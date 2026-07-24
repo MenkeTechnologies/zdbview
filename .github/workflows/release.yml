@@ -164,8 +164,10 @@ jobs:
             printf 'class Zdbview < Formula\n'
             printf '  desc "Terminal inspector and CRUD editor for rkyv archives and SQLite databases"\n'
             printf '  homepage "https://github.com/MenkeTechnologies/zdbview"\n'
-            printf '  license "MIT"\n'
-            printf '  version "%s"\n\n' "$V"
+            # version before license: brew audit's FormulaAuditor enforces
+            # that component order.
+            printf '  version "%s"\n' "$V"
+            printf '  license "MIT"\n\n'
             if [ -n "$mac_blocks" ]; then
               printf '  on_macos do\n%s\n  end\n\n' "$mac_blocks"
             fi
@@ -182,10 +184,11 @@ jobs:
             printf '  end\n'
             # musl tarballs as trailing comment — Homebrew has no on_libc gate,
             # so static binaries are referenced by URL for Alpine / distroless.
+            # Name and sha256 go on separate lines: brew audit caps lines at 118.
             if [ -n "$SHA_X86_LINUX_MUSL" ] || [ -n "$SHA_ARM_LINUX_MUSL" ]; then
               printf '\n  # Static musl tarballs also published at this release:\n'
-              [ -n "$SHA_X86_LINUX_MUSL" ] && printf '  #   zdbview-v%s-x86_64-unknown-linux-musl.tar.gz  sha256: %s\n' "$V" "$SHA_X86_LINUX_MUSL"
-              [ -n "$SHA_ARM_LINUX_MUSL" ] && printf '  #   zdbview-v%s-aarch64-unknown-linux-musl.tar.gz  sha256: %s\n' "$V" "$SHA_ARM_LINUX_MUSL"
+              [ -n "$SHA_X86_LINUX_MUSL" ] && printf '  #   zdbview-v%s-x86_64-unknown-linux-musl.tar.gz\n  #     sha256: %s\n' "$V" "$SHA_X86_LINUX_MUSL"
+              [ -n "$SHA_ARM_LINUX_MUSL" ] && printf '  #   zdbview-v%s-aarch64-unknown-linux-musl.tar.gz\n  #     sha256: %s\n' "$V" "$SHA_ARM_LINUX_MUSL"
             fi
             printf 'end\n'
           } > tap/Formula/zdbview.rb
