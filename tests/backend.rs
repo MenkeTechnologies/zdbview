@@ -6,12 +6,21 @@ use std::io::Write;
 // Pull the crate's modules in by path. The binary crate exposes them via the
 // integration test harness only if declared in a lib; since zdbview is a bin,
 // re-include the sources under test.
+//
+// Each re-included module is compiled fresh into this test binary, so whatever
+// the tests below don't call looks dead here even though the real binary uses
+// it — hence the per-module allow. It is scoped to the re-inclusion, so dead
+// code in the test file itself is still reported.
+#[allow(dead_code)]
 #[path = "../src/mru.rs"]
 mod mru;
+#[allow(dead_code)]
 #[path = "../src/rkyv_inspect.rs"]
 mod rkyv_inspect;
+#[allow(dead_code)]
 #[path = "../src/sqlite.rs"]
 mod sqlite;
+#[allow(dead_code)]
 #[path = "../src/store.rs"]
 mod store;
 

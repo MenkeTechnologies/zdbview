@@ -1,4 +1,9 @@
 // Throwaway verification: decode a rkyv file and print detected format + records.
+//
+// The registry is re-included rather than linked (zdbview is a bin, not a lib),
+// so the parts this example doesn't call — the edit/delete path in particular —
+// register as dead code in this target only.
+#[allow(dead_code)]
 #[path = "../src/formats.rs"]
 mod formats;
 

@@ -5,7 +5,7 @@
 //! CRUD: browse tables, edit any cell, insert/delete rows, run raw SQL.
 //!
 //! rkyv archives are NOT self-describing (the format stores no field names or
-//! type tags — see https://rkyv.org/format.html). For an arbitrary archive
+//! type tags — see <https://rkyv.org/format.html>). For an arbitrary archive
 //! zdbview therefore provides a structural inspector: hex/ascii dump and the
 //! embedded string runs. Typed field-name CRUD requires a supplied schema
 //! descriptor (future work).

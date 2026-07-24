@@ -1,7 +1,7 @@
 //! rkyv (and generic binary) structural inspector.
 //!
 //! rkyv archives are not self-describing — the format stores no field names or
-//! type tags (https://rkyv.org/format.html), so a generic reader cannot recover
+//! type tags (<https://rkyv.org/format.html>), so a generic reader cannot recover
 //! the schema. What it CAN do without the Rust type is show the raw structure:
 //! a hex/ascii dump and the runs of printable text embedded in the archive
 //! (strings, keys, interned identifiers). Typed CRUD would require a supplied
