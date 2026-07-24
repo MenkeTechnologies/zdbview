@@ -379,7 +379,8 @@ impl App {
     fn key_detail(&mut self, code: KeyCode) {
         let max_scroll = self.detail_value.len() / 16;
         match code {
-            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter => {
+            KeyCode::Char('q') => self.quit = true,
+            KeyCode::Esc | KeyCode::Enter => {
                 self.screen = Screen::Main;
                 self.detail_scroll = 0;
             }
@@ -403,7 +404,8 @@ impl App {
 
     fn key_schema(&mut self, code: KeyCode) {
         match code {
-            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('S') => {
+            KeyCode::Char('q') => self.quit = true,
+            KeyCode::Esc | KeyCode::Char('S') => {
                 self.screen = Screen::Main;
                 self.schema_scroll = 0;
             }
@@ -1489,7 +1491,8 @@ impl App {
             Line::from("  /               search          n / N    next / prev match"),
             Line::from("  Enter           open detail     v        cycle value render"),
             Line::from("  y               copy (OSC52)    x        export to file"),
-            Line::from("  ?               this help       q / Esc  back / quit"),
+            Line::from("  ?               this help       Esc      back (quit on main)"),
+            Line::from("                                  q        quit"),
         ];
         if is_sqlite {
             lines.push(Line::from(""));
