@@ -1,0 +1,187 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to build (e.g. v0.1.0)'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    # Per-target failures are tolerated on the musl variants so the
+    # downstream publish + tap job ships from whichever targets built.
+    continue-on-error: ${{ matrix.allow_failure || false }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # --- macOS (pure-Rust deps: x86_64 cross-builds from the arm runner) ---
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: macos-latest
+            target: x86_64-apple-darwin
+          # --- Linux glibc native ---
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          # --- Linux musl static (portable across glibc/musl distros) ---
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            allow_failure: true
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            allow_failure: true
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install musl tools
+        if: contains(matrix.target, 'musl')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Package
+        shell: bash
+        run: |
+          cd target/${{ matrix.target }}/release
+          strip zdbview 2>/dev/null || true
+          tar czf ../../../zdbview-${{ github.ref_name }}-${{ matrix.target }}.tar.gz zdbview
+          cd ../../..
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: zdbview-${{ matrix.target }}
+          path: zdbview-${{ github.ref_name }}-${{ matrix.target }}.tar.gz
+
+  publish:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create ${{ github.ref_name }} \
+            --title "${{ github.ref_name }}" \
+            --generate-notes \
+            artifacts/*.tar.gz
+
+  homebrew:
+    name: Update Homebrew tap
+    needs: publish
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Compute SHA256 sums
+        id: sha
+        shell: bash
+        run: |
+          for f in artifacts/*.tar.gz; do
+            base=$(basename "$f")
+            sum=$(sha256sum "$f" | awk '{print $1}')
+            # e.g. zdbview-vX.Y.Z-aarch64-apple-darwin.tar.gz → aarch64_apple_darwin
+            key=$(echo "$base" | sed 's/zdbview-v[^-]*-//; s/\.tar\.gz//; s/-/_/g; s/\./_/g')
+            echo "${key}=${sum}" >> "$GITHUB_OUTPUT"
+          done
+
+      - uses: actions/checkout@v6
+        with:
+          repository: MenkeTechnologies/homebrew-menketech
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: tap
+
+      - name: Update formula
+        shell: bash
+        env:
+          VERSION: ${{ github.ref_name }}
+          SHA_ARM_MACOS: ${{ steps.sha.outputs.aarch64_apple_darwin }}
+          SHA_X86_MACOS: ${{ steps.sha.outputs.x86_64_apple_darwin }}
+          SHA_X86_LINUX: ${{ steps.sha.outputs.x86_64_unknown_linux_gnu }}
+          SHA_ARM_LINUX: ${{ steps.sha.outputs.aarch64_unknown_linux_gnu }}
+          SHA_X86_LINUX_MUSL: ${{ steps.sha.outputs.x86_64_unknown_linux_musl }}
+          SHA_ARM_LINUX_MUSL: ${{ steps.sha.outputs.aarch64_unknown_linux_musl }}
+        run: |
+          set -eu
+          V="${VERSION#v}"
+          BASE="https://github.com/MenkeTechnologies/zdbview/releases/download/v${V}"
+          # Helper: emit an on_arm / on_intel block when its SHA is non-empty.
+          emit() { local guard="$1" arch="$2" sha="$3"; [ -n "$sha" ] || return 0; printf '    %s do\n      url "%s/zdbview-v%s-%s.tar.gz"\n      sha256 "%s"\n    end\n' "$guard" "$BASE" "$V" "$arch" "$sha"; }
+          # Build per-OS blocks first; skip the whole on_macos/on_linux
+          # block if zero arches succeeded for that OS.
+          mac_blocks=$( { emit on_arm aarch64-apple-darwin "$SHA_ARM_MACOS"; emit on_intel x86_64-apple-darwin "$SHA_X86_MACOS"; } )
+          linux_blocks=$( { emit on_intel x86_64-unknown-linux-gnu "$SHA_X86_LINUX"; emit on_arm aarch64-unknown-linux-gnu "$SHA_ARM_LINUX"; } )
+          {
+            printf 'class Zdbview < Formula\n'
+            printf '  desc "Terminal inspector and CRUD editor for rkyv archives and SQLite databases"\n'
+            printf '  homepage "https://github.com/MenkeTechnologies/zdbview"\n'
+            printf '  license "MIT"\n'
+            printf '  version "%s"\n\n' "$V"
+            if [ -n "$mac_blocks" ]; then
+              printf '  on_macos do\n%s\n  end\n\n' "$mac_blocks"
+            fi
+            if [ -n "$linux_blocks" ]; then
+              printf '  on_linux do\n%s\n  end\n\n' "$linux_blocks"
+            fi
+            printf '  def install\n'
+            printf '    bin.install "zdbview"\n'
+            printf '  end\n\n'
+            printf '  test do\n'
+            printf '    assert_match "zdbview", shell_output("#{bin}/zdbview --version")\n'
+            printf '  end\n'
+            # musl tarballs as trailing comment — Homebrew has no on_libc gate,
+            # so static binaries are referenced by URL for Alpine / distroless.
+            if [ -n "$SHA_X86_LINUX_MUSL" ] || [ -n "$SHA_ARM_LINUX_MUSL" ]; then
+              printf '\n  # Static musl tarballs also published at this release:\n'
+              [ -n "$SHA_X86_LINUX_MUSL" ] && printf '  #   zdbview-v%s-x86_64-unknown-linux-musl.tar.gz  sha256: %s\n' "$V" "$SHA_X86_LINUX_MUSL"
+              [ -n "$SHA_ARM_LINUX_MUSL" ] && printf '  #   zdbview-v%s-aarch64-unknown-linux-musl.tar.gz  sha256: %s\n' "$V" "$SHA_ARM_LINUX_MUSL"
+            fi
+            printf 'end\n'
+          } > tap/Formula/zdbview.rb
+
+      - name: Push formula update
+        run: |
+          cd tap
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/zdbview.rb
+          if git diff --cached --quiet; then
+            echo "no changes — formula already up to date"
+            exit 0
+          fi
+          git commit -m "zdbview: bump to ${{ github.ref_name }}"
+          git push

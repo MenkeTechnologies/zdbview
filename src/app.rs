@@ -1089,3 +1089,45 @@ fn centered(area: Rect, w: u16, h: u16) -> Rect {
         height: h,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{find_bytes, find_next};
+
+    #[test]
+    fn find_next_forward_wraps() {
+        // matches at indices 1 and 3 of a length-5 range
+        let pred = |i: usize| i == 1 || i == 3;
+        assert_eq!(find_next(5, 0, true, pred), Some(1));
+        assert_eq!(find_next(5, 1, true, pred), Some(3));
+        assert_eq!(find_next(5, 3, true, pred), Some(1)); // wrap past end
+        assert_eq!(find_next(5, 4, true, pred), Some(1));
+    }
+
+    #[test]
+    fn find_next_backward_wraps() {
+        let pred = |i: usize| i == 1 || i == 3;
+        assert_eq!(find_next(5, 4, false, pred), Some(3));
+        assert_eq!(find_next(5, 3, false, pred), Some(1));
+        assert_eq!(find_next(5, 1, false, pred), Some(3)); // wrap past start
+        assert_eq!(find_next(5, 0, false, pred), Some(3));
+    }
+
+    #[test]
+    fn find_next_none_and_empty() {
+        assert_eq!(find_next(5, 0, true, |_| false), None);
+        assert_eq!(find_next(0, 0, true, |_| true), None);
+    }
+
+    #[test]
+    fn find_bytes_forward_and_backward() {
+        let hay = b"abXYabZZab"; // "ab" at 0, 4, 8
+        assert_eq!(find_bytes(hay, b"ab", 0, true), Some(4));
+        assert_eq!(find_bytes(hay, b"ab", 4, true), Some(8));
+        assert_eq!(find_bytes(hay, b"ab", 8, true), None); // nothing after
+        assert_eq!(find_bytes(hay, b"ab", 8, false), Some(4));
+        assert_eq!(find_bytes(hay, b"ab", 4, false), Some(0));
+        assert_eq!(find_bytes(hay, b"zz", 0, true), None); // case-sensitive
+        assert_eq!(find_bytes(hay, b"", 0, true), None);
+    }
+}

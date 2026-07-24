@@ -1,9 +1,21 @@
+# Standalone crate (its own git submodule); not part of any host workspace.
+[workspace]
+
 [package]
 name = "zdbview"
 version = "0.1.0"
 edition = "2021"
 description = "Terminal inspector and CRUD editor for rkyv archives and SQLite databases"
+authors = ["MenkeTechnologies <linux.dev25@gmail.com>"]
 license = "MIT"
+repository = "https://github.com/MenkeTechnologies/zdbview"
+homepage = "https://menketechnologies.github.io/zdbview"
+documentation = "https://menketechnologies.github.io/zdbview"
+readme = "README.md"
+keywords = ["sqlite", "rkyv", "tui", "database", "viewer"]
+categories = ["command-line-utilities", "database"]
+# Dev-only assets: not part of the published crate.
+exclude = ["/docs", "/screenshots"]
 
 [[bin]]
 name = "zdbview"
@@ -15,3 +27,7 @@ crossterm = "0.29"
 rusqlite = { version = "0.40", features = ["bundled"] }
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
+
+[profile.release]
+lto = true
+strip = true
