@@ -161,21 +161,16 @@ update or delete touches exactly one entry even when several share a display key
 for the map-keyed formats; the header-less formats key by a content hash and have
 no renameable key.
 
-### Bytecode disassembly (`disasm` feature)
+### Bytecode disassembly (`disasm` feature — on by default)
 
-The script-cache value blobs are `bincode`-encoded `fusevm::Chunk`. Built with
-
-```sh
-cargo build --features disasm
-```
-
-the value pane gains a **disasm** render mode (`v` cycles to it) that decodes the
-blob and lists ops, constants, and names using the real `fusevm` types — no
-vendored copy of the 267-variant opcode enum, so no risk of silently wrong
-output. bincode is version-sensitive: disassembly is correct only when the linked
-`fusevm` version matches the one that encoded the cache; a mismatch fails loudly
-(`invalid variant` / `unexpected EOF`) and you fall back to hex. The feature is
-off by default so the crate stays self-contained and publishable.
+The script-cache value blobs are `bincode`-encoded `fusevm::Chunk`. The value
+pane's **disasm** render mode (`v` cycles to it) decodes the blob and lists ops,
+constants, and names using the real `fusevm` types — no vendored copy of the
+267-variant opcode enum, so no risk of silently wrong output. bincode is
+version-sensitive: disassembly is correct only when the linked `fusevm` version
+matches the one that encoded the cache; a mismatch fails loudly (`invalid
+variant` / `unexpected EOF`) and you fall back to hex. On by default (`fusevm`
+is published on crates.io); disable with `--no-default-features`.
 
 ## Keys
 
@@ -194,9 +189,19 @@ off by default so the crate stays self-contained and publishable.
 | `v` | cycle value render (auto / hex / text / disasm) — detail screen |
 | `y` | copy cell / value / key to clipboard (OSC 52) |
 | `x` | export table (CSV) / records (JSON) to a file |
+| `t` | theme chooser (31 schemes) |
 | `?` | help overlay |
 | mouse | wheel scrolls, click selects, right-click selects + opens detail |
-| `q` / `Esc` | leave screen / quit |
+| `q` | quit |
+| `Esc` | back out of a nested screen (quits on the main screen) |
+
+## Themes
+
+`t` opens a chooser of **31 color schemes** (ported from `iftoprs`); `j`/`k` or
+the wheel cycle with live preview, `Enter` saves, `e` opens a palette **editor**
+(adjust the 6 base colors, `Enter` saves a custom scheme). The selection
+persists to `$XDG_CONFIG_HOME/zdbview/prefs` (or `~/.config/zdbview/prefs`) and
+loads on startup.
 
 Input prompts (search, SQL, cell/value edit, add/rename) have a movable text
 cursor: `←`/`→`, `Home`/`End`, and the readline chords `Ctrl-a`/`Ctrl-e`

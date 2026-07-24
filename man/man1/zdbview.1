@@ -185,11 +185,11 @@ Adding a format is a single registry entry in
 copy the producer's archive type (same rkyv version and features) and map its
 magic, or add a validated try-decode for a header-less one.
 .SS Disassembly
-Built with
-.B "cargo build --features disasm"
-the detail value pane gains a
+The detail value pane has a
 .B disasm
-render mode that decodes a
+render mode (cycle to it with
+.BR v )
+that decodes a
 .B fusevm::Chunk
 value blob (bincode) into ops, constants and names using the real
 .B fusevm
@@ -197,7 +197,10 @@ types. bincode is version-sensitive, so disassembly is correct only when the
 linked
 .B fusevm
 matches the version that wrote the cache; a mismatch fails loudly and falls back
-to hex. The feature is off by default so the crate stays self-contained.
+to hex. Built via the
+.B disasm
+feature, which is on by default (disable with
+.BR "--no-default-features" ).
 .SH KEYS
 .TP
 .B Tab
@@ -248,6 +251,10 @@ the working directory.
 .TP
 .B S
 Show the SQLite schema (CREATE statements for tables, views, and indexes).
+.TP
+.B t
+Open the theme chooser (31 color schemes; j/k or wheel to preview, Enter to
+save, e to edit the palette). The choice persists to \fI$XDG_CONFIG_HOME/zdbview/prefs\fR.
 .TP
 .B ?
 Show the context-sensitive key help overlay.

@@ -22,9 +22,9 @@ name = "zdbview"
 path = "src/main.rs"
 
 [features]
-# Bytecode disassembly of fusevm::Chunk value blobs. Optional so the default
-# build stays a five-dependency TUI; enable it when you need to read a cached
-# chunk as ops rather than hex.
+# Bytecode disassembly of fusevm::Chunk value blobs, on by default (fusevm is
+# published on crates.io, so this stays self-contained and publishable).
+default = ["disasm"]
 disasm = ["dep:fusevm", "dep:bincode"]
 
 [dependencies]

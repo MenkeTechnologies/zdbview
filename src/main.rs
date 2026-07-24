@@ -17,9 +17,11 @@ mod disasm;
 mod export;
 mod formats;
 mod mru;
+mod prefs;
 mod rkyv_inspect;
 mod sqlite;
 mod store;
+mod theme;
 
 use anyhow::{anyhow, Result};
 use clap::Parser;

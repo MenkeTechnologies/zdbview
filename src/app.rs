@@ -20,6 +20,7 @@ use crate::mru::{self, Entry};
 use crate::rkyv_inspect::RkyvStore;
 use crate::sqlite::{RowsView, SqliteStore};
 use crate::store::{Kind, Store};
+use crate::theme::{Theme, ThemeName};
 
 /// How many rows per SQLite page.
 const PAGE: i64 = 500;
@@ -151,10 +152,27 @@ pub struct App {
     off_records: usize,
     /// Byte offset of the text cursor within the active input modal's buffer.
     input_cursor: usize,
+
+    // Theming (ported from iftoprs)
+    theme: Theme,
+    /// Theme chooser overlay: index into `ThemeName::ALL`, plus the scheme to
+    /// restore if the chooser is cancelled.
+    show_chooser: bool,
+    chooser_idx: usize,
+    chooser_saved: ThemeName,
+    /// Editor overlay: which of the 6 base colors is selected.
+    show_editor: bool,
+    editor_slot: usize,
+    editor_palette: [u8; 6],
 }
 
 impl App {
     pub fn new(store: Store) -> Self {
+        let prefs = crate::prefs::load();
+        let theme = match prefs.custom {
+            Some(c) => Theme::from_palette(prefs.theme, c),
+            None => Theme::from_name(prefs.theme),
+        };
         let mut app = App {
             store,
             focus: Focus::Left,
@@ -188,6 +206,13 @@ impl App {
             off_right: 0,
             off_records: 0,
             input_cursor: 0,
+            theme,
+            show_chooser: false,
+            chooser_idx: 0,
+            chooser_saved: ThemeName::default(),
+            show_editor: false,
+            editor_slot: 0,
+            editor_palette: [0; 6],
         };
         app.init();
         app
@@ -240,6 +265,13 @@ impl App {
             self.show_help = false;
             return;
         }
+        // Theme editor / chooser overlays take keys next.
+        if self.show_editor {
+            return self.editor_key(code);
+        }
+        if self.show_chooser {
+            return self.chooser_key(code);
+        }
 
         // Modal input first. Snapshot the buffer into a local so no borrow of
         // `self.mode` is held across the `&mut self` dispatch call.
@@ -289,6 +321,11 @@ impl App {
             self.show_help = true;
             return;
         }
+        // `t` opens the theme chooser from any screen.
+        if code == KeyCode::Char('t') {
+            self.open_chooser();
+            return;
+        }
 
         match self.screen {
             Screen::Detail => return self.key_detail(code),
@@ -309,6 +346,25 @@ impl App {
         if self.show_help {
             if matches!(m.kind, MouseEventKind::Down(_)) {
                 self.show_help = false;
+            }
+            return;
+        }
+        // Theme chooser: wheel cycles schemes, click confirms.
+        if self.show_chooser {
+            match m.kind {
+                MouseEventKind::ScrollDown => self.chooser_key(KeyCode::Down),
+                MouseEventKind::ScrollUp => self.chooser_key(KeyCode::Up),
+                MouseEventKind::Down(MouseButton::Left) => self.chooser_key(KeyCode::Enter),
+                _ => {}
+            }
+            return;
+        }
+        // Editor: wheel adjusts the selected slot's color.
+        if self.show_editor {
+            match m.kind {
+                MouseEventKind::ScrollUp => self.editor_key(KeyCode::Up),
+                MouseEventKind::ScrollDown => self.editor_key(KeyCode::Down),
+                _ => {}
             }
             return;
         }
@@ -371,6 +427,110 @@ impl App {
                     }
                 }
             }
+        }
+    }
+
+    // ----- theming: chooser + editor (ported from iftoprs) ------------------
+
+    fn open_chooser(&mut self) {
+        self.chooser_saved = self.theme.name;
+        self.chooser_idx = ThemeName::ALL
+            .iter()
+            .position(|&t| t == self.theme.name)
+            .unwrap_or(0);
+        self.show_chooser = true;
+    }
+
+    fn chooser_preview(&mut self) {
+        self.theme = Theme::from_name(ThemeName::ALL[self.chooser_idx]);
+    }
+
+    fn chooser_key(&mut self, code: KeyCode) {
+        let n = ThemeName::ALL.len();
+        match code {
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.chooser_idx = (self.chooser_idx + n - 1) % n;
+                self.chooser_preview();
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.chooser_idx = (self.chooser_idx + 1) % n;
+                self.chooser_preview();
+            }
+            KeyCode::Char('g') => {
+                self.chooser_idx = 0;
+                self.chooser_preview();
+            }
+            KeyCode::Char('G') => {
+                self.chooser_idx = n - 1;
+                self.chooser_preview();
+            }
+            KeyCode::Enter => {
+                self.chooser_preview();
+                crate::prefs::save(&crate::prefs::Prefs {
+                    theme: self.theme.name,
+                    custom: None,
+                });
+                self.show_chooser = false;
+                self.status = format!("theme: {}", self.theme.name.display());
+            }
+            KeyCode::Char('e') => {
+                // Open the editor seeded from the highlighted scheme.
+                self.editor_palette = crate::theme::base_palette(ThemeName::ALL[self.chooser_idx]);
+                self.editor_slot = 0;
+                self.show_chooser = false;
+                self.show_editor = true;
+                self.editor_preview();
+            }
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('t') => {
+                self.theme = Theme::from_name(self.chooser_saved);
+                self.show_chooser = false;
+            }
+            _ => {}
+        }
+    }
+
+    fn editor_preview(&mut self) {
+        self.theme = Theme::from_palette(self.theme.name, self.editor_palette);
+    }
+
+    fn editor_key(&mut self, code: KeyCode) {
+        match code {
+            KeyCode::Left | KeyCode::Char('h') => self.editor_slot = (self.editor_slot + 5) % 6,
+            KeyCode::Right | KeyCode::Char('l') => self.editor_slot = (self.editor_slot + 1) % 6,
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.editor_palette[self.editor_slot] =
+                    self.editor_palette[self.editor_slot].wrapping_add(1);
+                self.editor_preview();
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.editor_palette[self.editor_slot] =
+                    self.editor_palette[self.editor_slot].wrapping_sub(1);
+                self.editor_preview();
+            }
+            KeyCode::PageUp => {
+                self.editor_palette[self.editor_slot] =
+                    self.editor_palette[self.editor_slot].wrapping_add(16);
+                self.editor_preview();
+            }
+            KeyCode::PageDown => {
+                self.editor_palette[self.editor_slot] =
+                    self.editor_palette[self.editor_slot].wrapping_sub(16);
+                self.editor_preview();
+            }
+            KeyCode::Enter => {
+                self.editor_preview();
+                crate::prefs::save(&crate::prefs::Prefs {
+                    theme: self.theme.name,
+                    custom: Some(self.editor_palette),
+                });
+                self.show_editor = false;
+                self.status = "saved custom theme".into();
+            }
+            KeyCode::Esc | KeyCode::Char('q') => {
+                self.theme = Theme::from_name(self.chooser_saved);
+                self.show_editor = false;
+            }
+            _ => {}
         }
     }
 
@@ -1368,6 +1528,86 @@ impl App {
         if self.show_help {
             self.render_help(f);
         }
+        if self.show_chooser {
+            self.render_chooser(f);
+        }
+        if self.show_editor {
+            self.render_editor(f);
+        }
+    }
+
+    fn render_chooser(&self, f: &mut Frame) {
+        let items: Vec<ListItem> = ThemeName::ALL
+            .iter()
+            .map(|&t| {
+                let th = Theme::from_name(t);
+                ListItem::new(Line::from(vec![
+                    Span::styled("██", Style::default().fg(th.accent)),
+                    Span::styled("██", Style::default().fg(th.primary)),
+                    Span::styled("██", Style::default().fg(th.label)),
+                    Span::styled("██  ", Style::default().fg(th.dark)),
+                    Span::raw(t.display().to_string()),
+                ]))
+            })
+            .collect();
+        let mut st = ListState::default();
+        st.select(Some(self.chooser_idx));
+        let h = (ThemeName::ALL.len() as u16 + 2).min(f.area().height.saturating_sub(2));
+        let area = centered(f.area(), 40.min(f.area().width), h);
+        f.render_widget(Clear, area);
+        let list = List::new(items)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(self.theme.accent))
+                    .title(" theme  (j/k · Enter=save · e=edit · Esc) "),
+            )
+            .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
+        f.render_stateful_widget(list, area, &mut st);
+    }
+
+    fn render_editor(&self, f: &mut Frame) {
+        let labels = ["primary", "accent", "alt", "label", "dim", "dark"];
+        let mut lines: Vec<Line> = vec![
+            Line::from(Span::styled(
+                "edit palette — ←/→ slot · ↑/↓ ±1 · PgUp/Dn ±16 · Enter save · Esc",
+                Style::default().fg(self.theme.dim),
+            )),
+            Line::from(""),
+        ];
+        for (i, (lab, &c)) in labels.iter().zip(self.editor_palette.iter()).enumerate() {
+            let sel = i == self.editor_slot;
+            lines.push(Line::from(vec![
+                Span::styled(
+                    if sel { "▶ " } else { "  " },
+                    Style::default().fg(self.theme.accent),
+                ),
+                Span::styled(
+                    "██████ ",
+                    Style::default().fg(ratatui::style::Color::Indexed(c)),
+                ),
+                Span::styled(
+                    format!("{:<9}", lab),
+                    Style::default().fg(if sel {
+                        self.theme.accent
+                    } else {
+                        self.theme.dim
+                    }),
+                ),
+                Span::raw(format!("idx {c}")),
+            ]));
+        }
+        let area = centered(f.area(), 44.min(f.area().width), 11.min(f.area().height));
+        f.render_widget(Clear, area);
+        f.render_widget(
+            Paragraph::new(lines).block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(self.theme.accent))
+                    .title(" theme editor "),
+            ),
+            area,
+        );
     }
 
     fn render_detail(&self, f: &mut Frame, area: Rect) {
@@ -1387,9 +1627,9 @@ impl App {
                                 Span::styled(
                                     format!("{:<20}", truncate(col, 20)),
                                     Style::default().fg(if sel {
-                                        Color::Cyan
+                                        self.theme.accent
                                     } else {
-                                        Color::DarkGray
+                                        self.theme.dim
                                     }),
                                 ),
                                 Span::raw(truncate(
@@ -1409,14 +1649,17 @@ impl App {
                     .and_then(|d| d.records.get(self.record_idx))
                 {
                     fields.push(Line::from(vec![
-                        Span::styled(format!("{:<20}", "key"), Style::default().fg(Color::Cyan)),
+                        Span::styled(
+                            format!("{:<20}", "key"),
+                            Style::default().fg(self.theme.accent),
+                        ),
                         Span::raw(truncate(&rec.key, 80)),
                     ]));
                     for (name, val) in &rec.fields {
                         fields.push(Line::from(vec![
                             Span::styled(
                                 format!("{:<20}", truncate(name, 20)),
-                                Style::default().fg(Color::DarkGray),
+                                Style::default().fg(self.theme.dim),
                             ),
                             Span::raw(val.clone()),
                         ]));
@@ -1451,13 +1694,13 @@ impl App {
         let mut lines: Vec<Line> = Vec::new();
         for (ty, name, sql) in &self.schema {
             lines.push(Line::from(vec![
-                Span::styled(format!("{:<6}", ty), Style::default().fg(Color::Magenta)),
+                Span::styled(format!("{:<6}", ty), Style::default().fg(self.theme.alt)),
                 Span::styled(name.clone(), Style::default().add_modifier(Modifier::BOLD)),
             ]));
             for l in sql.lines() {
                 lines.push(Line::from(Span::styled(
                     format!("    {}", l),
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(self.theme.dim),
                 )));
             }
             lines.push(Line::from(""));
@@ -1483,7 +1726,7 @@ impl App {
             Line::from(Span::styled(
                 "zdbview — keys",
                 Style::default()
-                    .fg(Color::Cyan)
+                    .fg(self.theme.accent)
                     .add_modifier(Modifier::BOLD),
             )),
             Line::from(""),
@@ -1491,14 +1734,14 @@ impl App {
             Line::from("  /               search          n / N    next / prev match"),
             Line::from("  Enter           open detail     v        cycle value render"),
             Line::from("  y               copy (OSC52)    x        export to file"),
-            Line::from("  ?               this help       Esc      back (quit on main)"),
-            Line::from("                                  q        quit"),
+            Line::from("  t               themes (31)     Esc      back (quit on main)"),
+            Line::from("  ?               this help       q        quit"),
         ];
         if is_sqlite {
             lines.push(Line::from(""));
             lines.push(Line::from(Span::styled(
                 "  SQLite:",
-                Style::default().fg(Color::Green),
+                Style::default().fg(self.theme.label),
             )));
             lines.push(Line::from(
                 "  Tab focus   e edit cell   a add row   d delete   : SQL",
@@ -1510,7 +1753,7 @@ impl App {
             lines.push(Line::from(""));
             lines.push(Line::from(Span::styled(
                 "  rkyv:",
-                Style::default().fg(Color::Green),
+                Style::default().fg(self.theme.label),
             )));
             lines.push(Line::from("  0 Records   1 Info   2 Strings   3 Hex"));
             lines.push(Line::from(
@@ -1520,7 +1763,7 @@ impl App {
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
             "  mouse:",
-            Style::default().fg(Color::Green),
+            Style::default().fg(self.theme.label),
         )));
         lines.push(Line::from(
             "  wheel scroll   click select   right-click select + detail",
@@ -1531,7 +1774,7 @@ impl App {
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
             "  press any key to close",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(self.theme.dim),
         )));
 
         let h = (lines.len() as u16 + 2).min(f.area().height);
@@ -1541,7 +1784,7 @@ impl App {
             Paragraph::new(lines).block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .border_style(Style::default().fg(Color::Cyan))
+                    .border_style(Style::default().fg(self.theme.accent))
                     .title(" help "),
             ),
             area,
@@ -1597,7 +1840,7 @@ impl App {
                     .map(|(i, c)| {
                         let st = if i == self.col_idx && self.focus == Focus::Right {
                             Style::default()
-                                .fg(Color::Cyan)
+                                .fg(self.theme.accent)
                                 .add_modifier(Modifier::BOLD)
                         } else {
                             Style::default().add_modifier(Modifier::BOLD)
@@ -1684,7 +1927,7 @@ impl App {
             .block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .border_style(Style::default().fg(Color::Cyan))
+                    .border_style(Style::default().fg(self.theme.accent))
                     .title(format!(" {} — {} keys ", d.format, d.records.len())),
             )
             .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
@@ -1696,17 +1939,14 @@ impl App {
         if let Some(rec) = d.records.get(self.record_idx) {
             for (name, val) in &rec.fields {
                 lines.push(Line::from(vec![
-                    Span::styled(
-                        format!("{:<22}", name),
-                        Style::default().fg(Color::DarkGray),
-                    ),
+                    Span::styled(format!("{:<22}", name), Style::default().fg(self.theme.dim)),
                     Span::raw(val.clone()),
                 ]));
             }
             lines.push(Line::from(""));
             lines.push(Line::from(Span::styled(
                 format!("value — {} bytes (hex):", rec.value.len()),
-                Style::default().fg(Color::Yellow),
+                Style::default().fg(self.theme.primary),
             )));
             let rows = area.height.saturating_sub(6) as usize;
             for i in 0..rows {
@@ -1726,15 +1966,15 @@ impl App {
     fn render_rkyv_info(&self, f: &mut Frame, area: Rect, r: &RkyvStore) {
         let mut lines = vec![
             Line::from(vec![
-                Span::styled("file:    ", Style::default().fg(Color::DarkGray)),
+                Span::styled("file:    ", Style::default().fg(self.theme.dim)),
                 Span::raw(r.path.display().to_string()),
             ]),
             Line::from(vec![
-                Span::styled("size:    ", Style::default().fg(Color::DarkGray)),
+                Span::styled("size:    ", Style::default().fg(self.theme.dim)),
                 Span::raw(format!("{} bytes", r.len())),
             ]),
             Line::from(vec![
-                Span::styled("strings: ", Style::default().fg(Color::DarkGray)),
+                Span::styled("strings: ", Style::default().fg(self.theme.dim)),
                 Span::raw(format!(
                     "{} runs (>= {} printable bytes)",
                     self.strings.len(),
@@ -1747,11 +1987,11 @@ impl App {
             Some(d) => {
                 lines.push(Line::from(""));
                 lines.push(Line::from(vec![
-                    Span::styled("format:  ", Style::default().fg(Color::DarkGray)),
-                    Span::styled(d.format.clone(), Style::default().fg(Color::Green)),
+                    Span::styled("format:  ", Style::default().fg(self.theme.dim)),
+                    Span::styled(d.format.clone(), Style::default().fg(self.theme.label)),
                 ]));
                 lines.push(Line::from(vec![
-                    Span::styled("records: ", Style::default().fg(Color::DarkGray)),
+                    Span::styled("records: ", Style::default().fg(self.theme.dim)),
                     Span::raw(d.records.len().to_string()),
                 ]));
                 lines.push(Line::from(""));
@@ -1759,7 +1999,7 @@ impl App {
                     lines.push(Line::from(vec![
                         Span::styled(
                             format!("  {:<16}", name),
-                            Style::default().fg(Color::DarkGray),
+                            Style::default().fg(self.theme.dim),
                         ),
                         Span::raw(val.clone()),
                     ]));
@@ -1767,26 +2007,26 @@ impl App {
                 lines.push(Line::from(""));
                 lines.push(Line::from(Span::styled(
                     "Views:  0 Records (key/value)  2 Strings  3 Hex",
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(self.theme.dim),
                 )));
             }
             None => {
                 lines.push(Line::from(""));
                 lines.push(Line::from(Span::styled(
                     "unrecognized rkyv archive: no matching format decoder.",
-                    Style::default().fg(Color::Yellow),
+                    Style::default().fg(self.theme.primary),
                 )));
                 lines.push(Line::from(Span::styled(
                     "rkyv stores no field names or type tags, so an unknown type",
-                    Style::default().fg(Color::Yellow),
+                    Style::default().fg(self.theme.primary),
                 )));
                 lines.push(Line::from(Span::styled(
                     "cannot be decoded generically — showing raw structure.",
-                    Style::default().fg(Color::Yellow),
+                    Style::default().fg(self.theme.primary),
                 )));
                 lines.push(Line::from(Span::styled(
                     "Views:  2 Strings (embedded text)  3 Hex (raw bytes)",
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(self.theme.dim),
                 )));
             }
         }
@@ -1806,7 +2046,7 @@ impl App {
                 ListItem::new(Line::from(vec![
                     Span::styled(
                         format!("{:08x}  ", h.offset),
-                        Style::default().fg(Color::DarkGray),
+                        Style::default().fg(self.theme.dim),
                     ),
                     Span::raw(truncate(&h.text, 200)),
                 ]))
@@ -1874,7 +2114,7 @@ impl App {
         let p = Paragraph::new(line).block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Cyan))
+                .border_style(Style::default().fg(self.theme.accent))
                 .title(format!(" {} ", title)),
         );
         f.render_widget(p, area);
@@ -1882,9 +2122,9 @@ impl App {
 
     fn pane_style(&self, which: Focus) -> Style {
         if self.focus == which {
-            Style::default().fg(Color::Cyan)
+            Style::default().fg(self.theme.accent)
         } else {
-            Style::default().fg(Color::DarkGray)
+            Style::default().fg(self.theme.dim)
         }
     }
 }
