@@ -195,7 +195,13 @@ off by default so the crate stays self-contained and publishable.
 | `y` | copy cell / value / key to clipboard (OSC 52) |
 | `x` | export table (CSV) / records (JSON) to a file |
 | `?` | help overlay |
+| mouse | wheel scrolls, click selects, right-click selects + opens detail |
 | `q` / `Esc` | leave screen / quit |
+
+Input prompts (search, SQL, cell/value edit, add/rename) have a movable text
+cursor: `←`/`→`, `Home`/`End`, and the readline chords `Ctrl-a`/`Ctrl-e`
+(line start/end), `Ctrl-w` (delete word), `Ctrl-u`/`Ctrl-k` (kill to
+start/end). Mouse support and the cursor model are ported from `iftoprs`.
 
 SQLite search is **whole-table** (SQL-backed across every column), not limited to
 the loaded page; rkyv search scans record keys, the string list, or raw bytes.

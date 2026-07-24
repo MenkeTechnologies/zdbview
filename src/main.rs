@@ -57,7 +57,11 @@ fn main() -> Result<()> {
     }
 
     let mut terminal = ratatui::init();
+    // `ratatui::init()` does not capture the mouse; enable it so the TUI gets
+    // scroll-wheel and click events.
+    let _ = crossterm::execute!(std::io::stdout(), crossterm::event::EnableMouseCapture);
     let res = run(&cli, &mut terminal);
+    let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableMouseCapture);
     ratatui::restore();
     res
 }

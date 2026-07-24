@@ -252,6 +252,26 @@ Show the SQLite schema (CREATE statements for tables, views, and indexes).
 .B ?
 Show the context-sensitive key help overlay.
 .TP
+.B mouse
+The scroll wheel moves the selection, left-click selects the row / record /
+table under the cursor, and right-click selects it and opens its detail screen.
+.TP
+.B "input cursor"
+Text prompts have a movable cursor:
+.BR \(<- / \(-> ,
+.BR Home / End ,
+and the readline chords
+.B Ctrl\-a
+/
+.B Ctrl\-e
+(line start / end),
+.B Ctrl\-w
+(delete word),
+.B Ctrl\-u
+/
+.B Ctrl\-k
+(kill to start / end).
+.TP
 .BR q ", " Esc
 Leave the current screen or quit. On the detail, schema, or help screen, return
 to the main view. Inside a modal (edit, SQL, search, confirm), Esc cancels the

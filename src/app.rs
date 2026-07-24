@@ -1,7 +1,10 @@
 //! The interactive terminal application: state, key handling, and rendering.
 
 use anyhow::Result;
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
+    MouseEventKind,
+};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -137,6 +140,17 @@ pub struct App {
     schema_scroll: usize,
     /// SQLite schema objects `(type, name, sql)`, loaded lazily.
     schema: Vec<(String, String, String)>,
+
+    // Mouse hit-testing: the on-screen rect and scroll offset of each clickable
+    // list/grid, captured during render so a click maps to the right index.
+    click_left: Rect,
+    click_right: Rect,
+    click_records: Rect,
+    off_left: usize,
+    off_right: usize,
+    off_records: usize,
+    /// Byte offset of the text cursor within the active input modal's buffer.
+    input_cursor: usize,
 }
 
 impl App {
@@ -167,6 +181,13 @@ impl App {
             detail_scroll: 0,
             schema_scroll: 0,
             schema: Vec::new(),
+            click_left: Rect::ZERO,
+            click_right: Rect::ZERO,
+            click_records: Rect::ZERO,
+            off_left: 0,
+            off_right: 0,
+            off_records: 0,
+            input_cursor: 0,
         };
         app.init();
         app
@@ -200,10 +221,10 @@ impl App {
     pub fn run(&mut self, terminal: &mut DefaultTerminal) -> Result<()> {
         while !self.quit {
             terminal.draw(|f| self.render(f))?;
-            if let Event::Key(key) = event::read()? {
-                if key.kind == KeyEventKind::Press {
-                    self.on_key(key);
-                }
+            match event::read()? {
+                Event::Key(key) if key.kind == KeyEventKind::Press => self.on_key(key),
+                Event::Mouse(m) => self.on_mouse(m),
+                _ => {}
             }
         }
         Ok(())
@@ -243,17 +264,21 @@ impl App {
             Mode::Normal => Modal::None,
         };
         match modal {
-            Modal::Edit(buf) => return self.key_edit_cell(code, buf),
-            Modal::Cmd(buf) => return self.key_command(code, buf),
-            Modal::Search(buf) => return self.key_search(code, buf),
+            Modal::Edit(buf) => {
+                return self.key_input(key, buf, Mode::EditCell, App::commit_edit_cell)
+            }
+            Modal::Cmd(buf) => return self.key_input(key, buf, Mode::Command, App::commit_command),
+            Modal::Search(buf) => {
+                return self.key_input(key, buf, Mode::Search, App::commit_search)
+            }
             Modal::Add(buf) => {
-                return self.key_line(code, buf, Mode::AddRecord, App::commit_add_record)
+                return self.key_input(key, buf, Mode::AddRecord, App::commit_add_record)
             }
             Modal::EditVal(buf) => {
-                return self.key_line(code, buf, Mode::EditValue, App::commit_edit_value)
+                return self.key_input(key, buf, Mode::EditValue, App::commit_edit_value)
             }
             Modal::Rename(buf) => {
-                return self.key_line(code, buf, Mode::RenameRecord, App::commit_rename_record)
+                return self.key_input(key, buf, Mode::RenameRecord, App::commit_rename_record)
             }
             Modal::Confirm => return self.key_confirm_delete(code),
             Modal::None => {}
@@ -274,6 +299,78 @@ impl App {
         match &self.store {
             Store::Sqlite(_) => self.key_sqlite(key),
             Store::Rkyv(_) => self.key_rkyv(key),
+        }
+    }
+
+    // ----- mouse (ported from iftoprs `handle_mouse`) -----------------------
+
+    fn on_mouse(&mut self, m: MouseEvent) {
+        // Any click dismisses the help overlay.
+        if self.show_help {
+            if matches!(m.kind, MouseEventKind::Down(_)) {
+                self.show_help = false;
+            }
+            return;
+        }
+        // Scroll wheel reuses the existing up/down navigation for the active
+        // screen/view (rows, records, hex, strings, detail, schema).
+        match m.kind {
+            MouseEventKind::ScrollDown => self.scroll_select(true),
+            MouseEventKind::ScrollUp => self.scroll_select(false),
+            MouseEventKind::Down(MouseButton::Left) => self.click_at(m.column, m.row, false),
+            MouseEventKind::Down(MouseButton::Right) => self.click_at(m.column, m.row, true),
+            _ => {}
+        }
+    }
+
+    fn scroll_select(&mut self, down: bool) {
+        if !matches!(self.mode, Mode::Normal) {
+            return;
+        }
+        let code = if down { KeyCode::Down } else { KeyCode::Up };
+        self.on_key(KeyEvent::new(code, KeyModifiers::empty()));
+    }
+
+    /// Left/right click at `(col,row)`: select the item under the cursor. Right
+    /// click additionally opens the detail screen for it (like iftoprs's
+    /// right-click-shows-details). The clickable rects and their scroll offsets
+    /// are captured during render, so the mapping is correct even when scrolled.
+    fn click_at(&mut self, col: u16, row: u16, right: bool) {
+        if !matches!(self.mode, Mode::Normal) || self.screen != Screen::Main {
+            return;
+        }
+        match &self.store {
+            Store::Sqlite(_) => {
+                if hit(self.click_left, col, row) {
+                    self.focus = Focus::Left;
+                    let idx = self.off_left + row.saturating_sub(self.click_left.y + 1) as usize;
+                    self.select_table(idx);
+                } else if hit(self.click_right, col, row) {
+                    self.focus = Focus::Right;
+                    // +2 for the top border and the header row.
+                    let idx = self.off_right + row.saturating_sub(self.click_right.y + 2) as usize;
+                    let n = self.rows.as_ref().map(|r| r.rows.len()).unwrap_or(0);
+                    if idx < n {
+                        self.row_idx = idx;
+                        if right {
+                            self.enter_detail();
+                        }
+                    }
+                }
+            }
+            Store::Rkyv(_) => {
+                if self.rkyv_view == RkyvView::Records && hit(self.click_records, col, row) {
+                    let idx =
+                        self.off_records + row.saturating_sub(self.click_records.y + 1) as usize;
+                    let n = self.decoded.as_ref().map(|d| d.records.len()).unwrap_or(0);
+                    if idx < n {
+                        self.record_idx = idx;
+                        if right {
+                            self.enter_detail();
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -476,7 +573,7 @@ impl App {
 
         match code {
             KeyCode::Char('G') => self.goto_bottom(),
-            KeyCode::Char('/') => self.mode = Mode::Search(String::new()),
+            KeyCode::Char('/') => self.open_modal(Mode::Search(String::new())),
             KeyCode::Char('n') => self.search_next(true),
             KeyCode::Char('N') => self.search_next(false),
             KeyCode::Char('q') | KeyCode::Esc => self.quit = true,
@@ -531,7 +628,7 @@ impl App {
             KeyCode::Char('S') => self.open_schema(),
             KeyCode::Char('x') => self.export_current(),
             KeyCode::Char('y') => self.copy_sqlite_cell(),
-            KeyCode::Char(':') => self.mode = Mode::Command(String::new()),
+            KeyCode::Char(':') => self.open_modal(Mode::Command(String::new())),
             _ => {}
         }
     }
@@ -583,7 +680,7 @@ impl App {
 
         match code {
             KeyCode::Char('G') => self.rkyv_goto_bottom(),
-            KeyCode::Char('/') => self.mode = Mode::Search(String::new()),
+            KeyCode::Char('/') => self.open_modal(Mode::Search(String::new())),
             KeyCode::Char('n') => self.search_next(true),
             KeyCode::Char('N') => self.search_next(false),
             KeyCode::Char('q') | KeyCode::Esc => self.quit = true,
@@ -638,12 +735,12 @@ impl App {
             }
             KeyCode::Char('a') => {
                 if self.rkyv_view == RkyvView::Records && self.decoded.is_some() {
-                    self.mode = Mode::AddRecord(String::new());
+                    self.open_modal(Mode::AddRecord(String::new()));
                 }
             }
             KeyCode::Char('e') => {
                 if self.rkyv_view == RkyvView::Records && self.has_current_record() {
-                    self.mode = Mode::EditValue(String::new());
+                    self.open_modal(Mode::EditValue(String::new()));
                 }
             }
             KeyCode::Char('r') => {
@@ -663,7 +760,7 @@ impl App {
                         .and_then(|d| d.records.get(self.record_idx))
                         .map(|r| r.key.clone())
                         .unwrap_or_default();
-                    self.mode = Mode::RenameRecord(key);
+                    self.open_modal(Mode::RenameRecord(key));
                 }
             }
             KeyCode::Char('x') => self.export_current(),
@@ -672,62 +769,87 @@ impl App {
         }
     }
 
-    fn key_edit_cell(&mut self, code: KeyCode, mut buf: String) {
-        match code {
-            KeyCode::Esc => self.mode = Mode::Normal,
-            KeyCode::Enter => {
-                self.commit_edit_cell(&buf);
+    /// Cursor-aware text-input handler shared by every input modal. The cursor
+    /// model (UTF-8-safe left/right/word-nav/home/end/kill) is ported from
+    /// iftoprs's `FilterState`. `mk` rebuilds the mode from the edited buffer,
+    /// `commit` runs on Enter.
+    fn key_input(
+        &mut self,
+        key: KeyEvent,
+        mut buf: String,
+        mk: fn(String) -> Mode,
+        commit: fn(&mut App, &str),
+    ) {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let mut cur = self.input_cursor.min(buf.len());
+        match key.code {
+            KeyCode::Esc => {
                 self.mode = Mode::Normal;
+                return;
             }
+            KeyCode::Enter => {
+                self.mode = Mode::Normal;
+                commit(self, &buf);
+                return;
+            }
+            KeyCode::Left => cur = input_left(&buf, cur),
+            KeyCode::Right => cur = input_right(&buf, cur),
+            KeyCode::Home => cur = 0,
+            KeyCode::End => cur = buf.len(),
+            KeyCode::Char('a') if ctrl => cur = 0,
+            KeyCode::Char('e') if ctrl => cur = buf.len(),
+            KeyCode::Char('b') if ctrl => cur = input_left(&buf, cur),
+            KeyCode::Char('f') if ctrl => cur = input_right(&buf, cur),
+            KeyCode::Char('w') if ctrl => cur = input_delete_word(&mut buf, cur),
+            KeyCode::Char('u') if ctrl => {
+                buf.drain(..cur);
+                cur = 0;
+            }
+            KeyCode::Char('k') if ctrl => buf.truncate(cur),
             KeyCode::Backspace => {
-                buf.pop();
-                self.mode = Mode::EditCell(buf);
+                if cur > 0 {
+                    let p = input_left(&buf, cur);
+                    buf.drain(p..cur);
+                    cur = p;
+                }
+            }
+            KeyCode::Delete => {
+                if cur < buf.len() {
+                    let n = input_right(&buf, cur);
+                    buf.drain(cur..n);
+                }
             }
             KeyCode::Char(c) => {
-                buf.push(c);
-                self.mode = Mode::EditCell(buf);
+                buf.insert(cur, c);
+                cur += c.len_utf8();
             }
             _ => {}
         }
+        self.input_cursor = cur;
+        self.mode = mk(buf);
     }
 
-    fn key_command(&mut self, code: KeyCode, mut buf: String) {
-        match code {
-            KeyCode::Esc => self.mode = Mode::Normal,
-            KeyCode::Enter => {
-                self.run_sql(&buf);
-                self.mode = Mode::Normal;
-            }
-            KeyCode::Backspace => {
-                buf.pop();
-                self.mode = Mode::Command(buf);
-            }
-            KeyCode::Char(c) => {
-                buf.push(c);
-                self.mode = Mode::Command(buf);
-            }
-            _ => {}
-        }
+    /// Open a text-input modal, placing the cursor at the end of its buffer.
+    fn open_modal(&mut self, mode: Mode) {
+        self.input_cursor = match &mode {
+            Mode::EditCell(s)
+            | Mode::Command(s)
+            | Mode::Search(s)
+            | Mode::AddRecord(s)
+            | Mode::EditValue(s)
+            | Mode::RenameRecord(s) => s.len(),
+            _ => 0,
+        };
+        self.mode = mode;
     }
 
-    fn key_search(&mut self, code: KeyCode, mut buf: String) {
-        match code {
-            KeyCode::Esc => self.mode = Mode::Normal,
-            KeyCode::Enter => {
-                self.search = buf;
-                self.mode = Mode::Normal;
-                self.search_next(true);
-            }
-            KeyCode::Backspace => {
-                buf.pop();
-                self.mode = Mode::Search(buf);
-            }
-            KeyCode::Char(c) => {
-                buf.push(c);
-                self.mode = Mode::Search(buf);
-            }
-            _ => {}
-        }
+    fn commit_command(&mut self, sql: &str) {
+        self.run_sql(sql);
+    }
+
+    fn commit_search(&mut self, pattern: &str) {
+        self.search = pattern.to_string();
+        self.search_next(true);
     }
 
     fn key_confirm_delete(&mut self, code: KeyCode) {
@@ -744,33 +866,6 @@ impl App {
     }
 
     // ----- rkyv record CRUD -------------------------------------------------
-
-    /// A one-line text-input handler shared by the add/edit-value/rename modals:
-    /// Esc cancels, Enter commits via `commit`, other keys edit `buf`.
-    fn key_line(
-        &mut self,
-        code: KeyCode,
-        mut buf: String,
-        mk: fn(String) -> Mode,
-        commit: fn(&mut App, &str),
-    ) {
-        match code {
-            KeyCode::Esc => self.mode = Mode::Normal,
-            KeyCode::Enter => {
-                self.mode = Mode::Normal;
-                commit(self, &buf);
-            }
-            KeyCode::Backspace => {
-                buf.pop();
-                self.mode = mk(buf);
-            }
-            KeyCode::Char(c) => {
-                buf.push(c);
-                self.mode = mk(buf);
-            }
-            _ => {}
-        }
-    }
 
     fn has_current_record(&self) -> bool {
         self.decoded
@@ -975,7 +1070,7 @@ impl App {
             .cloned()
             .unwrap_or_default();
         if self.current_rowid().is_some() {
-            self.mode = Mode::EditCell(cur);
+            self.open_modal(Mode::EditCell(cur));
         } else {
             self.status = "row has no rowid — cannot edit (WITHOUT ROWID table)".into();
         }
@@ -1421,6 +1516,17 @@ impl App {
         }
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
+            "  mouse:",
+            Style::default().fg(Color::Green),
+        )));
+        lines.push(Line::from(
+            "  wheel scroll   click select   right-click select + detail",
+        ));
+        lines.push(Line::from(
+            "  input line: ←/→ move  Home/End  Ctrl-a/e/w/u/k  cursor edit",
+        ));
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
             "  press any key to close",
             Style::default().fg(Color::DarkGray),
         )));
@@ -1439,8 +1545,9 @@ impl App {
         );
     }
 
-    fn render_sqlite(&self, f: &mut Frame, area: Rect) {
+    fn render_sqlite(&mut self, f: &mut Frame, area: Rect) {
         let cols = Layout::horizontal([Constraint::Length(24), Constraint::Min(10)]).split(area);
+        let (rect_left, rect_right) = (cols[0], cols[1]);
 
         let s = self.sqlite().unwrap();
         // Left: table list.
@@ -1461,6 +1568,8 @@ impl App {
             )
             .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
         f.render_stateful_widget(list, cols[0], &mut lstate);
+        let off_left = lstate.selected().map(|_| lstate.offset()).unwrap_or(0);
+        let mut off_right = 0usize;
 
         // Right: row grid.
         let title = match self.current_table() {
@@ -1515,6 +1624,7 @@ impl App {
                 )
                 .row_highlight_style(Style::default().add_modifier(Modifier::REVERSED));
             f.render_stateful_widget(table, cols[1], &mut tstate);
+            off_right = tstate.offset();
         } else {
             let p = Paragraph::new("no rows").block(
                 Block::default()
@@ -1524,28 +1634,40 @@ impl App {
             );
             f.render_widget(p, cols[1]);
         }
+
+        // Capture hit-test geometry for mouse clicks.
+        self.click_left = rect_left;
+        self.click_right = rect_right;
+        self.off_left = off_left;
+        self.off_right = off_right;
     }
 
-    fn render_rkyv(&self, f: &mut Frame, area: Rect) {
+    fn render_rkyv(&mut self, f: &mut Frame, area: Rect) {
+        // Records mutates click geometry, so handle it before borrowing the store.
+        if self.rkyv_view == RkyvView::Records {
+            self.render_rkyv_records(f, area);
+            return;
+        }
         let r = match &self.store {
             Store::Rkyv(r) => r,
             _ => return,
         };
         match self.rkyv_view {
-            RkyvView::Records => self.render_rkyv_records(f, area),
             RkyvView::Info => self.render_rkyv_info(f, area, r),
             RkyvView::Strings => self.render_rkyv_strings(f, area),
             RkyvView::Hex => self.render_rkyv_hex(f, area, r),
+            RkyvView::Records => {}
         }
     }
 
-    fn render_rkyv_records(&self, f: &mut Frame, area: Rect) {
+    fn render_rkyv_records(&mut self, f: &mut Frame, area: Rect) {
+        let cols =
+            Layout::horizontal([Constraint::Percentage(45), Constraint::Min(10)]).split(area);
+        self.click_records = cols[0];
         let d = match &self.decoded {
             Some(d) => d,
             None => return,
         };
-        let cols =
-            Layout::horizontal([Constraint::Percentage(45), Constraint::Min(10)]).split(area);
 
         // Left: keys.
         let items: Vec<ListItem> = d
@@ -1564,6 +1686,7 @@ impl App {
             )
             .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
         f.render_stateful_widget(list, cols[0], &mut st);
+        let off_records = st.offset();
 
         // Right: selected value — decoded scalar fields, then a hex dump.
         let mut lines: Vec<Line> = Vec::new();
@@ -1594,6 +1717,7 @@ impl App {
         let p =
             Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(" value "));
         f.render_widget(p, cols[1]);
+        self.off_records = off_records;
     }
 
     fn render_rkyv_info(&self, f: &mut Frame, area: Rect, r: &RkyvStore) {
@@ -1727,7 +1851,24 @@ impl App {
     fn render_input(&self, f: &mut Frame, title: &str, buf: &str) {
         let area = centered(f.area(), 60, 3);
         f.render_widget(Clear, area);
-        let p = Paragraph::new(format!("{}_", buf)).block(
+        // Draw the buffer with a reversed block cursor over the char at the
+        // cursor (or a trailing space when the cursor is at the end).
+        let cur = self.input_cursor.min(buf.len());
+        let (pre, rest) = buf.split_at(cur);
+        let (at, post) = match rest.char_indices().nth(1) {
+            Some((i, _)) => rest.split_at(i),
+            None => (rest, ""),
+        };
+        let at_disp = if at.is_empty() { " " } else { at };
+        let line = Line::from(vec![
+            Span::raw(pre.to_string()),
+            Span::styled(
+                at_disp.to_string(),
+                Style::default().add_modifier(Modifier::REVERSED),
+            ),
+            Span::raw(post.to_string()),
+        ]);
+        let p = Paragraph::new(line).block(
             Block::default()
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::Cyan))
@@ -1952,6 +2093,58 @@ fn find_bytes(hay: &[u8], needle: &[u8], cur: usize, forward: bool) -> Option<us
     }
 }
 
+/// Whether the point `(col,row)` falls inside `r`.
+fn hit(r: Rect, col: u16, row: u16) -> bool {
+    col >= r.x
+        && col < r.x.saturating_add(r.width)
+        && row >= r.y
+        && row < r.y.saturating_add(r.height)
+}
+
+/// Move the cursor one char left (UTF-8-safe). Ported from iftoprs `FilterState::left`.
+fn input_left(buf: &str, cur: usize) -> usize {
+    if cur > 0 {
+        buf[..cur]
+            .char_indices()
+            .next_back()
+            .map(|(i, _)| i)
+            .unwrap_or(0)
+    } else {
+        0
+    }
+}
+
+/// Move the cursor one char right (UTF-8-safe). Ported from iftoprs `FilterState::right`.
+fn input_right(buf: &str, cur: usize) -> usize {
+    if cur < buf.len() {
+        buf[cur..]
+            .char_indices()
+            .nth(1)
+            .map(|(i, _)| cur + i)
+            .unwrap_or(buf.len())
+    } else {
+        buf.len()
+    }
+}
+
+/// Delete the word before the cursor (Ctrl+W). Ported from iftoprs
+/// `FilterState::delete_word` — skips trailing whitespace, then the word,
+/// stepping by real UTF-8 widths. Returns the new cursor position.
+fn input_delete_word(buf: &mut String, cur: usize) -> usize {
+    let s = &buf[..cur];
+    let trimmed = s.trim_end();
+    let word_start = match trimmed
+        .char_indices()
+        .rev()
+        .find(|(_, c)| c.is_whitespace())
+    {
+        Some((i, c)) => i + c.len_utf8(),
+        None => 0,
+    };
+    buf.drain(word_start..cur);
+    word_start
+}
+
 /// Parse a value-input string: a `0x…` prefix is decoded as hex bytes (spaces
 /// ignored), otherwise the string's UTF-8 bytes are used verbatim.
 fn parse_value_input(s: &str) -> Vec<u8> {
@@ -2127,7 +2320,39 @@ fn centered(area: Rect, w: u16, h: u16) -> Rect {
 
 #[cfg(test)]
 mod tests {
-    use super::{find_bytes, find_next};
+    use super::{find_bytes, find_next, hit, input_delete_word, input_left, input_right};
+    use ratatui::layout::Rect;
+
+    #[test]
+    fn cursor_left_right_utf8() {
+        // "aé" — 'é' is 2 bytes, so byte offsets are 0,1,3.
+        let s = "aé";
+        assert_eq!(input_right(s, 0), 1); // past 'a'
+        assert_eq!(input_right(s, 1), 3); // past 'é'
+        assert_eq!(input_right(s, 3), 3); // at end, stays
+        assert_eq!(input_left(s, 3), 1); // before 'é'
+        assert_eq!(input_left(s, 1), 0);
+        assert_eq!(input_left(s, 0), 0);
+    }
+
+    #[test]
+    fn delete_word_skips_trailing_space() {
+        let mut s = String::from("foo bar  ");
+        let len = s.len();
+        let cur = input_delete_word(&mut s, len);
+        assert_eq!(s, "foo ");
+        assert_eq!(cur, 4);
+    }
+
+    #[test]
+    fn hit_testing() {
+        let r = Rect::new(2, 3, 10, 5); // x=2..12, y=3..8
+        assert!(hit(r, 2, 3));
+        assert!(hit(r, 11, 7));
+        assert!(!hit(r, 12, 3)); // just past right edge
+        assert!(!hit(r, 2, 8)); // just past bottom edge
+        assert!(!hit(r, 1, 3));
+    }
 
     #[test]
     fn find_next_forward_wraps() {
