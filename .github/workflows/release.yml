@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Tag to build (e.g. v0.1.0)'
+        description: 'Tag to build (e.g. v0.1.0) — builds only, does not publish'
         required: true
         type: string
 
@@ -54,6 +54,8 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      # rusqlite's `bundled` feature compiles SQLite from C, so the musl
+      # targets need musl-gcc for the cc crate.
       - name: Install musl tools
         if: contains(matrix.target, 'musl')
         run: sudo apt-get update && sudo apt-get install -y musl-tools
@@ -63,23 +65,35 @@ jobs:
       - name: Build
         run: cargo build --release --locked --target ${{ matrix.target }}
 
-      - name: Package
+      # Tarball root is a single directory, so Homebrew's stage step chdirs
+      # into it and the formula sees zdbview / man/ / completions/ directly.
+      - name: Package (binary + man pages + zsh completion)
         shell: bash
+        env:
+          TAG: ${{ inputs.tag || github.ref_name }}
+          TARGET: ${{ matrix.target }}
         run: |
-          cd target/${{ matrix.target }}/release
-          strip zdbview 2>/dev/null || true
-          tar czf ../../../zdbview-${{ github.ref_name }}-${{ matrix.target }}.tar.gz zdbview
-          cd ../../..
+          set -eu
+          pkg="zdbview-${TAG}-${TARGET}"
+          mkdir -p "$pkg/man/man1" "$pkg/completions"
+          cp "target/${TARGET}/release/zdbview" "$pkg/zdbview"
+          strip "$pkg/zdbview" 2>/dev/null || true
+          cp man/man1/*.1 "$pkg/man/man1/"
+          cp completions/_zdbview "$pkg/completions/"
+          cp LICENSE README.md "$pkg/"
+          tar czf "${pkg}.tar.gz" "$pkg"
 
-      - uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@v4
         with:
           name: zdbview-${{ matrix.target }}
-          path: zdbview-${{ github.ref_name }}-${{ matrix.target }}.tar.gz
+          path: zdbview-${{ inputs.tag || github.ref_name }}-${{ matrix.target }}.tar.gz
 
   publish:
     name: Publish GitHub Release
     needs: build
     runs-on: ubuntu-latest
+    # workflow_dispatch is a build smoke test only; releases come from tags.
+    if: startsWith(github.ref, 'refs/tags/')
     steps:
       - uses: actions/checkout@v6
 
@@ -92,7 +106,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create ${{ github.ref_name }} \
+          gh release create "${{ github.ref_name }}" \
             --title "${{ github.ref_name }}" \
             --generate-notes \
             artifacts/*.tar.gz
@@ -101,6 +115,7 @@ jobs:
     name: Update Homebrew tap
     needs: publish
     runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
     steps:
       - uses: actions/download-artifact@v4
         with:
@@ -114,8 +129,8 @@ jobs:
           for f in artifacts/*.tar.gz; do
             base=$(basename "$f")
             sum=$(sha256sum "$f" | awk '{print $1}')
-            # e.g. zdbview-vX.Y.Z-aarch64-apple-darwin.tar.gz → aarch64_apple_darwin
-            key=$(echo "$base" | sed 's/zdbview-v[^-]*-//; s/\.tar\.gz//; s/-/_/g; s/\./_/g')
+            # zdbview-vX.Y.Z-aarch64-apple-darwin.tar.gz → aarch64_apple_darwin
+            key=$(printf '%s' "$base" | perl -pe 's/^zdbview-v[^-]*-//; s/\.tar\.gz$//; s/[.-]/_/g')
             echo "${key}=${sum}" >> "$GITHUB_OUTPUT"
           done
 
@@ -159,6 +174,8 @@ jobs:
             fi
             printf '  def install\n'
             printf '    bin.install "zdbview"\n'
+            printf '    man1.install Dir["man/man1/*.1"]\n'
+            printf '    zsh_completion.install "completions/_zdbview" => "_zdbview"\n'
             printf '  end\n\n'
             printf '  test do\n'
             printf '    assert_match "zdbview", shell_output("#{bin}/zdbview --version")\n'

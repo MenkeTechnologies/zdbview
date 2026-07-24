@@ -44,6 +44,16 @@ zdbview --rkyv   file          # force rkyv/binary
 ## Install
 
 ```sh
+brew tap MenkeTechnologies/menketech
+brew install zdbview
+```
+
+The formula installs the binary, both man pages and the zsh completion, and is
+bumped automatically by this repo's `Release` workflow on every `v*` tag.
+
+From source:
+
+```sh
 git clone https://github.com/MenkeTechnologies/zdbview
 cd zdbview && cargo build --release
 install -m 755 target/release/zdbview /usr/local/bin/
@@ -51,7 +61,10 @@ install -m 755 target/release/zdbview /usr/local/bin/
 
 SQLite is compiled in (`rusqlite`'s `bundled` feature), so there is no system
 library to install. Tagged releases publish prebuilt binaries for macOS
-(arm64 + x86_64) and Linux (glibc + static musl, arm64 + x86_64).
+(arm64 + x86_64) and Linux (glibc + static musl, arm64 + x86_64). Homebrew
+covers the glibc targets; the static musl tarballs — for Alpine, distroless and
+other non-glibc hosts — are attached to the same GitHub release, with their
+sha256 sums listed at the bottom of the formula.
 
 ## Recent files (no args)
 
@@ -122,6 +135,9 @@ case-sensitive and stops at the end of the file.
 
 ## Man pages
 
+Installed by the Homebrew formula — `man zdbview` works straight after
+`brew install`. From a source checkout:
+
 ```sh
 man -l man/man1/zdbview.1        # the standard page
 man -l man/man1/zdbviewall.1     # the all-in-one reference, zshall-style
@@ -131,6 +147,9 @@ cp man/man1/zdbview*.1 /usr/local/share/man/man1/
 ```
 
 ## Zsh completion
+
+The Homebrew formula drops `_zdbview` into Homebrew's `zsh_completion` dir,
+which is already on `fpath`. From a source checkout:
 
 ```sh
 fpath=(/path/to/zdbview/completions $fpath)
