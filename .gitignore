@@ -1,1 +1,4 @@
 /target
+# Binary crate: the lockfile is part of the release contract, so it overrides
+# the global ignore — CI and the release workflow build with --locked.
+!Cargo.lock
