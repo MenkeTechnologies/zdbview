@@ -23,7 +23,14 @@ mod store;
 
 use anyhow::{anyhow, Result};
 use clap::Parser;
-use ratatui::DefaultTerminal;
+use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
+use crossterm::execute;
+use crossterm::terminal::{
+    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+};
+use ratatui::backend::CrosstermBackend;
+use ratatui::{DefaultTerminal, Terminal};
+use std::io;
 use std::path::PathBuf;
 
 use store::Store;
@@ -56,14 +63,35 @@ fn main() -> Result<()> {
         return run_export(&cli, fmt);
     }
 
-    let mut terminal = ratatui::init();
-    // `ratatui::init()` does not capture the mouse; enable it so the TUI gets
-    // scroll-wheel and click events.
-    let _ = crossterm::execute!(std::io::stdout(), crossterm::event::EnableMouseCapture);
+    // Manual terminal setup (ported from iftoprs) so mouse capture is enabled
+    // in the same sequence as entering the alternate screen — `ratatui::init()`
+    // does not capture the mouse, so scroll/click events never arrive.
+    let mut terminal = setup_terminal()?;
     let res = run(&cli, &mut terminal);
-    let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableMouseCapture);
-    ratatui::restore();
+    restore_terminal(&mut terminal);
     res
+}
+
+/// Enter raw mode + alternate screen with mouse capture, matching iftoprs.
+fn setup_terminal() -> Result<DefaultTerminal> {
+    enable_raw_mode()?;
+    let mut stdout = io::stdout();
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    let terminal = Terminal::new(CrosstermBackend::new(stdout))?;
+    Ok(terminal)
+}
+
+/// Reverse of `setup_terminal`; best-effort so a partial teardown still leaves
+/// the terminal usable.
+fn restore_terminal(terminal: &mut DefaultTerminal) {
+    disable_raw_mode().ok();
+    execute!(
+        terminal.backend_mut(),
+        DisableMouseCapture,
+        LeaveAlternateScreen
+    )
+    .ok();
+    terminal.show_cursor().ok();
 }
 
 fn run_export(cli: &Cli, fmt: &str) -> Result<()> {

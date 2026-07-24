@@ -1900,7 +1900,28 @@ pub fn pick_mru(terminal: &mut DefaultTerminal, entries: &[Entry]) -> Result<Opt
             None
         };
         terminal.draw(|f| render_picker(f, entries, idx, query))?;
-        if let Event::Key(key) = event::read()? {
+        let ev = event::read()?;
+        // Mouse: wheel moves the selection, a click opens the entry under it.
+        if let Event::Mouse(m) = ev {
+            match m.kind {
+                MouseEventKind::ScrollDown => {
+                    if idx + 1 < entries.len() {
+                        idx += 1;
+                    }
+                }
+                MouseEventKind::ScrollUp => idx = idx.saturating_sub(1),
+                MouseEventKind::Down(_) => {
+                    // The list starts one row below the block's top border.
+                    let clicked = (m.row as usize).saturating_sub(1);
+                    if clicked < entries.len() {
+                        return Ok(Some(entries[clicked].path.clone()));
+                    }
+                }
+                _ => {}
+            }
+            continue;
+        }
+        if let Event::Key(key) = ev {
             if key.kind != KeyEventKind::Press {
                 continue;
             }
