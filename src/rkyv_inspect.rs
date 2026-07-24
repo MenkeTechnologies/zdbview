@@ -23,8 +23,7 @@ pub struct StringHit {
 
 impl RkyvStore {
     pub fn open(path: &Path) -> Result<Self> {
-        let bytes =
-            std::fs::read(path).with_context(|| format!("read {}", path.display()))?;
+        let bytes = std::fs::read(path).with_context(|| format!("read {}", path.display()))?;
         Ok(Self {
             path: path.to_path_buf(),
             bytes,
@@ -83,7 +82,13 @@ impl RkyvStore {
         }
         let ascii: String = chunk
             .iter()
-            .map(|&b| if (0x20..0x7f).contains(&b) { b as char } else { '.' })
+            .map(|&b| {
+                if (0x20..0x7f).contains(&b) {
+                    b as char
+                } else {
+                    '.'
+                }
+            })
             .collect();
         format!("{:08x}  {} |{}|", offset, hex, ascii)
     }

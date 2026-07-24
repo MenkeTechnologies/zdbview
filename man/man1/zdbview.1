@@ -151,7 +151,11 @@ recoverable from the bytes:
 .B Records
 \(em key/value table for a recognized archive: keys on the left, the selected
 value's decoded scalar fields and a hex dump of its blob on the right. This view
-is selected automatically when a format is recognized, and is read-only.
+is selected automatically when a format is recognized. Records can be evicted
+with
+.B d
+(the shard is deserialized, the entry removed, and the file re-serialized
+byte-identically and rewritten atomically).
 .TP
 .B 1
 .B Info
@@ -171,8 +175,21 @@ practice this surfaces keys, interned identifiers and string fields.
 Adding a format is a single registry entry in
 .IR src/formats.rs :
 copy the producer's archive type (same rkyv version and features) and map its
-magic, or add a validated try-decode for a header-less one. Writing archives
-back is out of scope for this release \(em the Records view is read-only.
+magic, or add a validated try-decode for a header-less one.
+.SS Disassembly
+Built with
+.B "cargo build --features disasm"
+the detail value pane gains a
+.B disasm
+render mode that decodes a
+.B fusevm::Chunk
+value blob (bincode) into ops, constants and names using the real
+.B fusevm
+types. bincode is version-sensitive, so disassembly is correct only when the
+linked
+.B fusevm
+matches the version that wrote the cache; a mismatch fails loudly and falls back
+to hex. The feature is off by default so the crate stays self-contained.
 .SH KEYS
 .TP
 .B Tab
@@ -208,7 +225,10 @@ view, open the detail screen for the selected row / record. In the picker, open
 the file.
 .TP
 .B v
-On the detail screen, cycle the value render mode: auto / hex / text.
+On the detail screen, cycle the value render mode: auto / hex / text / disasm
+(disasm requires the
+.B disasm
+build feature).
 .TP
 .B y
 Copy the current cell, value, or key to the system clipboard via OSC 52 (works

@@ -10,7 +10,7 @@ authors = ["MenkeTechnologies <linux.dev25@gmail.com>"]
 license = "MIT"
 repository = "https://github.com/MenkeTechnologies/zdbview"
 homepage = "https://menketechnologies.github.io/zdbview"
-documentation = "https://menketechnologies.github.io/zdbview"
+documentation = "https://docs.rs/zdbview"
 readme = "README.md"
 keywords = ["sqlite", "rkyv", "tui", "database", "viewer"]
 categories = ["command-line-utilities", "database"]
@@ -21,6 +21,12 @@ exclude = ["/docs", "/screenshots"]
 name = "zdbview"
 path = "src/main.rs"
 
+[features]
+# Bytecode disassembly of fusevm::Chunk value blobs. Optional because it pulls
+# the fusevm crate (a local path dependency, not published), so the default
+# build and crates.io publish stay self-contained.
+disasm = ["dep:fusevm", "dep:bincode"]
+
 [dependencies]
 ratatui = "0.30"
 crossterm = "0.29"
@@ -30,6 +36,10 @@ clap = { version = "4", features = ["derive"] }
 # Pinned to match the rkyv version + features zshrs serializes its shards with,
 # so recognized archives validate byte-for-byte.
 rkyv = { version = "0.7", features = ["validation", "archive_le", "size_32"] }
+# disasm feature only: the real fusevm bytecode types (no vendored copy of the
+# 267-variant Op enum, so no drift risk) + bincode to decode the blobs.
+fusevm = { path = "../fusevm", version = "0.14", default-features = false, optional = true }
+bincode = { version = "1", optional = true }
 
 [profile.release]
 lto = true

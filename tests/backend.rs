@@ -6,17 +6,17 @@ use std::io::Write;
 // Pull the crate's modules in by path. The binary crate exposes them via the
 // integration test harness only if declared in a lib; since zdbview is a bin,
 // re-include the sources under test.
-#[path = "../src/store.rs"]
-mod store;
-#[path = "../src/sqlite.rs"]
-mod sqlite;
-#[path = "../src/rkyv_inspect.rs"]
-mod rkyv_inspect;
 #[path = "../src/mru.rs"]
 mod mru;
+#[path = "../src/rkyv_inspect.rs"]
+mod rkyv_inspect;
+#[path = "../src/sqlite.rs"]
+mod sqlite;
+#[path = "../src/store.rs"]
+mod store;
 
-use sqlite::SqliteStore;
 use rkyv_inspect::RkyvStore;
+use sqlite::SqliteStore;
 use store::{detect, Kind};
 
 fn tmp(name: &str) -> std::path::PathBuf {
@@ -149,15 +149,24 @@ fn detect_sqlite_by_magic_and_extension() {
     let conn = rusqlite::Connection::open(&dbpath).unwrap();
     conn.execute("CREATE TABLE t (x)", []).unwrap();
     drop(conn);
-    assert!(matches!(detect(&dbpath, false, false).unwrap(), Kind::Sqlite));
+    assert!(matches!(
+        detect(&dbpath, false, false).unwrap(),
+        Kind::Sqlite
+    ));
 
     // Non-sqlite file with unknown extension → rkyv default.
     let binpath = tmp("blob.bin");
     std::fs::write(&binpath, [0u8, 1, 2, 3]).unwrap();
-    assert!(matches!(detect(&binpath, false, false).unwrap(), Kind::Rkyv));
+    assert!(matches!(
+        detect(&binpath, false, false).unwrap(),
+        Kind::Rkyv
+    ));
 
     // Force flags win.
-    assert!(matches!(detect(&binpath, true, false).unwrap(), Kind::Sqlite));
+    assert!(matches!(
+        detect(&binpath, true, false).unwrap(),
+        Kind::Sqlite
+    ));
     assert!(matches!(detect(&dbpath, false, true).unwrap(), Kind::Rkyv));
 
     let _ = std::fs::remove_file(&dbpath);

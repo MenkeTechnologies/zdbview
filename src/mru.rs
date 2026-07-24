@@ -63,8 +63,12 @@ pub(crate) fn load_path(file: &Path) -> Vec<Entry> {
         let (Some(ts), Some(kind), Some(path)) = (it.next(), it.next(), it.next()) else {
             continue;
         };
-        let Ok(secs) = ts.parse::<u64>() else { continue };
-        let Some(kind) = parse_kind(kind) else { continue };
+        let Ok(secs) = ts.parse::<u64>() else {
+            continue;
+        };
+        let Some(kind) = parse_kind(kind) else {
+            continue;
+        };
         out.push(Entry {
             path: PathBuf::from(path),
             kind,
@@ -103,7 +107,12 @@ pub(crate) fn record_path(file: &Path, path: &Path, kind: Kind) {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        buf.push_str(&format!("{}\t{}\t{}\n", secs, kind_str(e.kind), e.path.display()));
+        buf.push_str(&format!(
+            "{}\t{}\t{}\n",
+            secs,
+            kind_str(e.kind),
+            e.path.display()
+        ));
     }
     // Write to a temp file then rename so a concurrent reader never sees a
     // half-written list.

@@ -14,7 +14,12 @@ fn main() {
             }
             println!("RECORDS: {}", d.records.len());
             for r in d.records.iter().take(5) {
-                println!("  key={}  value={} bytes  fields={:?}", r.key, r.value.len(), r.fields);
+                println!(
+                    "  key={}  value={} bytes  fields={:?}",
+                    r.key,
+                    r.value.len(),
+                    r.fields
+                );
             }
         }
         None => println!("NOT RECOGNIZED (structural fallback)"),

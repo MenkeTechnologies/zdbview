@@ -110,10 +110,53 @@ back to a raw structural view.
   byte offsets.
 - `3` **Hex** — `xxd`-style hex/ascii dump of the raw bytes.
 
-**Recognized formats:** zshrs script cache (`ZRSC`) and autoload cache (`ZRAL`).
-Adding a format is one registry entry: copy its archive type (same rkyv version
-and features as the producer) and map its magic. A format mismatch shows up as
-failed validation → structural fallback, never silent corruption.
+**Recognized formats** (all fusevm-host script/heap caches, rkyv 0.7):
+
+| Format | Magic | Detect | Key |
+|--------|-------|--------|-----|
+| zshrs script cache | `ZRSC` | magic | script path |
+| zshrs autoload cache | `ZRAL` | magic | function name |
+| strykelang script cache | `STRY` | magic (native v4 + compat) | script path |
+| awkrs script cache | `AWKR` | magic | script path |
+| vimlrs script cache | `VIML` | magic | script path |
+| elisprs heap-image cache | `ELSP` | magic | script path |
+| pythonrs bytecode cache | *(none)* | validated try-decode | source path |
+| rubylang / arb script cache | *(none)* | validated try-decode | u64 content hash |
+
+Magic-bearing formats are matched by their header; the header-less hash-keyed
+shards (pythonrs, rubylang, arb) are attempted last and gated by rkyv
+validation, so an unrelated archive falls through to the structural view rather
+than mis-decoding. A format mismatch always surfaces as failed validation →
+structural fallback, never silent corruption. Adding a format is one registry
+entry: copy its archive type (same rkyv version and features as the producer)
+and map its magic (or add a validated try-decode for header-less formats).
+
+### Deleting records (write-back)
+
+`d` on a record (confirm with `y`) evicts it: the shard is deserialized, the
+entry removed, and the file re-serialized and rewritten atomically (temp +
+rename). Re-serialization is byte-identical to what the producing host writes,
+so the host reads the edited shard normally. Deletion targets a record's stable
+identity (map key, or the u64 content hash for the header-less formats), so it
+removes exactly one entry even when several share a display key (pythonrs stores
+many records under `<string>`/`<stdin>`). Add and value-edit are intentionally
+absent — the value is compiled bytecode, not meaningfully editable in place.
+
+### Bytecode disassembly (`disasm` feature)
+
+The script-cache value blobs are `bincode`-encoded `fusevm::Chunk`. Built with
+
+```sh
+cargo build --features disasm
+```
+
+the value pane gains a **disasm** render mode (`v` cycles to it) that decodes the
+blob and lists ops, constants, and names using the real `fusevm` types — no
+vendored copy of the 267-variant opcode enum, so no risk of silently wrong
+output. bincode is version-sensitive: disassembly is correct only when the linked
+`fusevm` version matches the one that encoded the cache; a mismatch fails loudly
+(`invalid variant` / `unexpected EOF`) and you fall back to hex. The feature is
+off by default so the crate stays self-contained and publishable.
 
 ## Keys
 
@@ -122,16 +165,42 @@ failed validation → structural fallback, never silent corruption.
 | `Tab` | switch focus (table list ↔ rows) |
 | arrows / `hjkl` | move |
 | `gg` / `G` | jump to top / bottom |
+| `Enter` | open detail (row / record); focus rows (table list) |
 | `/` | search; `n` / `N` next / previous match |
 | `Ctrl-f` / `Ctrl-b` | page forward / back (SQLite) |
 | `e` `a` `d` `:` | edit / add / delete / SQL (SQLite) |
+| `d` | delete record — evicts + rewrites the shard (rkyv) |
+| `S` | schema view (SQLite) |
 | `0` `1` `2` `3` | Records / Info / Strings / Hex (rkyv) |
-| `q` / `Esc` | quit |
+| `v` | cycle value render (auto / hex / text / disasm) — detail screen |
+| `y` | copy cell / value / key to clipboard (OSC 52) |
+| `x` | export table (CSV) / records (JSON) to a file |
+| `?` | help overlay |
+| `q` / `Esc` | leave screen / quit |
 
-Search scans the loaded page across all columns (SQLite), record keys, the
-string list, or raw bytes (rkyv Records/Strings/Hex), or filenames (recent-files
-picker). Text searches are case-insensitive and wrap; the hex byte search is
-case-sensitive and stops at the end of the file.
+SQLite search is **whole-table** (SQL-backed across every column), not limited to
+the loaded page; rkyv search scans record keys, the string list, or raw bytes.
+Text searches are case-insensitive and wrap; the hex byte search is
+case-sensitive.
+
+## Detail view
+
+`Enter` on a row or record opens a full-screen detail: every field untruncated on
+top, and a scrollable value pane below. `v` cycles how the value bytes render —
+**auto** (text if it looks textual, else hex), **hex** (`xxd` style), or **text**
+(UTF-8). `y` copies the value; the blob is shown raw, so this is how you read a
+cell or record value that's too wide for the grid.
+
+## Export
+
+Interactive `x` writes the current table (CSV) or all records (JSON) to a file in
+the working directory. Non-interactively:
+
+```sh
+zdbview data.db --export json      # object of { table: [rows...] }, all tables
+zdbview data.db --export csv       # first table as CSV
+zdbview cache.rkyv --export json   # recognized records, value blob as hex
+```
 
 ## Man pages
 

@@ -28,8 +28,7 @@ pub fn detect(path: &Path, force_sqlite: bool, force_rkyv: bool) -> Result<Kind>
     }
 
     let mut buf = [0u8; 16];
-    let mut f =
-        std::fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
+    let mut f = std::fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
     let n = f.read(&mut buf)?;
 
     if n >= SQLITE_MAGIC.len() {

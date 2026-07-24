@@ -10,6 +10,7 @@ _zdbview() {
     args=(
         '(--sqlite --rkyv)--sqlite[Force treating the file as a SQLite database]'
         '(--sqlite --rkyv)--rkyv[Force treating the file as a rkyv archive or raw binary]'
+        '--export[Non-interactively dump contents and exit]:format:(json csv)'
         '(- *)'{-h,--help}'[Print help]'
         '(- *)'{-V,--version}'[Print version]'
         '1:file:_zdbview_files'
