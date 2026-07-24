@@ -22,9 +22,9 @@ name = "zdbview"
 path = "src/main.rs"
 
 [features]
-# Bytecode disassembly of fusevm::Chunk value blobs. Optional because it pulls
-# the fusevm crate (a local path dependency, not published), so the default
-# build and crates.io publish stay self-contained.
+# Bytecode disassembly of fusevm::Chunk value blobs. Optional so the default
+# build stays a five-dependency TUI; enable it when you need to read a cached
+# chunk as ops rather than hex.
 disasm = ["dep:fusevm", "dep:bincode"]
 
 [dependencies]
@@ -38,7 +38,7 @@ clap = { version = "4", features = ["derive"] }
 rkyv = { version = "0.7", features = ["validation", "archive_le", "size_32"] }
 # disasm feature only: the real fusevm bytecode types (no vendored copy of the
 # 267-variant Op enum, so no drift risk) + bincode to decode the blobs.
-fusevm = { path = "../fusevm", version = "0.14", default-features = false, optional = true }
+fusevm = { version = "0.14", default-features = false, optional = true }
 bincode = { version = "1", optional = true }
 
 [profile.release]
