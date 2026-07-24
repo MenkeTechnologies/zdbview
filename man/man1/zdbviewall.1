@@ -44,6 +44,9 @@ be grepped with `/':
 .br
 .B 10. LIMITATIONS
 .RB "\(em " "what is deliberately not implemented"
+.br
+.B 11. EXPORT, DETAIL AND CLIPBOARD
+.RB "\(em " "CSV/JSON out, the detail screen, OSC 52 copy"
 .RE
 .SH 1. INVOCATION
 .RS 4
@@ -68,6 +71,17 @@ Skip detection and open the file as a rkyv archive / raw binary. Mutually
 exclusive with
 .BR \-\-sqlite ;
 clap rejects the combination.
+.TP
+.BI \-\-export " FORMAT"
+Dump the file to standard output and exit, without initializing the terminal.
+.I FORMAT
+is
+.B json
+or
+.BR csv ,
+and a
+.I FILE
+is required. See section 11.
 .TP
 .B \-h ", " \-\-help
 Print usage and exit.
@@ -202,7 +216,8 @@ rkyv version (0.7), same features
 same field order and types. Detection is a cheap little-endian scan for the
 format's magic, followed by a full
 .B rkyv::check_archived_root
-validation. Two formats are recognized today:
+validation. Eight formats are recognized \(em the script and heap caches the
+fusevm-hosted languages write:
 .RS 2
 .IP \(bu 2
 .B ZRSC
@@ -212,7 +227,35 @@ and the compiled chunk blob.
 .B ZRAL
 \(em the zshrs autoload cache: per-function entries carrying cache timestamps
 and the compiled chunk blob.
+.IP \(bu 2
+.B STRY
+\(em the strykelang script cache, in both its native and its compat layout;
+keyed by script path.
+.IP \(bu 2
+.B AWKR
+\(em the awkrs script cache, keyed by script path.
+.IP \(bu 2
+.B VIML
+\(em the vimlrs script cache, keyed by script path.
+.IP \(bu 2
+.B ELSP
+\(em the elisprs heap-image cache, keyed by script path.
+.IP \(bu 2
+the
+.B pythonrs
+bytecode cache \(em no magic header, keyed by source path.
+.IP \(bu 2
+the hash-keyed
+.B rubylang
+/
+.B arb
+script cache \(em no magic header, keyed by a u64 content hash rendered as hex.
 .RE
+.PP
+The two header-less formats have nothing to pre-filter on, so they are attempted
+last and admitted on rkyv validation alone. An unrelated archive that happens to
+survive the earlier magic scans still fails their validation and falls through to
+the structural view.
 .PP
 Because decoding goes through validation, a copied type that has drifted from
 its producer fails the check and the file falls back to the structural views. A
@@ -259,7 +302,18 @@ jumps to the final line.
 .SS Global
 .TP
 .BR q ", " Esc
-Quit.
+Leave the current screen; from the main view, quit.
+.TP
+.B ?
+Show the context-sensitive key-help overlay. Any key closes it.
+.TP
+.B y
+Copy the current cell, value or record key to the system clipboard via the
+OSC 52 terminal escape (em no clipboard library, and it works over SSH.
+.TP
+.B x
+Export: the current table as CSV (SQLite) or all decoded records as JSON (rkyv),
+written to a file in the working directory.
 .TP
 .BR gg ", " G
 First / last. A lone
@@ -277,7 +331,12 @@ Next / previous match.
 Toggle focus between the table list and the row grid.
 .TP
 .B Enter
-From the table list, move focus to the rows.
+From the table list, move focus to the rows; from the row grid, open the detail
+screen for the selected row.
+.TP
+.B S
+Open the schema screen for the database: the CREATE statements for tables, views
+and indexes.
 .TP
 .BR k ", " Up
 Previous table (left pane) or previous row (right pane).
@@ -309,6 +368,9 @@ Records / Info / Strings / Hex. Key
 .B 0
 is available only when the archive format was recognized.
 .TP
+.B Enter
+In the Records view, open the detail screen for the selected record.
+.TP
 .BR j ", " k
 Scroll the record list, the string list or the hex dump.
 .TP
@@ -327,6 +389,20 @@ Search file names.
 .TP
 .BR q ", " Esc
 Quit without opening anything.
+.SS Detail screen
+.TP
+.B v
+Cycle how the value renders: auto (text when it looks textual, else hex), hex, or
+text.
+.TP
+.BR j ", " k ", " g ", " G
+Scroll the value pane.
+.TP
+.B y
+Copy the value.
+.TP
+.BR q ", " Esc ", " Enter
+Return to the main view.
 .SS Modal input (edit, SQL, search)
 .TP
 .B Enter
@@ -352,13 +428,11 @@ which pane has focus:
 Table names, case-insensitively. Wraps at the ends.
 .TP
 .B SQLite \(em rows
-Every cell of the loaded page, row by row, across all columns,
-case-insensitively. Wraps at the ends. Matching is confined to the current
-page; page first, then search, or use
-.B :
-with a
-.B WHERE
-clause.
+The whole table, not just the loaded page: a
+.B "SELECT rowid ... WHERE <any column> LIKE ?"
+walks from the current row in the search direction, wraps from the far edge when
+nothing is found ahead, and the view pages to the row that matched. Matching is
+case-insensitive, as SQL LIKE is for ASCII.
 .TP
 .B rkyv \(em Records
 Record keys, case-insensitively. Wraps at the ends.
@@ -429,6 +503,16 @@ fallback to the structural views on any mismatch.
 The recent-files store: load, record, dedupe, cap, atomic write, relative-age
 formatting.
 .TP
+.B src/export.rs
+Dependency-free CSV and JSON writers shared by the interactive
+.B x
+key and the non-interactive
+.B \-\-export
+path.
+.TP
+.B src/clipboard.rs
+OSC 52 clipboard copy, including the hand-rolled base64 the escape carries.
+.TP
 .B src/app.rs
 The interactive layer: application state, focus and modal handling, key
 dispatch, search, and all ratatui rendering.
@@ -474,12 +558,14 @@ wrong write corrupts a cache the producer then mmaps. Unrecognized archives stay
 structural, since guessing field boundaries from an untyped image would produce
 plausible, wrong output.
 .TP
-.B Search is page-local in SQLite
-Matching runs over the loaded page, not the whole table. Use
-.B :
-with a
+.B Search is a plain substring
+No regular expressions, and no full-text index. SQLite row search runs as a SQL
+.B LIKE
+over every column of the table, so it is whole-table but linear; a
 .B WHERE
-clause to search a large table.
+clause through
+.B :
+remains the right tool for a complex predicate.
 .TP
 .B WITHOUT ROWID tables are read-only
 No
@@ -489,15 +575,66 @@ means no generic row handle for
 and
 .BR DELETE .
 .TP
-.B Blobs are summarized, not edited
-Cells render as
-.RI "\(oq" "<blob N bytes>" "\(cq" ;
-use
-.B :
-to write binary values.
+.B Blobs are readable, not editable
+The grid summarizes a blob as
+.RI "\(oq" "<blob N bytes>" "\(cq"
+and the detail screen shows its bytes as hex or text, but writing binary values
+still goes through
+.BR : .
 .TP
 .B Single connection, no transaction UI
 Each statement commits on its own. There is no explicit begin/rollback surface.
+.SH 11. EXPORT, DETAIL AND CLIPBOARD
+.SS Export
+.B x
+writes the current table as CSV (SQLite) or all decoded records as JSON (rkyv)
+to a file in the working directory, named after the table or the archive. The
+same rendering is available without the TUI:
+.PP
+.RS 4
+.B zdbview data.db \-\-export json
+.br
+.B zdbview data.db \-\-export csv
+.br
+.B zdbview cache.rkyv \-\-export json
+.RE
+.PP
+For SQLite,
+.B json
+emits an object of
+.RI { table :
+[rows]} covering every table, while
+.B csv
+emits the first table alone \(em CSV has no way to express several tables in one
+stream. For a recognized rkyv archive both emit the decoded records, each value
+blob as a lowercase hex string; an unrecognized archive is an error, because
+there is nothing structured to export. The writers are hand-rolled in
+.IR src/export.rs ,
+so export adds no dependency, and their quoting and escaping are unit-tested.
+.SS Detail screen
+.B Enter
+on a row or record opens a full-screen detail: every field untruncated at the
+top, and a scrollable value pane below.
+.B v
+cycles the value render mode \(em
+.B auto
+(text when the bytes look textual, else hex),
+.B hex
+.RB ( xxd
+style), or
+.B text
+(UTF-8). This is how a cell or blob too wide for the grid gets read.
+.SS Clipboard
+.B y
+copies through the
+.B OSC 52
+terminal escape, written straight to
+.IR /dev/tty .
+No clipboard library, no X, Wayland or
+.BR pbcopy (1)
+dependency, and it works over SSH, because the terminal emulator on the near end
+is what sets the clipboard. It is best-effort: with no controlling terminal the
+copy silently does nothing.
 .SH SEE ALSO
 .BR zdbview (1),
 .BR sqlite3 (1),

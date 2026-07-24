@@ -40,6 +40,23 @@ Force treating the file as a SQLite database, skipping detection.
 Force treating the file as a rkyv archive / raw binary. Mutually exclusive with
 .BR \-\-sqlite .
 .TP
+.BI \-\-export " FORMAT"
+Non-interactively dump the file's contents to standard output and exit, without
+starting the TUI.
+.I FORMAT
+is
+.B json
+or
+.BR csv .
+For SQLite,
+.B json
+emits an object of
+.RI { table :\  [ rows ]}
+for every table and
+.B csv
+emits the first table. For a recognized rkyv archive, records are emitted as
+JSON with the value blob as a hex string.
+.TP
 .B \-h ", " \-\-help
 Print usage and exit.
 .TP
@@ -90,15 +107,43 @@ is reported in the status bar and the current page is reloaded.
 .SH RKYV MODE
 The rkyv format stores no field names and no type tags, so a generic reader
 cannot recover the schema of an arbitrary archive without the originating Rust
-type. zdbview supplies that type for the formats it recognizes \(em currently the
-zshrs script cache
-.RB ( ZRSC )
-and autoload cache
-.RB ( ZRAL )
-\(em detecting each by its magic header and decoding through
+type. zdbview supplies that type for the formats it recognizes, decoding through
 .BR rkyv::check_archived_root ,
 so a copied type that has drifted from its producer fails validation instead of
-misreading the bytes. For anything unrecognized, the views show what
+misreading the bytes. Eight formats are recognized \(em the script and heap
+caches the fusevm-hosted languages write:
+.RS 2
+.IP \(bu 2
+.B ZRSC
+\(em zshrs script cache, keyed by script path.
+.IP \(bu 2
+.B ZRAL
+\(em zshrs autoload cache, keyed by function name.
+.IP \(bu 2
+.B STRY
+\(em strykelang script cache (native and compat layouts), keyed by script path.
+.IP \(bu 2
+.B AWKR
+\(em awkrs script cache, keyed by script path.
+.IP \(bu 2
+.B VIML
+\(em vimlrs script cache, keyed by script path.
+.IP \(bu 2
+.B ELSP
+\(em elisprs heap-image cache, keyed by script path.
+.IP \(bu 2
+the header-less
+.B pythonrs
+bytecode cache (keyed by source path) and the header-less hash-keyed
+.B rubylang
+/
+.B arb
+script cache (keyed by u64 content hash) \(em both recognized by validated
+try-decode rather than a magic scan, and attempted last so an unrelated archive
+falls through instead of mis-decoding.
+.RE
+.PP
+For anything unrecognized, the views show what
 .I is
 recoverable from the bytes:
 .TP
@@ -126,8 +171,8 @@ practice this surfaces keys, interned identifiers and string fields.
 Adding a format is a single registry entry in
 .IR src/formats.rs :
 copy the producer's archive type (same rkyv version and features) and map its
-magic. Writing archives back is out of scope for this release \(em the Records
-view is read-only.
+magic, or add a validated try-decode for a header-less one. Writing archives
+back is out of scope for this release \(em the Records view is read-only.
 .SH KEYS
 .TP
 .B Tab
@@ -148,20 +193,41 @@ page, not just the visible rows.
 Page forward / back through rows.
 .TP
 .B /
-Search. The pattern is matched against table names or every column of the loaded
-page (SQLite, depending on focus), record keys, the extracted strings or the raw
-bytes (rkyv), or the file names (recent-files picker). Text searches are
-case-insensitive and wrap; the hex search is a case-sensitive byte match and
-does not wrap.
+Search. The pattern is matched against table names, or \(em with the row grid
+focused \(em every column of the whole table via SQL (not just the loaded page),
+record keys, the extracted strings or the raw bytes (rkyv), or the file names
+(recent-files picker). Text searches are case-insensitive and wrap; the hex
+search is a case-sensitive byte match.
 .TP
 .BR n ", " N
 Jump to the next / previous match of the active search.
 .TP
 .B Enter
-Move focus from the table list into the rows; in the picker, open the file.
+In the table list, move focus into the rows. In the row grid or the rkyv Records
+view, open the detail screen for the selected row / record. In the picker, open
+the file.
+.TP
+.B v
+On the detail screen, cycle the value render mode: auto / hex / text.
+.TP
+.B y
+Copy the current cell, value, or key to the system clipboard via OSC 52 (works
+over SSH).
+.TP
+.B x
+Export the current table (SQLite, CSV) or all records (rkyv, JSON) to a file in
+the working directory.
+.TP
+.B S
+Show the SQLite schema (CREATE statements for tables, views, and indexes).
+.TP
+.B ?
+Show the context-sensitive key help overlay.
 .TP
 .BR q ", " Esc
-Quit. Inside a modal (edit, SQL, search, confirm), Esc cancels the modal only.
+Leave the current screen or quit. On the detail, schema, or help screen, return
+to the main view. Inside a modal (edit, SQL, search, confirm), Esc cancels the
+modal only.
 .SH RECENT FILES
 Every successful open is recorded, most-recent-first, deduplicated by absolute
 path and capped at 50 entries. The list is written atomically (temp file plus

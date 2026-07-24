@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="dark light">
-  <meta name="description" content="zdbview — terminal inspector and CRUD editor for rkyv archives and SQLite databases. One binary: generic SQLite CRUD by rowid, recognized-format rkyv key/value decoding with structural fallback (records / info / strings / hex), vim keys, search, recent-files picker.">
+  <meta name="description" content="zdbview — terminal inspector and CRUD editor for rkyv archives and SQLite databases. One binary: generic SQLite CRUD by rowid, key/value decoding for 8 recognized rkyv cache formats with structural fallback, whole-table search, detail view, CSV/JSON export, OSC 52 clipboard, recent-files picker.">
   <title>zdbview — Documentation</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -88,7 +88,7 @@
             <span class="sep">/</span>
             <a href="https://github.com/MenkeTechnologies/zdbview/issues" target="_blank" rel="noopener noreferrer">Issues</a>
           </nav>
-          <p class="docs-build-line" id="zdbviewBuildLine">zdbview v0.1.0 · ratatui + crossterm TUI · generic SQLite CRUD by rowid · rkyv format registry with structural fallback · vim motions · recent-files picker</p>
+          <p class="docs-build-line" id="zdbviewBuildLine">zdbview v0.1.0 · ratatui + crossterm TUI · generic SQLite CRUD by rowid · 8 recognized rkyv cache formats with structural fallback · whole-table search · CSV/JSON export · OSC 52 clipboard</p>
         </div>
         <div class="tutorial-toolbar">
           <button type="button" class="btn btn-secondary" id="btnTheme" title="Toggle light/dark">Theme</button>
@@ -113,7 +113,11 @@
 
       <section class="tutorial-section">
         <h2>Quickstart</h2>
-<pre># build from source
+<pre># install (binary + both man pages + zsh completion)
+brew tap MenkeTechnologies/menketech
+brew install zdbview
+
+# or build from source
 git clone https://github.com/MenkeTechnologies/zdbview
 cd zdbview &amp;&amp; cargo build --release
 
@@ -172,8 +176,22 @@ zdbview</pre>
             <tr><td>3 — Hex</td><td><code>xxd</code>-style dump: 16 bytes per line as <code>offset&nbsp;&nbsp;hex&nbsp;&nbsp;|ascii|</code>.</td></tr>
           </tbody>
         </table>
-        <p><strong>Recognized formats:</strong> the zshrs script cache (<code>ZRSC</code>) and autoload cache (<code>ZRAL</code>). Adding one is a single registry entry: copy the producer's archive type — same rkyv version (0.7) and features (<code>validation</code>, <code>archive_le</code>, <code>size_32</code>), same field order and types — and map its magic. Because decoding goes through validation, a type that has drifted from its producer fails the check and drops to the structural view; it never silently misreads the bytes.</p>
-        <p class="doc-note">Editing a recognized archive in place is a separate step: today the Records view is read-only.</p>
+        <p><strong>Recognized formats</strong> — the script and heap caches the fusevm-hosted languages write, all rkyv 0.7:</p>
+        <table class="doc-table">
+          <thead><tr><th>Format</th><th>Magic</th><th>Detected by</th><th>Record key</th></tr></thead>
+          <tbody>
+            <tr><td>zshrs script cache</td><td><code>ZRSC</code></td><td>magic</td><td>script path</td></tr>
+            <tr><td>zshrs autoload cache</td><td><code>ZRAL</code></td><td>magic</td><td>function name</td></tr>
+            <tr><td>strykelang script cache</td><td><code>STRY</code></td><td>magic (native + compat layout)</td><td>script path</td></tr>
+            <tr><td>awkrs script cache</td><td><code>AWKR</code></td><td>magic</td><td>script path</td></tr>
+            <tr><td>vimlrs script cache</td><td><code>VIML</code></td><td>magic</td><td>script path</td></tr>
+            <tr><td>elisprs heap-image cache</td><td><code>ELSP</code></td><td>magic</td><td>script path</td></tr>
+            <tr><td>pythonrs bytecode cache</td><td><em>none</em></td><td>validated try-decode</td><td>source path</td></tr>
+            <tr><td>rubylang / arb script cache</td><td><em>none</em></td><td>validated try-decode</td><td>u64 content hash</td></tr>
+          </tbody>
+        </table>
+        <p>Magic-bearing formats are matched by header; the header-less hash-keyed shards are attempted last and gated by rkyv validation, so an unrelated archive falls through to the structural view instead of mis-decoding. Adding a format is a single registry entry: copy the producer's archive type — same rkyv version (0.7) and features (<code>validation</code>, <code>archive_le</code>, <code>size_32</code>), same field order and types — and map its magic, or add a validated try-decode for a header-less one.</p>
+        <p class="doc-note">The Records view is read-only in the UI. <code>formats.rs</code> already carries a validated delete-and-reserialize path with tests, but no key is bound to it — writing a shard back means reproducing the producer's exact layout, and a wrong write corrupts a cache the producer then mmaps.</p>
       </section>
 
       <section class="tutorial-section">
@@ -188,9 +206,14 @@ zdbview</pre>
             <tr><td>/</td><td>Search</td></tr>
             <tr><td>n / N</td><td>Next / previous match</td></tr>
             <tr><td>e a d :</td><td>Edit cell / insert row / delete row / SQL (SQLite)</td></tr>
+            <tr><td>S</td><td>Schema view for the selected table (SQLite)</td></tr>
             <tr><td>0 1 2 3</td><td>Records / Info / Strings / Hex (rkyv — <code>0</code> only when the format was recognized)</td></tr>
-            <tr><td>Enter</td><td>Focus the rows; in the picker, open the file</td></tr>
-            <tr><td>q / Esc</td><td>Quit — inside a modal, Esc cancels the modal only</td></tr>
+            <tr><td>Enter</td><td>Open the detail screen for the selected row or record; from the table list, focus the rows; in the picker, open the file</td></tr>
+            <tr><td>v</td><td>Cycle how a value renders on the detail screen: auto / hex / text</td></tr>
+            <tr><td>y</td><td>Copy the cell, value or record key to the clipboard (OSC 52 — works over SSH)</td></tr>
+            <tr><td>x</td><td>Export the current table as CSV, or all records as JSON, to a file</td></tr>
+            <tr><td>?</td><td>Help overlay; any key closes it</td></tr>
+            <tr><td>q / Esc</td><td>Leave the current screen, or quit — inside a modal, Esc cancels the modal only</td></tr>
           </tbody>
         </table>
       </section>
@@ -202,13 +225,32 @@ zdbview</pre>
           <thead><tr><th>Mode</th><th>Scanned</th></tr></thead>
           <tbody>
             <tr><td>SQLite — tables</td><td>Table names, case-insensitive, wrapping</td></tr>
-            <tr><td>SQLite — rows</td><td>Every column of the loaded page, case-insensitive, wrapping. Page-local: page first, or use <code>:</code> with a <code>WHERE</code> clause</td></tr>
+            <tr><td>SQLite — rows</td><td>The whole table, not just the loaded page: a <code>SELECT rowid … WHERE &lt;any column&gt; LIKE ?</code> that walks from the current row and wraps from the far edge, then pages to the hit</td></tr>
             <tr><td>rkyv — Records</td><td>Record keys, case-insensitive, wrapping</td></tr>
             <tr><td>rkyv — Strings</td><td>The extracted runs, case-insensitive, wrapping</td></tr>
             <tr><td>rkyv — Hex</td><td>Raw bytes, case-sensitive, does <em>not</em> wrap; the view scrolls to the hit and the offset is reported</td></tr>
             <tr><td>Picker</td><td>Recorded file paths, case-insensitive, wrapping</td></tr>
           </tbody>
         </table>
+      </section>
+
+      <section class="tutorial-section">
+        <h2>Detail view</h2>
+        <p><code>Enter</code> on a row or record opens a full-screen detail: every field untruncated at the top, and a scrollable value pane below. <code>v</code> cycles how the value bytes render — <strong>auto</strong> (text when it looks textual, else hex), <strong>hex</strong> (<code>xxd</code> style), or <strong>text</strong> (UTF-8). <code>y</code> copies the value. This is how you read a cell or record blob too wide for the grid.</p>
+      </section>
+
+      <section class="tutorial-section">
+        <h2>Export</h2>
+        <p>Interactive <code>x</code> writes the current table (CSV) or all decoded records (JSON) to a file in the working directory. The same rendering is available non-interactively, which is what makes zdbview scriptable:</p>
+<pre>zdbview data.db --export json      # { table: [ {col: val, …}, … ] } for every table
+zdbview data.db --export csv       # the first table as RFC-4180 CSV
+zdbview cache.rkyv --export json   # decoded records; each value blob as lowercase hex</pre>
+        <p class="doc-note">CSV and JSON are emitted by a dependency-free writer in <code>export.rs</code> — quoting and escaping are covered by unit tests. <code>--export</code> never starts the TUI, so it is safe in a pipeline.</p>
+      </section>
+
+      <section class="tutorial-section">
+        <h2>Clipboard</h2>
+        <p><code>y</code> copies through the <strong>OSC 52</strong> terminal escape, written straight to <code>/dev/tty</code>. That means no clipboard library, no X/Wayland/pbcopy dependency, and it works over SSH — the terminal emulator on your side sets the clipboard. It is best-effort: with no controlling terminal (output redirected), the copy silently does nothing.</p>
       </section>
 
       <section class="tutorial-section">
@@ -224,6 +266,7 @@ zdbview</pre>
             <tr><td>[FILE]</td><td>File to open; with none, the recent-files picker opens</td></tr>
             <tr><td>&nbsp;&nbsp;&nbsp;&nbsp;--sqlite</td><td>Force the SQLite backend</td></tr>
             <tr><td>&nbsp;&nbsp;&nbsp;&nbsp;--rkyv</td><td>Force the rkyv / binary inspector (conflicts with <code>--sqlite</code>)</td></tr>
+            <tr><td>&nbsp;&nbsp;&nbsp;&nbsp;--export FORMAT</td><td>Dump the file to stdout and exit — <code>json</code> or <code>csv</code>; requires a file argument</td></tr>
             <tr><td>-h, --help</td><td>Print usage</td></tr>
             <tr><td>-V, --version</td><td>Print the version</td></tr>
           </tbody>
