@@ -36,7 +36,7 @@ carry a header.
 ```
 zdbview                        # no args → pick from recently opened files
 zdbview path/to/file.db        # SQLite → full CRUD
-zdbview path/to/archive.rkyv   # rkyv   → structural inspection
+zdbview path/to/archive.rkyv   # rkyv   → key/value if recognized, else structural
 zdbview --sqlite file          # force SQLite
 zdbview --rkyv   file          # force rkyv/binary
 ```
@@ -79,20 +79,28 @@ Identifiers are double-quoted with internal quotes doubled, and edited values ar
 bound as parameters, so schemas with spaces, keywords or quotes in their names
 work unmodified.
 
-## rkyv — structural inspection
+## rkyv — auto-detected key/value + structural inspection
 
 rkyv archives are **not self-describing**: the format stores no field names or
 type tags (https://rkyv.org/format.html), so the schema cannot be recovered from
-an arbitrary archive. Without the originating Rust type, zdbview shows the raw
-structure instead:
+an *unknown* archive. zdbview handles this with a **format registry**: known
+formats are detected by their magic header and decoded to real key/value with a
+faithfully-copied, byte-compatible archive type; anything unrecognized falls
+back to a raw structural view.
 
-- `1` **Info** — size and summary.
+- `0` **Records** — key/value table for a recognized archive: keys on the left,
+  the selected value's decoded scalar fields plus a hex dump on the right.
+  Searchable by key. This view is the default whenever a format is recognized.
+- `1` **Info** — file size, and (when recognized) the detected format name and
+  decoded header fields.
 - `2` **Strings** — every run of printable text embedded in the archive, with
-  byte offsets (keys, interned identifiers, string fields).
+  byte offsets.
 - `3` **Hex** — `xxd`-style hex/ascii dump of the raw bytes.
 
-Typed field-name CRUD over a rkyv archive requires a supplied schema descriptor
-and is planned separately.
+**Recognized formats:** zshrs script cache (`ZRSC`) and autoload cache (`ZRAL`).
+Adding a format is one registry entry: copy its archive type (same rkyv version
+and features as the producer) and map its magic. A format mismatch shows up as
+failed validation → structural fallback, never silent corruption.
 
 ## Keys
 
@@ -104,13 +112,13 @@ and is planned separately.
 | `/` | search; `n` / `N` next / previous match |
 | `Ctrl-f` / `Ctrl-b` | page forward / back (SQLite) |
 | `e` `a` `d` `:` | edit / add / delete / SQL (SQLite) |
-| `1` `2` `3` | Info / Strings / Hex (rkyv) |
+| `0` `1` `2` `3` | Records / Info / Strings / Hex (rkyv) |
 | `q` / `Esc` | quit |
 
-Search scans the loaded page across all columns (SQLite), the string list or raw
-bytes (rkyv), or filenames (recent-files picker). Text searches are
-case-insensitive and wrap; the hex byte search is case-sensitive and stops at the
-end of the file.
+Search scans the loaded page across all columns (SQLite), record keys, the
+string list, or raw bytes (rkyv Records/Strings/Hex), or filenames (recent-files
+picker). Text searches are case-insensitive and wrap; the hex byte search is
+case-sensitive and stops at the end of the file.
 
 ## Man pages
 

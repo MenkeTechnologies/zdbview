@@ -1,0 +1,22 @@
+// Throwaway verification: decode a rkyv file and print detected format + records.
+#[path = "../src/formats.rs"]
+mod formats;
+
+fn main() {
+    let path = std::env::args().nth(1).expect("usage: decode <file>");
+    let bytes = std::fs::read(&path).expect("read");
+    match formats::try_decode(&bytes) {
+        Some(d) => {
+            println!("FORMAT: {}", d.format);
+            println!("HEADER:");
+            for (k, v) in &d.header {
+                println!("  {k} = {v}");
+            }
+            println!("RECORDS: {}", d.records.len());
+            for r in d.records.iter().take(5) {
+                println!("  key={}  value={} bytes  fields={:?}", r.key, r.value.len(), r.fields);
+            }
+        }
+        None => println!("NOT RECOGNIZED (structural fallback)"),
+    }
+}

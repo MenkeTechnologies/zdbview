@@ -11,6 +11,7 @@
 //! descriptor (future work).
 
 mod app;
+mod formats;
 mod mru;
 mod rkyv_inspect;
 mod sqlite;
@@ -24,6 +25,7 @@ use std::path::PathBuf;
 #[derive(Parser)]
 #[command(
     name = "zdbview",
+    version,
     about = "Terminal inspector and CRUD editor for rkyv archives and SQLite databases"
 )]
 struct Cli {

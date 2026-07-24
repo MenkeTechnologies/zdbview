@@ -27,6 +27,9 @@ crossterm = "0.29"
 rusqlite = { version = "0.40", features = ["bundled"] }
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
+# Pinned to match the rkyv version + features zshrs serializes its shards with,
+# so recognized archives validate byte-for-byte.
+rkyv = { version = "0.7", features = ["validation", "archive_le", "size_32"] }
 
 [profile.release]
 lto = true

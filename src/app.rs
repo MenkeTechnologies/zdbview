@@ -12,6 +12,7 @@ use ratatui::{DefaultTerminal, Frame};
 
 use std::path::PathBuf;
 
+use crate::formats::{self, Decoded};
 use crate::mru::{self, Entry};
 use crate::rkyv_inspect::RkyvStore;
 use crate::sqlite::{RowsView, SqliteStore};
@@ -42,9 +43,11 @@ enum Mode {
     ConfirmDelete,
 }
 
-/// The three read-only views for a rkyv/binary file.
+/// The views for a rkyv/binary file. `Records` is only available when the
+/// archive was recognized and decoded to key/value.
 #[derive(PartialEq, Eq, Clone, Copy)]
 enum RkyvView {
+    Records,
     Info,
     Strings,
     Hex,
@@ -69,6 +72,9 @@ pub struct App {
     strings: Vec<crate::rkyv_inspect::StringHit>,
     string_idx: usize,
     hex_row: usize,
+    /// Decoded key/value records when the archive was recognized.
+    decoded: Option<Decoded>,
+    record_idx: usize,
 
     /// True after a lone `g`, awaiting the second `g` of a `gg` motion.
     pending_g: bool,
@@ -93,6 +99,8 @@ impl App {
             strings: Vec::new(),
             string_idx: 0,
             hex_row: 0,
+            decoded: None,
+            record_idx: 0,
             pending_g: false,
             search: String::new(),
         };
@@ -110,7 +118,17 @@ impl App {
             }
             Store::Rkyv(r) => {
                 self.strings = r.strings(MIN_STRING);
-                self.status = "1 Info · 2 Strings · 3 Hex · j/k scroll · / search (n/N) · q quit  (rkyv: read-only structural view)".into();
+                self.decoded = formats::try_decode(&r.bytes);
+                if let Some(d) = &self.decoded {
+                    self.rkyv_view = RkyvView::Records;
+                    self.status = format!(
+                        "{} · {} records · 0 Records 1 Info 2 Strings 3 Hex · / search (n/N) · q quit",
+                        d.format,
+                        d.records.len()
+                    );
+                } else {
+                    self.status = "1 Info · 2 Strings · 3 Hex · j/k scroll · / search (n/N) · q quit  (rkyv: unrecognized — structural view)".into();
+                }
             }
         }
     }
@@ -267,15 +285,27 @@ impl App {
             KeyCode::Char('n') => self.search_next(true),
             KeyCode::Char('N') => self.search_next(false),
             KeyCode::Char('q') | KeyCode::Esc => self.quit = true,
+            KeyCode::Char('0') => {
+                if self.decoded.is_some() {
+                    self.rkyv_view = RkyvView::Records;
+                }
+            }
             KeyCode::Char('1') => self.rkyv_view = RkyvView::Info,
             KeyCode::Char('2') => self.rkyv_view = RkyvView::Strings,
             KeyCode::Char('3') => self.rkyv_view = RkyvView::Hex,
             KeyCode::Up | KeyCode::Char('k') => match self.rkyv_view {
+                RkyvView::Records => self.record_idx = self.record_idx.saturating_sub(1),
                 RkyvView::Strings => self.string_idx = self.string_idx.saturating_sub(1),
                 RkyvView::Hex => self.hex_row = self.hex_row.saturating_sub(1),
                 RkyvView::Info => {}
             },
             KeyCode::Down | KeyCode::Char('j') => match self.rkyv_view {
+                RkyvView::Records => {
+                    let n = self.decoded.as_ref().map(|d| d.records.len()).unwrap_or(0);
+                    if self.record_idx + 1 < n {
+                        self.record_idx += 1;
+                    }
+                }
                 RkyvView::Strings => {
                     if self.string_idx + 1 < self.strings.len() {
                         self.string_idx += 1;
@@ -548,6 +578,7 @@ impl App {
 
     fn rkyv_goto_top(&mut self) {
         match self.rkyv_view {
+            RkyvView::Records => self.record_idx = 0,
             RkyvView::Strings => self.string_idx = 0,
             RkyvView::Hex => self.hex_row = 0,
             RkyvView::Info => {}
@@ -556,6 +587,13 @@ impl App {
 
     fn rkyv_goto_bottom(&mut self) {
         match self.rkyv_view {
+            RkyvView::Records => {
+                self.record_idx = self
+                    .decoded
+                    .as_ref()
+                    .map(|d| d.records.len().saturating_sub(1))
+                    .unwrap_or(0);
+            }
             RkyvView::Strings => self.string_idx = self.strings.len().saturating_sub(1),
             RkyvView::Hex => {
                 let len = match &self.store {
@@ -617,6 +655,19 @@ impl App {
     fn search_rkyv(&mut self, forward: bool) {
         let term = self.search.to_lowercase();
         match self.rkyv_view {
+            RkyvView::Records => {
+                let keys: Vec<String> = self
+                    .decoded
+                    .as_ref()
+                    .map(|d| d.records.iter().map(|r| r.key.to_lowercase()).collect())
+                    .unwrap_or_default();
+                match find_next(keys.len(), self.record_idx, forward, |i| {
+                    keys[i].contains(&term)
+                }) {
+                    Some(i) => self.record_idx = i,
+                    None => self.status = format!("not found: {}", self.search),
+                }
+            }
             RkyvView::Strings => {
                 match find_next(self.strings.len(), self.string_idx, forward, |i| {
                     self.strings[i].text.to_lowercase().contains(&term)
@@ -758,14 +809,72 @@ impl App {
             _ => return,
         };
         match self.rkyv_view {
+            RkyvView::Records => self.render_rkyv_records(f, area),
             RkyvView::Info => self.render_rkyv_info(f, area, r),
             RkyvView::Strings => self.render_rkyv_strings(f, area),
             RkyvView::Hex => self.render_rkyv_hex(f, area, r),
         }
     }
 
+    fn render_rkyv_records(&self, f: &mut Frame, area: Rect) {
+        let d = match &self.decoded {
+            Some(d) => d,
+            None => return,
+        };
+        let cols =
+            Layout::horizontal([Constraint::Percentage(45), Constraint::Min(10)]).split(area);
+
+        // Left: keys.
+        let items: Vec<ListItem> = d
+            .records
+            .iter()
+            .map(|rec| ListItem::new(truncate(&rec.key, 60)))
+            .collect();
+        let mut st = ListState::default();
+        st.select(Some(self.record_idx.min(d.records.len().saturating_sub(1))));
+        let list = List::new(items)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::Cyan))
+                    .title(format!(" {} — {} keys ", d.format, d.records.len())),
+            )
+            .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
+        f.render_stateful_widget(list, cols[0], &mut st);
+
+        // Right: selected value — decoded scalar fields, then a hex dump.
+        let mut lines: Vec<Line> = Vec::new();
+        if let Some(rec) = d.records.get(self.record_idx) {
+            for (name, val) in &rec.fields {
+                lines.push(Line::from(vec![
+                    Span::styled(format!("{:<22}", name), Style::default().fg(Color::DarkGray)),
+                    Span::raw(val.clone()),
+                ]));
+            }
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                format!("value — {} bytes (hex):", rec.value.len()),
+                Style::default().fg(Color::Yellow),
+            )));
+            let rows = area.height.saturating_sub(6) as usize;
+            for i in 0..rows {
+                let off = i * 16;
+                if off >= rec.value.len() {
+                    break;
+                }
+                lines.push(Line::from(hex_row(&rec.value, off)));
+            }
+        }
+        let p = Paragraph::new(lines).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" value "),
+        );
+        f.render_widget(p, cols[1]);
+    }
+
     fn render_rkyv_info(&self, f: &mut Frame, area: Rect, r: &RkyvStore) {
-        let lines = vec![
+        let mut lines = vec![
             Line::from(vec![
                 Span::styled("file:    ", Style::default().fg(Color::DarkGray)),
                 Span::raw(r.path.display().to_string()),
@@ -778,20 +887,52 @@ impl App {
                 Span::styled("strings: ", Style::default().fg(Color::DarkGray)),
                 Span::raw(format!("{} runs (>= {} printable bytes)", self.strings.len(), MIN_STRING)),
             ]),
-            Line::from(""),
-            Line::from(Span::styled(
-                "rkyv archives are not self-describing: no field names or type tags",
-                Style::default().fg(Color::Yellow),
-            )),
-            Line::from(Span::styled(
-                "are stored in the format, so the schema cannot be recovered generically.",
-                Style::default().fg(Color::Yellow),
-            )),
-            Line::from(Span::styled(
-                "Views:  2 Strings (embedded text)   3 Hex (raw byte structure)",
-                Style::default().fg(Color::DarkGray),
-            )),
         ];
+
+        match &self.decoded {
+            Some(d) => {
+                lines.push(Line::from(""));
+                lines.push(Line::from(vec![
+                    Span::styled("format:  ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(d.format.clone(), Style::default().fg(Color::Green)),
+                ]));
+                lines.push(Line::from(vec![
+                    Span::styled("records: ", Style::default().fg(Color::DarkGray)),
+                    Span::raw(d.records.len().to_string()),
+                ]));
+                lines.push(Line::from(""));
+                for (name, val) in &d.header {
+                    lines.push(Line::from(vec![
+                        Span::styled(format!("  {:<16}", name), Style::default().fg(Color::DarkGray)),
+                        Span::raw(val.clone()),
+                    ]));
+                }
+                lines.push(Line::from(""));
+                lines.push(Line::from(Span::styled(
+                    "Views:  0 Records (key/value)  2 Strings  3 Hex",
+                    Style::default().fg(Color::DarkGray),
+                )));
+            }
+            None => {
+                lines.push(Line::from(""));
+                lines.push(Line::from(Span::styled(
+                    "unrecognized rkyv archive: no matching format decoder.",
+                    Style::default().fg(Color::Yellow),
+                )));
+                lines.push(Line::from(Span::styled(
+                    "rkyv stores no field names or type tags, so an unknown type",
+                    Style::default().fg(Color::Yellow),
+                )));
+                lines.push(Line::from(Span::styled(
+                    "cannot be decoded generically — showing raw structure.",
+                    Style::default().fg(Color::Yellow),
+                )));
+                lines.push(Line::from(Span::styled(
+                    "Views:  2 Strings (embedded text)  3 Hex (raw bytes)",
+                    Style::default().fg(Color::DarkGray),
+                )));
+            }
+        }
         let p = Paragraph::new(lines).block(
             Block::default()
                 .borders(Borders::ALL)
@@ -1065,6 +1206,28 @@ fn find_bytes(hay: &[u8], needle: &[u8], cur: usize, forward: bool) -> Option<us
         let start = cur.min(last + 1);
         (0..start).rev().find(|&i| &hay[i..i + needle.len()] == needle)
     }
+}
+
+/// One 16-byte `offset  hex  |ascii|` line for an arbitrary slice.
+fn hex_row(bytes: &[u8], offset: usize) -> String {
+    let end = (offset + 16).min(bytes.len());
+    let chunk = &bytes[offset.min(bytes.len())..end];
+    let mut hex = String::with_capacity(50);
+    for i in 0..16 {
+        if i < chunk.len() {
+            hex.push_str(&format!("{:02x} ", chunk[i]));
+        } else {
+            hex.push_str("   ");
+        }
+        if i == 7 {
+            hex.push(' ');
+        }
+    }
+    let ascii: String = chunk
+        .iter()
+        .map(|&b| if (0x20..0x7f).contains(&b) { b as char } else { '.' })
+        .collect();
+    format!("{:08x}  {} |{}|", offset, hex, ascii)
 }
 
 /// Truncate a display string to `max` chars, appending an ellipsis.
