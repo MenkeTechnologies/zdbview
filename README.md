@@ -10,6 +10,8 @@
 <p align="center">
   <a href="https://github.com/MenkeTechnologies/zdbview/actions/workflows/ci.yml"><img src="https://github.com/MenkeTechnologies/zdbview/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <a href="https://github.com/MenkeTechnologies/zdbview/actions/workflows/release.yml"><img src="https://github.com/MenkeTechnologies/zdbview/actions/workflows/release.yml/badge.svg" alt="Release"></a>
+  <a href="https://crates.io/crates/zdbview"><img src="https://img.shields.io/crates/v/zdbview.svg" alt="crates.io"></a>
+  <a href="https://docs.rs/zdbview"><img src="https://docs.rs/zdbview/badge.svg" alt="docs.rs"></a>
   <a href="https://github.com/MenkeTechnologies/zdbview/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="license"></a>
 </p>
 
@@ -50,6 +52,13 @@ brew install zdbview
 
 The formula installs the binary, both man pages and the zsh completion, and is
 bumped automatically by this repo's `Release` workflow on every `v*` tag.
+
+From [crates.io](https://crates.io/crates/zdbview) — binary only, no man pages
+or completion:
+
+```sh
+cargo install zdbview
+```
 
 From source:
 
