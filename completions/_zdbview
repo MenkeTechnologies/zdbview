@@ -1,0 +1,27 @@
+#compdef zdbview
+
+# zsh completion for zdbview — terminal inspector / CRUD editor for rkyv
+# archives and SQLite databases. Install by putting this file (named
+# `_zdbview`) in a directory on $fpath, e.g.:
+#   fpath=(/path/to/zdbview/completions $fpath)
+
+_zdbview() {
+    local -a args
+    args=(
+        '(--sqlite --rkyv)--sqlite[Force treating the file as a SQLite database]'
+        '(--sqlite --rkyv)--rkyv[Force treating the file as a rkyv archive or raw binary]'
+        '(- *)'{-h,--help}'[Print help]'
+        '(- *)'{-V,--version}'[Print version]'
+        '1:file:_zdbview_files'
+    )
+    _arguments -s -S : $args
+}
+
+# Database-ish files first, then any file — a rkyv shard can carry any name.
+_zdbview_files() {
+    _alternative \
+        'databases:database file:_files -g "*.(db|sqlite|sqlite3|rkyv|bin|cache)(-.)"' \
+        'files:file:_files'
+}
+
+_zdbview "$@"

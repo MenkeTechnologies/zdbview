@@ -1,0 +1,208 @@
+.TH ZDBVIEW 1 "2026-07-24" "zdbview 0.1.0" "User Commands"
+.SH NAME
+zdbview \- terminal inspector and CRUD editor for rkyv archives and SQLite databases
+.SH SYNOPSIS
+.B zdbview
+.RI [ OPTIONS ]
+.RI [ FILE ]
+.SH DESCRIPTION
+.B zdbview
+opens a database file in a full-screen terminal UI. One binary handles both
+kinds of store used across the MenkeTechnologies stack:
+.RS 2
+.IP \(bu 2
+.B SQLite
+databases \(em fully self-describing, so every operation is generic: browse
+tables and paginated rows, edit any cell in place, insert and delete rows, and
+run arbitrary SQL.
+.IP \(bu 2
+.B rkyv
+archives (and any other binary blob) \(em
+.I not
+self-describing, so the view is structural: file summary, the runs of printable
+text embedded in the archive, and an
+.BR xxd (1)-style
+hex/ascii dump.
+.RE
+.PP
+Invoked with no
+.IR FILE ,
+zdbview shows a picker of recently opened files.
+.SH OPTIONS
+.TP
+.B \-\-sqlite
+Force treating the file as a SQLite database, skipping detection.
+.TP
+.B \-\-rkyv
+Force treating the file as a rkyv archive / raw binary. Mutually exclusive with
+.BR \-\-sqlite .
+.TP
+.B \-h ", " \-\-help
+Print usage and exit.
+.TP
+.B \-V ", " \-\-version
+Print the version and exit.
+.SH FILE TYPE DETECTION
+The first 16 bytes of the file are compared against the SQLite header magic
+.RB ( "SQLite format 3\e0" ).
+The magic is authoritative: its presence means SQLite, its absence in a readable
+header means the file is opened with the binary inspector \(em the
+.I extension is ignored.
+This is deliberate, because rkyv shards are routinely stored under a
+.B .db
+name. Only when the file is too short to carry a full header does the extension
+.RB ( .db ", " .sqlite ", " .sqlite3 )
+act as a tie-breaker. If a file passes the magic check but SQLite still refuses
+to open it, zdbview falls back to the binary inspector instead of failing.
+.SH SQLITE MODE
+The left pane lists tables and views from
+.BR sqlite_master ;
+the right pane shows one page of 500 rows for the selected table.
+.PP
+Rows are addressed by
+.BR rowid ,
+which is what makes edit and delete generic across arbitrary schemas. A
+.B WITHOUT ROWID
+table has no such handle, so its rows are listed read-only.
+.TP
+.B e
+Edit the selected cell in place; Enter commits an
+.B UPDATE
+of that column for the row's
+.BR rowid ,
+Esc cancels.
+.TP
+.B a
+Insert one row with
+.BR "INSERT INTO <table> DEFAULT VALUES" .
+.TP
+.B d
+Delete the selected row, after a
+.B y
+confirmation.
+.TP
+.B :
+Open a command line and run an arbitrary SQL statement. The row count affected
+is reported in the status bar and the current page is reloaded.
+.SH RKYV MODE
+The rkyv format stores no field names and no type tags, so a generic reader
+cannot recover the schema of an arbitrary archive without the originating Rust
+type. zdbview therefore shows what
+.I is
+recoverable from the bytes:
+.TP
+.B 1
+.B Info
+\(em path, size, and the number of extracted string runs.
+.TP
+.B 2
+.B Strings
+\(em every run of at least 4 printable ASCII bytes with its byte offset. In
+practice this surfaces keys, interned identifiers and string fields.
+.TP
+.B 3
+.B Hex
+\(em 16 bytes per line as
+.BR "offset  hex  |ascii|" .
+.PP
+Typed, field-name CRUD over a rkyv archive requires a supplied schema descriptor
+and is deliberately out of scope for this release.
+.SH KEYS
+.TP
+.B Tab
+Switch focus between the table list and the row grid.
+.TP
+.BR h ", " j ", " k ", " l ", " arrows
+Move. In the row grid,
+.B h
+and
+.B l
+also move the selected column.
+.TP
+.BR gg ", " G
+Jump to the first / last item. In the row grid this walks to the first or last
+page, not just the visible rows.
+.TP
+.BR Ctrl\-f ", " Ctrl\-b ", " PageDown ", " PageUp
+Page forward / back through rows.
+.TP
+.B /
+Search. The pattern is matched against table names or every column of the loaded
+page (SQLite, depending on focus), the extracted strings or the raw bytes
+(rkyv), or the file names (recent-files picker). Text searches are
+case-insensitive and wrap; the hex search is a case-sensitive byte match and
+does not wrap.
+.TP
+.BR n ", " N
+Jump to the next / previous match of the active search.
+.TP
+.B Enter
+Move focus from the table list into the rows; in the picker, open the file.
+.TP
+.BR q ", " Esc
+Quit. Inside a modal (edit, SQL, search, confirm), Esc cancels the modal only.
+.SH RECENT FILES
+Every successful open is recorded, most-recent-first, deduplicated by absolute
+path and capped at 50 entries. The list is written atomically (temp file plus
+rename) so a concurrent reader never sees a partial list. Entries whose file no
+longer exists are filtered out of the picker.
+.SH FILES
+.TP
+.I $XDG_CACHE_HOME/zdbview/recent
+The recent-files list. Falls back to
+.I ~/.cache/zdbview/recent
+when
+.B XDG_CACHE_HOME
+is unset. Each line is
+.RI "\(oq" "unix-seconds<TAB>kind<TAB>path" "\(cq" ,
+where
+.I kind
+is
+.B sqlite
+or
+.BR rkyv .
+.SH EXIT STATUS
+.TP
+.B 0
+The session ended normally, including quitting the picker without opening a file.
+.TP
+.B 1
+The file could not be opened or read, or the terminal could not be initialized.
+.SH EXAMPLES
+Open a SQLite database with full CRUD:
+.PP
+.RS 4
+.B zdbview ~/.cache/zshrs/completions.sqlite
+.RE
+.PP
+Inspect a rkyv cache shard that happens to be named
+.BR .db :
+.PP
+.RS 4
+.B zdbview ~/.cache/zshrs/plugins.db
+.RE
+.PP
+Force the binary inspector on a real SQLite file, to look at its page structure:
+.PP
+.RS 4
+.B zdbview \-\-rkyv data.sqlite
+.RE
+.PP
+Pick from the files opened recently:
+.PP
+.RS 4
+.B zdbview
+.RE
+.SH SEE ALSO
+.BR zdbviewall (1),
+.BR sqlite3 (1),
+.BR xxd (1),
+.BR zshrs (1)
+.PP
+Project documentation:
+.UR https://menketechnologies.github.io/zdbview
+.UE
+.SH REPORTING BUGS
+Report bugs at <https://github.com/MenkeTechnologies/zdbview/issues>.
+.SH COPYRIGHT
+Copyright \(co 2026 MenkeTechnologies. Released under the MIT license.
