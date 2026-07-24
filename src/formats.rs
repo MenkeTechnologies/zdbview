@@ -550,6 +550,184 @@ fn parse_hex_u64(s: &str) -> Result<u64, String> {
         .ok_or_else(|| format!("bad delete key: {}", s))
 }
 
+/// For the header-less formats, turn a create/rename key string into a u64: an
+/// explicit `0x…` hex is used as-is; otherwise the string is hashed (a real
+/// record, though the host indexes by content hash so it is not a cache hit).
+fn key_to_u64(s: &str) -> u64 {
+    if let Ok(v) = parse_hex_u64(s) {
+        return v;
+    }
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    s.hash(&mut h);
+    h.finish()
+}
+
+/// Replace the value blob of the record identified by `del_key`, preserving all
+/// other fields, and return the re-serialized shard.
+pub fn set_value(
+    bytes: &[u8],
+    kind: FormatKind,
+    del_key: &str,
+    value: Vec<u8>,
+) -> Result<Vec<u8>, String> {
+    match kind {
+        FormatKind::Script => edit_shard::<ScriptShard, _>(bytes, |s| {
+            if let Some(e) = s.entries.get_mut(del_key) {
+                e.chunk_blob = value;
+            }
+        }),
+        FormatKind::Stryke => edit_shard::<StrykeShard, _>(bytes, |s| {
+            if let Some(e) = s.entries.get_mut(del_key) {
+                e.chunk_blob = value;
+            }
+        }),
+        FormatKind::Autoload => edit_shard::<AutoloadShard, _>(bytes, |s| {
+            if let Some(e) = s.entries.get_mut(del_key) {
+                e.chunk_blob = value;
+            }
+        }),
+        FormatKind::Elisp => edit_shard::<ElispShard, _>(bytes, |s| {
+            if let Some(e) = s.entries.get_mut(del_key) {
+                e.heap = value;
+            }
+        }),
+        FormatKind::Python => {
+            let want = parse_hex_u64(del_key)?;
+            edit_shard::<PyShard, _>(bytes, move |s| {
+                if let Some(e) = s.entries.iter_mut().find(|e| e.key == want) {
+                    e.blob = value;
+                }
+            })
+        }
+        FormatKind::Hash => {
+            let want = parse_hex_u64(del_key)?;
+            edit_shard::<HashShard, _>(bytes, move |s| {
+                if let Some(e) = s.entries.iter_mut().find(|e| e.key == want) {
+                    e.blob = value;
+                }
+            })
+        }
+    }
+}
+
+/// Insert a new record with `key` and `value` (metadata zeroed) and return the
+/// re-serialized shard. For the map formats `key` is the map key; for the
+/// header-less formats it is a `0x…` hex u64 or a string that is hashed.
+pub fn add_record(
+    bytes: &[u8],
+    kind: FormatKind,
+    key: &str,
+    value: Vec<u8>,
+) -> Result<Vec<u8>, String> {
+    match kind {
+        FormatKind::Script => edit_shard::<ScriptShard, _>(bytes, |s| {
+            s.entries.insert(
+                key.to_string(),
+                ScriptEntry {
+                    mtime_secs: 0,
+                    mtime_nsecs: 0,
+                    binary_mtime_at_cache: 0,
+                    cached_at_secs: 0,
+                    chunk_blob: value,
+                },
+            );
+        }),
+        FormatKind::Stryke => edit_shard::<StrykeShard, _>(bytes, |s| {
+            s.entries.insert(
+                key.to_string(),
+                StrykeEntry {
+                    mtime_secs: 0,
+                    mtime_nsecs: 0,
+                    binary_mtime_at_cache: 0,
+                    cached_at_secs: 0,
+                    program_blob: Vec::new(),
+                    chunk_blob: value,
+                },
+            );
+        }),
+        FormatKind::Autoload => edit_shard::<AutoloadShard, _>(bytes, |s| {
+            s.entries.insert(
+                key.to_string(),
+                AutoloadEntry {
+                    binary_mtime_at_cache: 0,
+                    cached_at_secs: 0,
+                    chunk_blob: value,
+                },
+            );
+        }),
+        FormatKind::Elisp => edit_shard::<ElispShard, _>(bytes, |s| {
+            s.entries.insert(
+                key.to_string(),
+                ElispEntry {
+                    mtime_ns: 0,
+                    binary_mtime_at_cache: 0,
+                    cached_at_secs: 0,
+                    forms: Vec::new(),
+                    heap: value,
+                    oclosure_meta: Vec::new(),
+                },
+            );
+        }),
+        FormatKind::Python => {
+            let k = key_to_u64(key);
+            edit_shard::<PyShard, _>(bytes, move |s| {
+                s.entries.push(PyEntry {
+                    key: k,
+                    verify: 0,
+                    source: key.to_string(),
+                    blob: value,
+                });
+            })
+        }
+        FormatKind::Hash => {
+            let k = key_to_u64(key);
+            edit_shard::<HashShard, _>(bytes, move |s| {
+                s.entries.push(HashEntry {
+                    key: k,
+                    blob: value,
+                });
+            })
+        }
+    }
+}
+
+/// Rename a record's key (map formats only; the header-less formats key by a
+/// content hash and have no renameable key).
+pub fn rename_record(
+    bytes: &[u8],
+    kind: FormatKind,
+    del_key: &str,
+    new_key: &str,
+) -> Result<Vec<u8>, String> {
+    let new_key = new_key.to_string();
+    match kind {
+        FormatKind::Script => edit_shard::<ScriptShard, _>(bytes, move |s| {
+            if let Some(v) = s.entries.remove(del_key) {
+                s.entries.insert(new_key, v);
+            }
+        }),
+        FormatKind::Stryke => edit_shard::<StrykeShard, _>(bytes, move |s| {
+            if let Some(v) = s.entries.remove(del_key) {
+                s.entries.insert(new_key, v);
+            }
+        }),
+        FormatKind::Autoload => edit_shard::<AutoloadShard, _>(bytes, move |s| {
+            if let Some(v) = s.entries.remove(del_key) {
+                s.entries.insert(new_key, v);
+            }
+        }),
+        FormatKind::Elisp => edit_shard::<ElispShard, _>(bytes, move |s| {
+            if let Some(v) = s.entries.remove(del_key) {
+                s.entries.insert(new_key, v);
+            }
+        }),
+        FormatKind::Python | FormatKind::Hash => {
+            Err("rename is not supported for header-less hash-keyed formats".into())
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -673,6 +851,44 @@ mod tests {
         let after = try_decode(&new_bytes).expect("valid");
         assert_eq!(after.records.len(), 1, "exactly one removed");
         assert_eq!(after.records[0].value, vec![0xa2]);
+    }
+
+    #[test]
+    fn full_crud_roundtrip_on_map_format() {
+        // Start from an empty-ish script shard, then Create, Update, Rename,
+        // Delete — each re-serialization must stay a valid, decodable shard.
+        let shard = ScriptShard {
+            header: ShardHeader {
+                magic: ZSHRS_MAGIC,
+                format_version: 1,
+                zshrs_version: "1.0".into(),
+                pointer_width: 8,
+                built_at_secs: 0,
+            },
+            entries: HashMap::new(),
+        };
+        let mut bytes = rkyv::to_bytes::<_, 256>(&shard).unwrap().into_vec();
+
+        // Create
+        bytes = add_record(&bytes, FormatKind::Script, "/x.sh", vec![1, 2, 3]).unwrap();
+        let d = try_decode(&bytes).unwrap();
+        assert_eq!(d.records.len(), 1);
+        assert_eq!(d.records[0].value, vec![1, 2, 3]);
+
+        // Update value
+        bytes = set_value(&bytes, FormatKind::Script, "/x.sh", vec![9, 9]).unwrap();
+        let d = try_decode(&bytes).unwrap();
+        assert_eq!(d.records[0].value, vec![9, 9]);
+
+        // Rename key
+        bytes = rename_record(&bytes, FormatKind::Script, "/x.sh", "/y.sh").unwrap();
+        let d = try_decode(&bytes).unwrap();
+        assert_eq!(d.records[0].key, "/y.sh");
+        assert_eq!(d.records[0].value, vec![9, 9]);
+
+        // Delete
+        bytes = delete_record(&bytes, FormatKind::Script, "/y.sh").unwrap();
+        assert_eq!(try_decode(&bytes).unwrap().records.len(), 0);
     }
 
     #[test]

@@ -38,7 +38,7 @@ carry a header.
 ```
 zdbview                        # no args → pick from recently opened files
 zdbview path/to/file.db        # SQLite → full CRUD
-zdbview path/to/archive.rkyv   # rkyv   → key/value if recognized, else structural
+zdbview path/to/archive.rkyv   # rkyv   → full CRUD if recognized, else structural
 zdbview --sqlite file          # force SQLite
 zdbview --rkyv   file          # force rkyv/binary
 ```
@@ -101,7 +101,7 @@ Identifiers are double-quoted with internal quotes doubled, and edited values ar
 bound as parameters, so schemas with spaces, keywords or quotes in their names
 work unmodified.
 
-## rkyv — auto-detected key/value + structural inspection
+## rkyv — auto-detected key/value CRUD + structural inspection
 
 rkyv archives are **not self-describing**: the format stores no field names or
 type tags (https://rkyv.org/format.html), so the schema cannot be recovered from
@@ -140,16 +140,26 @@ structural fallback, never silent corruption. Adding a format is one registry
 entry: copy its archive type (same rkyv version and features as the producer)
 and map its magic (or add a validated try-decode for header-less formats).
 
-### Deleting records (write-back)
+### Full CRUD (write-back)
 
-`d` on a record (confirm with `y`) evicts it: the shard is deserialized, the
-entry removed, and the file re-serialized and rewritten atomically (temp +
-rename). Re-serialization is byte-identical to what the producing host writes,
-so the host reads the edited shard normally. Deletion targets a record's stable
-identity (map key, or the u64 content hash for the header-less formats), so it
-removes exactly one entry even when several share a display key (pythonrs stores
-many records under `<string>`/`<stdin>`). Add and value-edit are intentionally
-absent — the value is compiled bytecode, not meaningfully editable in place.
+Recognized archives are editable in place, not just readable. In the Records
+view:
+
+- `a` — **create** a record (prompt for a key; inserted with an empty value).
+- `e` — **update** the selected record's value (type text, or `0x<hex>` for
+  binary).
+- `r` — **rename** a record's key (map-keyed formats).
+- `d` — **delete** the record (confirm with `y`).
+
+Every edit deserializes the shard, mutates it, and re-serializes it, then writes
+the file back atomically (temp + rename). Re-serialization is **byte-identical**
+to what the producing host writes, so the host reads the edited shard normally —
+verified by round-tripping every real cache. Edits target a record's stable
+identity (map key, or the u64 content hash for the header-less formats), so an
+update or delete touches exactly one entry even when several share a display key
+(pythonrs stores many records under `<string>`/`<stdin>`). Rename is offered only
+for the map-keyed formats; the header-less formats key by a content hash and have
+no renameable key.
 
 ### Bytecode disassembly (`disasm` feature)
 
@@ -178,7 +188,7 @@ off by default so the crate stays self-contained and publishable.
 | `/` | search; `n` / `N` next / previous match |
 | `Ctrl-f` / `Ctrl-b` | page forward / back (SQLite) |
 | `e` `a` `d` `:` | edit / add / delete / SQL (SQLite) |
-| `d` | delete record — evicts + rewrites the shard (rkyv) |
+| `a` `e` `r` `d` | create / update-value / rename / delete record (rkyv) |
 | `S` | schema view (SQLite) |
 | `0` `1` `2` `3` | Records / Info / Strings / Hex (rkyv) |
 | `v` | cycle value render (auto / hex / text / disasm) — detail screen |

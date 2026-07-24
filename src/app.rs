@@ -12,7 +12,7 @@ use ratatui::{DefaultTerminal, Frame};
 
 use std::path::PathBuf;
 
-use crate::formats::{self, Decoded};
+use crate::formats::{self, Decoded, FormatKind};
 use crate::mru::{self, Entry};
 use crate::rkyv_inspect::RkyvStore;
 use crate::sqlite::{RowsView, SqliteStore};
@@ -39,6 +39,13 @@ enum Mode {
     Command(String),
     /// A `/` search prompt; buffer holds the pattern being typed.
     Search(String),
+    /// Adding a new rkyv record; buffer holds the key being typed.
+    AddRecord(String),
+    /// Editing a rkyv record's value; buffer holds the new value (text, or a
+    /// `0x…` hex string for binary).
+    EditValue(String),
+    /// Renaming a rkyv record's key; buffer holds the new key.
+    RenameRecord(String),
     /// Confirm a destructive action (delete row).
     ConfirmDelete,
 }
@@ -179,7 +186,7 @@ impl App {
                 if let Some(d) = &self.decoded {
                     self.rkyv_view = RkyvView::Records;
                     self.status = format!(
-                        "{} · {} records · 0 Records 1 Info 2 Strings 3 Hex · / search (n/N) · q quit",
+                        "{} · {} records · Enter detail · a add e edit r rename d delete · / search · 0/1/2/3 views · q quit",
                         d.format,
                         d.records.len()
                     );
@@ -219,6 +226,9 @@ impl App {
             Edit(String),
             Cmd(String),
             Search(String),
+            Add(String),
+            EditVal(String),
+            Rename(String),
             Confirm,
             None,
         }
@@ -226,6 +236,9 @@ impl App {
             Mode::EditCell(buf) => Modal::Edit(buf.clone()),
             Mode::Command(buf) => Modal::Cmd(buf.clone()),
             Mode::Search(buf) => Modal::Search(buf.clone()),
+            Mode::AddRecord(buf) => Modal::Add(buf.clone()),
+            Mode::EditValue(buf) => Modal::EditVal(buf.clone()),
+            Mode::RenameRecord(buf) => Modal::Rename(buf.clone()),
             Mode::ConfirmDelete => Modal::Confirm,
             Mode::Normal => Modal::None,
         };
@@ -233,6 +246,15 @@ impl App {
             Modal::Edit(buf) => return self.key_edit_cell(code, buf),
             Modal::Cmd(buf) => return self.key_command(code, buf),
             Modal::Search(buf) => return self.key_search(code, buf),
+            Modal::Add(buf) => {
+                return self.key_line(code, buf, Mode::AddRecord, App::commit_add_record)
+            }
+            Modal::EditVal(buf) => {
+                return self.key_line(code, buf, Mode::EditValue, App::commit_edit_value)
+            }
+            Modal::Rename(buf) => {
+                return self.key_line(code, buf, Mode::RenameRecord, App::commit_rename_record)
+            }
             Modal::Confirm => return self.key_confirm_delete(code),
             Modal::None => {}
         }
@@ -610,13 +632,38 @@ impl App {
                 }
             }
             KeyCode::Char('d') => {
-                if self.rkyv_view == RkyvView::Records
-                    && self
+                if self.rkyv_view == RkyvView::Records && self.has_current_record() {
+                    self.mode = Mode::ConfirmDelete;
+                }
+            }
+            KeyCode::Char('a') => {
+                if self.rkyv_view == RkyvView::Records && self.decoded.is_some() {
+                    self.mode = Mode::AddRecord(String::new());
+                }
+            }
+            KeyCode::Char('e') => {
+                if self.rkyv_view == RkyvView::Records && self.has_current_record() {
+                    self.mode = Mode::EditValue(String::new());
+                }
+            }
+            KeyCode::Char('r') => {
+                let renamable = matches!(
+                    self.decoded.as_ref().map(|d| d.kind),
+                    Some(
+                        FormatKind::Script
+                            | FormatKind::Stryke
+                            | FormatKind::Autoload
+                            | FormatKind::Elisp
+                    )
+                );
+                if self.rkyv_view == RkyvView::Records && self.has_current_record() && renamable {
+                    let key = self
                         .decoded
                         .as_ref()
-                        .is_some_and(|d| self.record_idx < d.records.len())
-                {
-                    self.mode = Mode::ConfirmDelete;
+                        .and_then(|d| d.records.get(self.record_idx))
+                        .map(|r| r.key.clone())
+                        .unwrap_or_default();
+                    self.mode = Mode::RenameRecord(key);
                 }
             }
             KeyCode::Char('x') => self.export_current(),
@@ -696,31 +743,76 @@ impl App {
         }
     }
 
-    /// Delete the selected rkyv record: remove it from the shard, re-serialize,
-    /// write the file back atomically, and reload the in-memory view.
-    fn delete_current_record(&mut self) {
-        let (key, del_key, kind) = match self.decoded.as_ref().and_then(|d| {
+    // ----- rkyv record CRUD -------------------------------------------------
+
+    /// A one-line text-input handler shared by the add/edit-value/rename modals:
+    /// Esc cancels, Enter commits via `commit`, other keys edit `buf`.
+    fn key_line(
+        &mut self,
+        code: KeyCode,
+        mut buf: String,
+        mk: fn(String) -> Mode,
+        commit: fn(&mut App, &str),
+    ) {
+        match code {
+            KeyCode::Esc => self.mode = Mode::Normal,
+            KeyCode::Enter => {
+                self.mode = Mode::Normal;
+                commit(self, &buf);
+            }
+            KeyCode::Backspace => {
+                buf.pop();
+                self.mode = mk(buf);
+            }
+            KeyCode::Char(c) => {
+                buf.push(c);
+                self.mode = mk(buf);
+            }
+            _ => {}
+        }
+    }
+
+    fn has_current_record(&self) -> bool {
+        self.decoded
+            .as_ref()
+            .is_some_and(|d| self.record_idx < d.records.len())
+    }
+
+    /// (kind, shard bytes) for the current rkyv archive, if decoded.
+    fn rkyv_kind_bytes(&self) -> Option<(FormatKind, Vec<u8>)> {
+        let kind = self.decoded.as_ref().map(|d| d.kind)?;
+        match &self.store {
+            Store::Rkyv(r) => Some((kind, r.bytes.clone())),
+            _ => None,
+        }
+    }
+
+    /// (display key, del_key, kind, shard bytes) for the selected record.
+    fn rkyv_ctx(&self) -> Option<(String, String, FormatKind, Vec<u8>)> {
+        let (key, del_key, kind) = self.decoded.as_ref().and_then(|d| {
             d.records
                 .get(self.record_idx)
                 .map(|r| (r.key.clone(), r.del_key.clone(), d.kind))
-        }) {
-            Some(v) => v,
-            None => return,
-        };
-        let (path, bytes) = match &self.store {
-            Store::Rkyv(r) => (r.path.clone(), r.bytes.clone()),
-            _ => return,
-        };
+        })?;
+        match &self.store {
+            Store::Rkyv(r) => Some((key, del_key, kind, r.bytes.clone())),
+            _ => None,
+        }
+    }
 
-        let new_bytes = match crate::formats::delete_record(&bytes, kind, &del_key) {
+    /// Apply a shard edit: write the new bytes back atomically and reload.
+    fn rkyv_apply(&mut self, result: Result<Vec<u8>, String>, ok_msg: String) {
+        let new_bytes = match result {
             Ok(b) => b,
             Err(e) => {
-                self.status = format!("delete failed: {}", e);
+                self.status = format!("failed: {}", e);
                 return;
             }
         };
-
-        // Atomic write: temp file in the same directory, then rename.
+        let path = match &self.store {
+            Store::Rkyv(r) => r.path.clone(),
+            _ => return,
+        };
         let tmp = path.with_extension("zdbview.tmp");
         let write = std::fs::write(&tmp, &new_bytes).and_then(|_| std::fs::rename(&tmp, &path));
         if let Err(e) = write {
@@ -728,12 +820,66 @@ impl App {
             self.status = format!("write failed: {}", e);
             return;
         }
-
         if let Store::Rkyv(r) = &mut self.store {
             r.bytes = new_bytes;
         }
         self.reload_rkyv();
-        self.status = format!("deleted record: {}", key);
+        self.status = ok_msg;
+    }
+
+    /// Delete the selected rkyv record and write the shard back.
+    fn delete_current_record(&mut self) {
+        let (key, del_key, kind, bytes) = match self.rkyv_ctx() {
+            Some(v) => v,
+            None => return,
+        };
+        self.rkyv_apply(
+            crate::formats::delete_record(&bytes, kind, &del_key),
+            format!("deleted: {}", key),
+        );
+    }
+
+    fn commit_add_record(&mut self, key: &str) {
+        if key.is_empty() {
+            self.status = "add cancelled: empty key".into();
+            return;
+        }
+        let (kind, bytes) = match self.rkyv_kind_bytes() {
+            Some(v) => v,
+            None => return,
+        };
+        self.rkyv_apply(
+            crate::formats::add_record(&bytes, kind, key, Vec::new()),
+            format!("added: {}", key),
+        );
+    }
+
+    fn commit_edit_value(&mut self, val: &str) {
+        let (_, del_key, kind, bytes) = match self.rkyv_ctx() {
+            Some(v) => v,
+            None => return,
+        };
+        let value = parse_value_input(val);
+        let n = value.len();
+        self.rkyv_apply(
+            crate::formats::set_value(&bytes, kind, &del_key, value),
+            format!("value set ({} bytes)", n),
+        );
+    }
+
+    fn commit_rename_record(&mut self, new_key: &str) {
+        if new_key.is_empty() {
+            self.status = "rename cancelled".into();
+            return;
+        }
+        let (_, del_key, kind, bytes) = match self.rkyv_ctx() {
+            Some(v) => v,
+            None => return,
+        };
+        self.rkyv_apply(
+            crate::formats::rename_record(&bytes, kind, &del_key, new_key),
+            format!("renamed → {}", new_key),
+        );
     }
 
     /// Recompute rkyv-derived state (strings + decoded records) after a write.
@@ -1105,6 +1251,13 @@ impl App {
             Mode::EditCell(buf) => self.render_input(f, "edit cell (Enter=save, Esc=cancel)", buf),
             Mode::Command(buf) => self.render_input(f, "SQL (Enter=run, Esc=cancel)", buf),
             Mode::Search(buf) => self.render_input(f, "search / (Enter, Esc)", buf),
+            Mode::AddRecord(buf) => self.render_input(f, "new record key (Enter=add, Esc)", buf),
+            Mode::EditValue(buf) => self.render_input(
+                f,
+                "new value — text, or 0x<hex> for binary (Enter, Esc)",
+                buf,
+            ),
+            Mode::RenameRecord(buf) => self.render_input(f, "rename key to (Enter, Esc)", buf),
             Mode::ConfirmDelete => {
                 let what = match self.store {
                     Store::Sqlite(_) => "row",
@@ -1262,6 +1415,9 @@ impl App {
                 Style::default().fg(Color::Green),
             )));
             lines.push(Line::from("  0 Records   1 Info   2 Strings   3 Hex"));
+            lines.push(Line::from(
+                "  Records CRUD:  a add   e edit value   r rename   d delete",
+            ));
         }
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
@@ -1794,6 +1950,33 @@ fn find_bytes(hay: &[u8], needle: &[u8], cur: usize, forward: bool) -> Option<us
             .rev()
             .find(|&i| &hay[i..i + needle.len()] == needle)
     }
+}
+
+/// Parse a value-input string: a `0x…` prefix is decoded as hex bytes (spaces
+/// ignored), otherwise the string's UTF-8 bytes are used verbatim.
+fn parse_value_input(s: &str) -> Vec<u8> {
+    if let Some(hex) = s.strip_prefix("0x") {
+        let clean: String = hex.chars().filter(|c| !c.is_whitespace()).collect();
+        if !clean.is_empty() && clean.len().is_multiple_of(2) {
+            if let Some(b) = hex_to_bytes(&clean) {
+                return b;
+            }
+        }
+    }
+    s.as_bytes().to_vec()
+}
+
+fn hex_to_bytes(s: &str) -> Option<Vec<u8>> {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len() / 2);
+    let mut i = 0;
+    while i + 1 < b.len() {
+        let hi = (b[i] as char).to_digit(16)?;
+        let lo = (b[i + 1] as char).to_digit(16)?;
+        out.push((hi * 16 + lo) as u8);
+        i += 2;
+    }
+    Some(out)
 }
 
 /// Whether a byte slice is mostly printable/UTF-8 text (heuristic for Auto
