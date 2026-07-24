@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="dark light">
-  <meta name="description" content="zdbview — terminal inspector and CRUD editor for rkyv archives and SQLite databases. One binary: generic SQLite CRUD by rowid, structural rkyv inspection (info / strings / hex), vim keys, search, recent-files picker.">
+  <meta name="description" content="zdbview — terminal inspector and CRUD editor for rkyv archives and SQLite databases. One binary: generic SQLite CRUD by rowid, recognized-format rkyv key/value decoding with structural fallback (records / info / strings / hex), vim keys, search, recent-files picker.">
   <title>zdbview — Documentation</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -88,7 +88,7 @@
             <span class="sep">/</span>
             <a href="https://github.com/MenkeTechnologies/zdbview/issues" target="_blank" rel="noopener noreferrer">Issues</a>
           </nav>
-          <p class="docs-build-line" id="zdbviewBuildLine">zdbview v0.1.0 · ratatui + crossterm TUI · generic SQLite CRUD by rowid · rkyv structural inspector · vim motions · recent-files picker</p>
+          <p class="docs-build-line" id="zdbviewBuildLine">zdbview v0.1.0 · ratatui + crossterm TUI · generic SQLite CRUD by rowid · rkyv format registry with structural fallback · vim motions · recent-files picker</p>
         </div>
         <div class="tutorial-toolbar">
           <button type="button" class="btn btn-secondary" id="btnTheme" title="Toggle light/dark">Theme</button>
@@ -109,7 +109,7 @@
 
     <main class="tutorial-main">
       <h2 class="tutorial-title"><span class="step-hash">&gt;_</span>ZDBVIEW</h2>
-      <p class="tutorial-subtitle"><strong>One binary for both halves of the cache.</strong> A SQLite database gets full generic CRUD — browse tables, edit any cell, insert and delete rows, run raw SQL — because SQLite is self-describing. An <a href="https://rkyv.org/format.html" target="_blank" rel="noopener noreferrer">rkyv</a> archive gets a structural inspector — info, embedded strings, hex — because rkyv is <em>not</em>. Which one you get is decided by the file's header bytes, never by its name.</p>
+      <p class="tutorial-subtitle"><strong>One binary for both halves of the cache.</strong> A SQLite database gets full generic CRUD — browse tables, edit any cell, insert and delete rows, run raw SQL — because SQLite is self-describing. An <a href="https://rkyv.org/format.html" target="_blank" rel="noopener noreferrer">rkyv</a> archive is <em>not</em> self-describing, so it gets decoded to real key/value records when its format is one zdbview recognizes, and a structural view — info, embedded strings, hex — when it is not. Which backend you get is decided by the file's header bytes, never by its name.</p>
 
       <section class="tutorial-section">
         <h2>Quickstart</h2>
@@ -119,7 +119,7 @@ cd zdbview &amp;&amp; cargo build --release
 
 # open a database — kind is detected from the header magic
 zdbview app.sqlite               # SQLite  → full CRUD
-zdbview ~/.cache/zshrs/plugins.db  # rkyv   → structural inspection (despite the .db name)
+zdbview ~/.cache/zshrs/scripts.db  # rkyv   → key/value records (despite the .db name)
 
 # force a backend
 zdbview --sqlite file
@@ -161,17 +161,19 @@ zdbview</pre>
       </section>
 
       <section class="tutorial-section">
-        <h2>rkyv — structural inspection</h2>
-        <p>An rkyv archive is a memory image of a Rust value plus a root pointer. The format stores no field names, no type tags and no embedded schema — the originating Rust type <em>is</em> the schema. Without it, no reader can know whether eight bytes are a <code>u64</code>, two <code>u32</code>s, or a relative pointer, so zdbview shows what <em>is</em> recoverable from the bytes rather than pretending to know the fields.</p>
+        <h2>rkyv — recognized key/value, or structural fallback</h2>
+        <p>An rkyv archive is a memory image of a Rust value plus a root pointer. The format stores no field names, no type tags and no embedded schema — the originating Rust type <em>is</em> the schema. zdbview closes that gap with a <strong>format registry</strong>: for archives it recognizes it carries a faithful, byte-compatible copy of the producer's archive type, detects the format by its magic header, validates with <code>rkyv::check_archived_root</code>, and decodes real key/value records. Anything it does not recognize falls back to the raw structural views.</p>
         <table class="doc-table">
           <thead><tr><th>View</th><th>Shows</th></tr></thead>
           <tbody>
-            <tr><td>1 — Info</td><td>Path, byte size, and how many string runs were extracted.</td></tr>
+            <tr><td>0 — Records</td><td>Key/value table for a recognized archive: keys on the left, the selected value's decoded scalar fields plus a hex dump of its blob on the right. Searchable by key. Selected automatically whenever a format is recognized.</td></tr>
+            <tr><td>1 — Info</td><td>Path and byte size, plus the detected format name and decoded header fields when recognized.</td></tr>
             <tr><td>2 — Strings</td><td>Every run of ≥ 4 printable ASCII bytes with its hex offset — in practice the keys, interned identifiers and string fields, in archive order.</td></tr>
             <tr><td>3 — Hex</td><td><code>xxd</code>-style dump: 16 bytes per line as <code>offset&nbsp;&nbsp;hex&nbsp;&nbsp;|ascii|</code>.</td></tr>
           </tbody>
         </table>
-        <p class="doc-note">Typed, field-name CRUD over an archive needs a supplied schema descriptor and is deliberately out of scope for this release.</p>
+        <p><strong>Recognized formats:</strong> the zshrs script cache (<code>ZRSC</code>) and autoload cache (<code>ZRAL</code>). Adding one is a single registry entry: copy the producer's archive type — same rkyv version (0.7) and features (<code>validation</code>, <code>archive_le</code>, <code>size_32</code>), same field order and types — and map its magic. Because decoding goes through validation, a type that has drifted from its producer fails the check and drops to the structural view; it never silently misreads the bytes.</p>
+        <p class="doc-note">Editing a recognized archive in place is a separate step: today the Records view is read-only.</p>
       </section>
 
       <section class="tutorial-section">
@@ -186,7 +188,7 @@ zdbview</pre>
             <tr><td>/</td><td>Search</td></tr>
             <tr><td>n / N</td><td>Next / previous match</td></tr>
             <tr><td>e a d :</td><td>Edit cell / insert row / delete row / SQL (SQLite)</td></tr>
-            <tr><td>1 2 3</td><td>Info / Strings / Hex (rkyv)</td></tr>
+            <tr><td>0 1 2 3</td><td>Records / Info / Strings / Hex (rkyv — <code>0</code> only when the format was recognized)</td></tr>
             <tr><td>Enter</td><td>Focus the rows; in the picker, open the file</td></tr>
             <tr><td>q / Esc</td><td>Quit — inside a modal, Esc cancels the modal only</td></tr>
           </tbody>
@@ -201,6 +203,7 @@ zdbview</pre>
           <tbody>
             <tr><td>SQLite — tables</td><td>Table names, case-insensitive, wrapping</td></tr>
             <tr><td>SQLite — rows</td><td>Every column of the loaded page, case-insensitive, wrapping. Page-local: page first, or use <code>:</code> with a <code>WHERE</code> clause</td></tr>
+            <tr><td>rkyv — Records</td><td>Record keys, case-insensitive, wrapping</td></tr>
             <tr><td>rkyv — Strings</td><td>The extracted runs, case-insensitive, wrapping</td></tr>
             <tr><td>rkyv — Hex</td><td>Raw bytes, case-sensitive, does <em>not</em> wrap; the view scrolls to the hit and the offset is reported</td></tr>
             <tr><td>Picker</td><td>Recorded file paths, case-insensitive, wrapping</td></tr>

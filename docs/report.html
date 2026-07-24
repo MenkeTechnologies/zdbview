@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="dark light">
-  <meta name="description" content="zdbview engineering report — module map, detection contract, dependency footprint and test status for the rkyv + SQLite terminal inspector and CRUD editor.">
+  <meta name="description" content="zdbview engineering report — module map, detection contract, rkyv format registry, dependency footprint and test status for the rkyv + SQLite terminal inspector and CRUD editor.">
   <title>zdbview &mdash; Engineering Report</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -72,7 +72,7 @@
             <a href="https://github.com/MenkeTechnologies/zdbview/issues" target="_blank" rel="noopener noreferrer">Issues</a>
           </nav>
           <p style="margin:0.35rem 0 0;font-family:'Share Tech Mono',monospace;font-size:11px;color:var(--text-dim);letter-spacing:0.03em;opacity:0.75;">
-            module map &middot; detection contract &middot; dependency footprint &middot; test status
+            module map &middot; detection contract &middot; rkyv format registry &middot; test status
           </p>
         </div>
         <div class="tutorial-toolbar">
@@ -85,14 +85,14 @@
     <main class="tutorial-main">
 
       <h2 class="tutorial-title"><span class="step-hash">&gt;_</span>EXECUTIVE SUMMARY</h2>
-      <p class="tutorial-subtitle">zdbview v0.1.0 is a single-crate, single-binary Rust TUI (~1,850 lines across six source files plus one integration-test file) that opens both halves of the cache stack: <strong>SQLite</strong> databases with full generic CRUD, and <strong>rkyv</strong> archives with a structural inspector. The split is not a limitation of effort but of the formats: SQLite is self-describing, rkyv is not. Backend selection comes from the file's header bytes, never its name, because rkyv shards are routinely written under a <code>.db</code> name.</p>
+      <p class="tutorial-subtitle">zdbview v0.1.0 is a single-crate, single-binary Rust TUI (~2,230 lines across seven source files plus one integration-test file) that opens both halves of the cache stack: <strong>SQLite</strong> databases with full generic CRUD, and <strong>rkyv</strong> archives through a format registry that decodes recognized archives to key/value records and falls back to a structural view for everything else. The split is not a limitation of effort but of the formats: SQLite is self-describing, rkyv is not, so key/value decoding requires carrying the producer's archive type. Backend selection comes from the file's header bytes, never its name, because rkyv shards are routinely written under a <code>.db</code> name.</p>
       <div class="stat-grid">
-        <div class="stat-card"><div class="stat-val accent">6</div><div class="stat-label">Rust source files</div></div>
-        <div class="stat-card"><div class="stat-val">~1,850</div><div class="stat-label">Lines of Rust</div></div>
+        <div class="stat-card"><div class="stat-val accent">7</div><div class="stat-label">Rust source files</div></div>
+        <div class="stat-card"><div class="stat-val">~2,230</div><div class="stat-label">Lines of Rust</div></div>
         <div class="stat-card"><div class="stat-val">2</div><div class="stat-label">Store backends</div></div>
-        <div class="stat-card"><div class="stat-val">5</div><div class="stat-label">Direct dependencies</div></div>
-        <div class="stat-card"><div class="stat-val green">5</div><div class="stat-label">Integration tests</div></div>
-        <div class="stat-card"><div class="stat-val">500</div><div class="stat-label">Rows per page</div></div>
+        <div class="stat-card"><div class="stat-val">2</div><div class="stat-label">Recognized rkyv formats</div></div>
+        <div class="stat-card"><div class="stat-val">6</div><div class="stat-label">Direct dependencies</div></div>
+        <div class="stat-card"><div class="stat-val green">11</div><div class="stat-label">Tests</div></div>
       </div>
 
       <hr class="section-rule">
@@ -102,14 +102,15 @@
       <table class="file-table">
         <thead><tr><th>Source</th><th class="num">Lines</th><th>Size</th><th>Role</th></tr></thead>
         <tbody>
-          <tr><td><code>src/main.rs</code></td><td class="num">67</td><td><div class="bar-wrap"><div class="bar-fill cyan" style="width:6%"></div></div></td><td>CLI (clap), terminal init/restore, and the open sequence: resolve file &rarr; detect &rarr; open &rarr; record in the MRU &rarr; run.</td></tr>
-          <tr><td><code>src/store.rs</code></td><td class="num">76</td><td><div class="bar-wrap"><div class="bar-fill yellow" style="width:7%"></div></div></td><td><code>Kind</code> detection from the SQLite header magic and the <code>Store</code> enum owning the selected backend, including the SQLite&rarr;inspector fallback.</td></tr>
-          <tr><td><code>src/rkyv_inspect.rs</code></td><td class="num">90</td><td><div class="bar-wrap"><div class="bar-fill magenta" style="width:8%"></div></div></td><td><code>RkyvStore</code>: whole-file load, printable-run extraction with byte offsets, and <code>xxd</code>-style hex line formatting.</td></tr>
-          <tr><td><code>src/mru.rs</code></td><td class="num">131</td><td><div class="bar-wrap"><div class="bar-fill green" style="width:12%"></div></div></td><td>Recent-files store: XDG path resolution, load/record, canonicalized dedupe, 50-entry cap, atomic temp-file-plus-rename write, relative-age formatting.</td></tr>
-          <tr><td><code>src/sqlite.rs</code></td><td class="num">181</td><td><div class="bar-wrap"><div class="bar-fill cyan" style="width:16%"></div></div></td><td><code>SqliteStore</code>: table/view listing, paged <code>RowsView</code> carrying rowids, and the update / insert / delete / exec operations. The layer the tests drive.</td></tr>
-          <tr><td><code>src/app.rs</code></td><td class="num">1,133</td><td><div class="bar-wrap"><div class="bar-fill yellow" style="width:100%"></div></div></td><td>The interactive layer: focus and modal state, per-backend key dispatch, vim motions, search, the recent-files picker, and all ratatui rendering.</td></tr>
-          <tr><td><code>tests/backend.rs</code></td><td class="num">165</td><td><div class="bar-wrap"><div class="bar-fill magenta" style="width:15%"></div></div></td><td>Integration tests over the backends, with the sources pulled in by <code>#[path]</code> since the crate is a binary.</td></tr>
-          <tr class="total-row"><td>7 files</td><td class="num">~1,850</td><td></td><td>One binary; no library target.</td></tr>
+          <tr><td><code>src/main.rs</code></td><td class="num">68</td><td><div class="bar-wrap"><div class="bar-fill cyan" style="width:5%"></div></div></td><td>CLI (clap), terminal init/restore, and the open sequence: resolve file &rarr; detect &rarr; open &rarr; record in the MRU &rarr; run.</td></tr>
+          <tr><td><code>src/store.rs</code></td><td class="num">76</td><td><div class="bar-wrap"><div class="bar-fill yellow" style="width:6%"></div></div></td><td><code>Kind</code> detection from the SQLite header magic and the <code>Store</code> enum owning the selected backend, including the SQLite&rarr;inspector fallback.</td></tr>
+          <tr><td><code>src/rkyv_inspect.rs</code></td><td class="num">90</td><td><div class="bar-wrap"><div class="bar-fill magenta" style="width:7%"></div></div></td><td><code>RkyvStore</code>: whole-file load, printable-run extraction with byte offsets, and <code>xxd</code>-style hex line formatting.</td></tr>
+          <tr><td><code>src/mru.rs</code></td><td class="num">131</td><td><div class="bar-wrap"><div class="bar-fill green" style="width:10%"></div></div></td><td>Recent-files store: XDG path resolution, load/record, canonicalized dedupe, 50-entry cap, atomic temp-file-plus-rename write, relative-age formatting.</td></tr>
+          <tr><td><code>src/sqlite.rs</code></td><td class="num">181</td><td><div class="bar-wrap"><div class="bar-fill cyan" style="width:14%"></div></div></td><td><code>SqliteStore</code>: table/view listing, paged <code>RowsView</code> carrying rowids, and the update / insert / delete / exec operations.</td></tr>
+          <tr><td><code>src/formats.rs</code></td><td class="num">220</td><td><div class="bar-wrap"><div class="bar-fill green" style="width:17%"></div></div></td><td>The rkyv format registry: byte-compatible copies of the producer archive types, magic detection, validated decode to <code>(key, value, fields)</code> records, and the structural fallback on any mismatch.</td></tr>
+          <tr><td><code>src/app.rs</code></td><td class="num">1,296</td><td><div class="bar-wrap"><div class="bar-fill yellow" style="width:100%"></div></div></td><td>The interactive layer: focus and modal state, per-backend key dispatch, vim motions, search, the Records / Info / Strings / Hex views, the recent-files picker, and all ratatui rendering.</td></tr>
+          <tr><td><code>tests/backend.rs</code></td><td class="num">165</td><td><div class="bar-wrap"><div class="bar-fill magenta" style="width:13%"></div></div></td><td>Integration tests over the backends, with the sources pulled in by <code>#[path]</code> since the crate is a binary.</td></tr>
+          <tr class="total-row"><td>8 files</td><td class="num">~2,230</td><td></td><td>One binary; no library target.</td></tr>
         </tbody>
       </table>
 
@@ -130,7 +131,7 @@
       <p class="tutorial-subtitle">Two backends behind one enum, one interactive layer that dispatches keys per backend.</p>
       <div class="feature-grid">
         <div class="feature-card"><h4>SQLite — generic CRUD</h4><p>Rows are addressed by <code>rowid</code>, selected alongside the real columns as <code>SELECT rowid, * FROM &lt;table&gt;</code>. That single decision is what makes edit and delete work on an arbitrary schema with no configuration. Identifiers are double-quoted with internal quotes doubled; values are bound as parameters.</p><ul><li><code>WITHOUT ROWID</code> tables are listed read-only — no generic row handle exists.</li><li>Pages hold 500 rows; the title reports <code>rows from..to of total</code>.</li></ul></div>
-        <div class="feature-card"><h4>rkyv — structural only</h4><p>An archive is a memory image plus a root pointer: no field names, no type tags, no embedded schema. The originating Rust type <em>is</em> the schema, so a generic field editor is impossible without a supplied descriptor. The inspector shows the size, the printable runs with offsets, and the raw bytes.</p></div>
+        <div class="feature-card"><h4>rkyv — registry, then fallback</h4><p>An archive is a memory image plus a root pointer: no field names, no type tags, no embedded schema. <code>formats.rs</code> supplies the missing schema for the formats zdbview knows — a byte-compatible copy of the producer's archive type, keyed by magic header — and decodes through <code>rkyv::check_archived_root</code>, so a drifted type fails validation instead of misreading bytes. Unrecognized archives fall back to size, printable runs with offsets, and the raw hex.</p><ul><li>Recognized today: zshrs script cache (<code>ZRSC</code>) and autoload cache (<code>ZRAL</code>).</li><li>A cheap little-endian magic scan pre-filters before full validation.</li></ul></div>
         <div class="feature-card"><h4>Interactive layer</h4><p>Modal state (<code>EditCell</code>, <code>Command</code>, <code>Search</code>, <code>ConfirmDelete</code>) is handled before normal keys, and the buffer is snapshotted into a local so no borrow of the mode is held across the <code>&amp;mut self</code> dispatch. Motions follow vim: <code>gg</code>/<code>G</code>, <code>Ctrl-f</code>/<code>Ctrl-b</code>, <code>/</code> with <code>n</code>/<code>N</code>.</p></div>
         <div class="feature-card"><h4>Recent files</h4><p>Opens are recorded to <code>$XDG_CACHE_HOME/zdbview/recent</code>, deduped by canonicalized path, capped at 50, and written via temp-file-plus-rename so a concurrent reader never sees a partial list. Malformed lines are skipped rather than aborting the load.</p></div>
       </div>
@@ -138,7 +139,7 @@
       <hr class="section-rule">
 
       <h2 class="tutorial-title"><span class="step-hash">~</span>DEPENDENCY FOOTPRINT</h2>
-      <p class="tutorial-subtitle">Five direct dependencies. SQLite is compiled in via the <code>bundled</code> feature, so there is no system-library requirement at runtime.</p>
+      <p class="tutorial-subtitle">Six direct dependencies. SQLite is compiled in via the <code>bundled</code> feature, so there is no system-library requirement at runtime, and rkyv is pinned to the version and features the producers serialize with.</p>
       <table class="file-table">
         <thead><tr><th>Crate</th><th>Ver</th><th>License</th><th>Why</th></tr></thead>
         <tbody>
@@ -147,16 +148,21 @@
           <tr><td>rusqlite</td><td>0.40</td><td>MIT</td><td>The SQLite backend; <code>bundled</code> compiles SQLite itself (public domain) through libsqlite3-sys 0.38 (MIT).</td></tr>
           <tr><td>anyhow</td><td>1</td><td>MIT / Apache-2.0</td><td>Error type for open/read paths, with per-file context.</td></tr>
           <tr><td>clap</td><td>4</td><td>MIT / Apache-2.0</td><td>Derive-based CLI: the optional file argument and the two force flags.</td></tr>
+          <tr><td>rkyv</td><td>0.7</td><td>MIT</td><td>Validated zero-copy decoding of recognized archives. Pinned to the version and features the producers serialize with (<code>validation</code>, <code>archive_le</code>, <code>size_32</code>) — a mismatch would fail validation rather than decode wrongly.</td></tr>
         </tbody>
       </table>
 
       <hr class="section-rule">
 
       <h2 class="tutorial-title"><span class="step-hash">~</span>VERIFICATION</h2>
-      <p class="tutorial-subtitle">Five integration tests in <code>tests/backend.rs</code> exercise the backends directly — the layer the TUI drives — so no terminal is needed and they run headless in CI. Run with <code>cargo test</code>.</p>
+      <p class="tutorial-subtitle">Eleven tests: six unit tests inside the binary (format decoding and the search primitives) plus five integration tests in <code>tests/backend.rs</code> that exercise the backends directly — the layer the TUI drives — so no terminal is needed and they run headless in CI. Run with <code>cargo test</code>.</p>
       <table class="file-table">
         <thead><tr><th>Test</th><th>Scope</th></tr></thead>
         <tbody>
+          <tr><td>formats::script_shard_roundtrips_through_try_decode</td><td>Serializes a script shard with the copied archive type, then asserts <code>try_decode</code> recognizes the format, decodes the record key and blob, and reports the header fields — the check that keeps the copied types byte-compatible with the producer.</td></tr>
+          <tr><td>formats::garbage_is_not_recognized</td><td>Zeroes and plain text must fall through to the structural view rather than decode into nonsense.</td></tr>
+          <tr><td>app::find_next_forward_wraps / _backward_wraps / _none_and_empty</td><td>The search cursor: wrap-around in both directions, no-match, and empty-collection behavior.</td></tr>
+          <tr><td>app::find_bytes_forward_and_backward</td><td>The hex byte search: first hit past the cursor going forward, last hit before it going backward.</td></tr>
           <tr><td>sqlite_full_crud_roundtrip</td><td>Builds a real database, then drives listing, column introspection, paging, cell update by rowid, default-values insert, row delete, and raw exec — asserting the row state after each step.</td></tr>
           <tr><td>rkyv_structural_strings_and_hex</td><td>Synthesizes a blob with a known embedded string, then asserts run extraction honours the minimum length, reports the right byte offset, and that the hex line is correctly formatted.</td></tr>
           <tr><td>mru_record_dedup_and_order</td><td>Records three opens including a repeat, then asserts the list dedupes by canonicalized path and that the re-opened file moves back to the front with the right kind.</td></tr>
@@ -171,14 +177,14 @@
       <h2 class="tutorial-title"><span class="step-hash">~</span>SCOPE</h2>
       <p class="tutorial-subtitle">What is deliberately not implemented, and why.</p>
       <div class="feature-grid">
-        <div class="feature-card"><h4>Typed rkyv CRUD</h4><p>Requires a supplied schema descriptor. Until one exists, guessing field boundaries from an untyped archive would produce plausible, wrong edits — so the rkyv side stays read-only.</p></div>
+        <div class="feature-card"><h4>Writing rkyv archives</h4><p>Recognized formats decode to key/value, but the Records view is read-only: re-serializing a shard means reproducing the producer's exact layout, and a wrong write corrupts a cache the producer then mmaps. Unrecognized archives stay structural, because guessing field boundaries from an untyped image would produce plausible, wrong output.</p></div>
         <div class="feature-card"><h4>Whole-table search</h4><p>Search is page-local in SQLite. A <code>WHERE</code> clause through <code>:</code> is the correct tool for a large table, and it is already generic.</p></div>
         <div class="feature-card"><h4>Blob editing and transactions</h4><p>Blobs render as <code>&lt;blob N bytes&gt;</code> and each statement commits on its own. Binary writes and multi-statement transactions go through <code>:</code>.</p></div>
       </div>
 
     </main>
     <footer style="text-align:center;padding:2rem;font-size:10px;color:var(--text-muted);font-family:'Orbitron',sans-serif;letter-spacing:2px;">
-      ZDBVIEW &middot; ENGINEERING REPORT &middot; 6 RUST FILES / ~1,850 LINES &middot; 2 BACKENDS &middot; 5 DEPENDENCIES &middot; 5 TESTS &middot; MENKETECHNOLOGIES
+      ZDBVIEW &middot; ENGINEERING REPORT &middot; 7 RUST FILES / ~2,230 LINES &middot; 2 BACKENDS &middot; 6 DEPENDENCIES &middot; 11 TESTS &middot; MENKETECHNOLOGIES
     </footer>
   </div>
 

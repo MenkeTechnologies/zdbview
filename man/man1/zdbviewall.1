@@ -25,7 +25,7 @@ be grepped with `/':
 .RB "\(em " "table list, paging, cell edit, insert, delete, raw SQL"
 .br
 .B 4.  RKYV MODE
-.RB "\(em " "why the schema is unrecoverable, Info/Strings/Hex views"
+.RB "\(em " "the format registry, Records/Info/Strings/Hex views"
 .br
 .B 5.  KEYS
 .RB "\(em " "every binding in every mode, including modal input"
@@ -46,7 +46,6 @@ be grepped with `/':
 .RB "\(em " "what is deliberately not implemented"
 .RE
 .SH 1. INVOCATION
-.PP
 .RS 4
 .B zdbview
 .RI [ \-\-sqlite | \-\-rkyv ]
@@ -76,7 +75,6 @@ Print usage and exit.
 .B \-V ", " \-\-version
 Print the version and exit.
 .SH 2. FILE TYPE DETECTION
-.PP
 Detection reads the first 16 bytes and compares them to the SQLite header magic
 .RB ( "SQLite format 3\e0" ).
 .TP
@@ -186,17 +184,52 @@ UTF-8 (lossy), NULL as
 and blobs as
 .RI "\(oq" "<blob N bytes>" "\(cq" .
 .SH 4. RKYV MODE
-.SS Why there is no generic CRUD
+.SS Why a registry is needed at all
 An rkyv archive is a memory image of a Rust value plus a root pointer. The
 format stores no field names, no type tags and no length-prefixed schema; the
 originating Rust type
 .I is
 the schema. A reader that does not have that type cannot know whether eight
-bytes are a u64, two u32s, or a relative pointer \(em so no generic field-name
-editor is possible, and zdbview does not pretend otherwise.
+bytes are a u64, two u32s, or a relative pointer \(em so a
+.I generic
+field-name editor is impossible, and zdbview does not pretend otherwise. What it
+does instead is carry the type for the formats it knows.
+.SS The format registry
+.I src/formats.rs
+holds a byte-compatible copy of each recognized producer's archive type: same
+rkyv version (0.7), same features
+.RB ( validation ", " archive_le ", " size_32 ),
+same field order and types. Detection is a cheap little-endian scan for the
+format's magic, followed by a full
+.B rkyv::check_archived_root
+validation. Two formats are recognized today:
+.RS 2
+.IP \(bu 2
+.B ZRSC
+\(em the zshrs script cache: per-path entries carrying mtime, cache timestamps
+and the compiled chunk blob.
+.IP \(bu 2
+.B ZRAL
+\(em the zshrs autoload cache: per-function entries carrying cache timestamps
+and the compiled chunk blob.
+.RE
+.PP
+Because decoding goes through validation, a copied type that has drifted from
+its producer fails the check and the file falls back to the structural views. A
+mismatch is therefore visible as "unrecognized", never as silently wrong fields.
+Adding a format is one registry entry: copy the type, map the magic.
+.SS Records (key 0)
+The key/value table for a recognized archive: keys on the left, the selected
+value's decoded scalar fields plus a hex dump of its blob on the right. Selected
+automatically whenever a format is recognized;
+.B /
+searches the keys. The view is read-only \(em writing an archive back means
+reproducing the producer's exact layout, and a wrong write corrupts a cache the
+producer then mmaps.
 .SS Info (key 1)
-Path, byte size, and the number of extracted string runs, plus a note on why the
-view is structural.
+Path, byte size, and the number of extracted string runs; for a recognized
+archive, also the detected format name and its decoded header fields
+(format version, producing zshrs version, pointer width, build timestamp).
 .SS Strings (key 2)
 Every run of at least 4 consecutive printable ASCII bytes
 .RB ( 0x20 \(en 0x7e ),
@@ -271,11 +304,13 @@ Delete the selected row (confirms).
 Run a SQL statement.
 .SS rkyv mode
 .TP
-.BR 1 ", " 2 ", " 3
-Info / Strings / Hex.
+.BR 0 ", " 1 ", " 2 ", " 3
+Records / Info / Strings / Hex. Key
+.B 0
+is available only when the archive format was recognized.
 .TP
 .BR j ", " k
-Scroll the string list or the hex dump.
+Scroll the record list, the string list or the hex dump.
 .TP
 .BR PageDown ", " PageUp
 Scroll the hex dump by 16 lines.
@@ -304,7 +339,6 @@ Cancel the modal and return to browsing. Nothing is written.
 .B Backspace
 Delete the last character.
 .SH 6. SEARCH
-.PP
 .B /
 opens a prompt; Enter stores the pattern and jumps to the first match.
 .B n
@@ -326,6 +360,9 @@ with a
 .B WHERE
 clause.
 .TP
+.B rkyv \(em Records
+Record keys, case-insensitively. Wraps at the ends.
+.TP
 .B rkyv \(em Strings
 The extracted string runs, case-insensitively. Wraps at the ends.
 .TP
@@ -338,7 +375,6 @@ wrap \(em it stops at the end (or the start, going backward).
 .B Picker
 The recorded file paths, case-insensitively. Wraps at the ends.
 .SH 7. RECENT FILES
-.PP
 Every successful open is appended to the front of the list at
 .I $XDG_CACHE_HOME/zdbview/recent
 .RI ( ~/.cache/zdbview/recent
@@ -384,6 +420,11 @@ layer the tests drive.
 The structural inspector: file load, printable-run extraction, hex-line
 formatting.
 .TP
+.B src/formats.rs
+The format registry: byte-compatible copies of the recognized producers'
+archive types, magic detection, validated decode to key/value records, and the
+fallback to the structural views on any mismatch.
+.TP
 .B src/mru.rs
 The recent-files store: load, record, dedupe, cap, atomic write, relative-age
 formatting.
@@ -399,7 +440,6 @@ and detection of a non-SQLite file carrying a
 .B .db
 name.
 .SH 9. EXAMPLES
-.PP
 Browse and edit a SQLite database:
 .PP
 .RS 4
@@ -411,7 +451,7 @@ Inspect an rkyv shard stored under a
 name \(em detection routes it to the inspector automatically:
 .PP
 .RS 4
-.B zdbview ~/.cache/zshrs/plugins.db
+.B zdbview ~/.cache/zshrs/scripts.db
 .RE
 .PP
 Look at the raw page structure of a real SQLite file:
@@ -427,9 +467,12 @@ Reopen something from earlier:
 .RE
 .SH 10. LIMITATIONS
 .TP
-.B No typed rkyv CRUD
-Editing named fields of an archive requires a supplied schema descriptor. Until
-one exists, rkyv files are read-only.
+.B rkyv archives are read-only
+Recognized formats decode to key/value, but nothing is written back:
+re-serializing a shard means reproducing the producer's exact layout, and a
+wrong write corrupts a cache the producer then mmaps. Unrecognized archives stay
+structural, since guessing field boundaries from an untyped image would produce
+plausible, wrong output.
 .TP
 .B Search is page-local in SQLite
 Matching runs over the loaded page, not the whole table. Use
@@ -461,9 +504,7 @@ Each statement commits on its own. There is no explicit begin/rollback surface.
 .BR xxd (1),
 .BR zshrs (1)
 .PP
-Project documentation:
-.UR https://menketechnologies.github.io/zdbview
-.UE
+Project documentation: <https://menketechnologies.github.io/zdbview>.
 .SH REPORTING BUGS
 Report bugs at <https://github.com/MenkeTechnologies/zdbview/issues>.
 .SH COPYRIGHT

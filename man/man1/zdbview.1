@@ -19,10 +19,13 @@ run arbitrary SQL.
 .B rkyv
 archives (and any other binary blob) \(em
 .I not
-self-describing, so the view is structural: file summary, the runs of printable
-text embedded in the archive, and an
+self-describing. zdbview carries a registry of recognized formats, each with a
+byte-compatible copy of the producer's archive type: a recognized archive is
+validated and decoded to a browsable key/value table, and anything else drops to
+a structural view (file summary, the runs of printable text embedded in the
+archive, and an
 .BR xxd (1)-style
-hex/ascii dump.
+hex/ascii dump).
 .RE
 .PP
 Invoked with no
@@ -87,13 +90,28 @@ is reported in the status bar and the current page is reloaded.
 .SH RKYV MODE
 The rkyv format stores no field names and no type tags, so a generic reader
 cannot recover the schema of an arbitrary archive without the originating Rust
-type. zdbview therefore shows what
+type. zdbview supplies that type for the formats it recognizes \(em currently the
+zshrs script cache
+.RB ( ZRSC )
+and autoload cache
+.RB ( ZRAL )
+\(em detecting each by its magic header and decoding through
+.BR rkyv::check_archived_root ,
+so a copied type that has drifted from its producer fails validation instead of
+misreading the bytes. For anything unrecognized, the views show what
 .I is
 recoverable from the bytes:
 .TP
+.B 0
+.B Records
+\(em key/value table for a recognized archive: keys on the left, the selected
+value's decoded scalar fields and a hex dump of its blob on the right. This view
+is selected automatically when a format is recognized, and is read-only.
+.TP
 .B 1
 .B Info
-\(em path, size, and the number of extracted string runs.
+\(em path, size, the number of extracted string runs, and the detected format
+plus its decoded header fields when recognized.
 .TP
 .B 2
 .B Strings
@@ -105,8 +123,11 @@ practice this surfaces keys, interned identifiers and string fields.
 \(em 16 bytes per line as
 .BR "offset  hex  |ascii|" .
 .PP
-Typed, field-name CRUD over a rkyv archive requires a supplied schema descriptor
-and is deliberately out of scope for this release.
+Adding a format is a single registry entry in
+.IR src/formats.rs :
+copy the producer's archive type (same rkyv version and features) and map its
+magic. Writing archives back is out of scope for this release \(em the Records
+view is read-only.
 .SH KEYS
 .TP
 .B Tab
@@ -128,8 +149,8 @@ Page forward / back through rows.
 .TP
 .B /
 Search. The pattern is matched against table names or every column of the loaded
-page (SQLite, depending on focus), the extracted strings or the raw bytes
-(rkyv), or the file names (recent-files picker). Text searches are
+page (SQLite, depending on focus), record keys, the extracted strings or the raw
+bytes (rkyv), or the file names (recent-files picker). Text searches are
 case-insensitive and wrap; the hex search is a case-sensitive byte match and
 does not wrap.
 .TP
@@ -175,11 +196,11 @@ Open a SQLite database with full CRUD:
 .B zdbview ~/.cache/zshrs/completions.sqlite
 .RE
 .PP
-Inspect a rkyv cache shard that happens to be named
+Browse a recognized rkyv cache shard that happens to be named
 .BR .db :
 .PP
 .RS 4
-.B zdbview ~/.cache/zshrs/plugins.db
+.B zdbview ~/.cache/zshrs/scripts.db
 .RE
 .PP
 Force the binary inspector on a real SQLite file, to look at its page structure:
@@ -199,9 +220,7 @@ Pick from the files opened recently:
 .BR xxd (1),
 .BR zshrs (1)
 .PP
-Project documentation:
-.UR https://menketechnologies.github.io/zdbview
-.UE
+Project documentation: <https://menketechnologies.github.io/zdbview>.
 .SH REPORTING BUGS
 Report bugs at <https://github.com/MenkeTechnologies/zdbview/issues>.
 .SH COPYRIGHT
