@@ -82,6 +82,35 @@ impl SqliteStore {
         })
     }
 
+    /// `WHERE` body matching `term` against every column as text, plus the bound
+    /// pattern. `None` when there is no filter.
+    fn filter_clause(columns: &[String], term: &str) -> Option<(String, String)> {
+        if term.is_empty() || columns.is_empty() {
+            return None;
+        }
+        let likes = columns
+            .iter()
+            .map(|c| format!("CAST(\"{}\" AS TEXT) LIKE ?1 ESCAPE '\\'", esc(c)))
+            .collect::<Vec<_>>()
+            .join(" OR ");
+        Some((
+            format!(" WHERE ({likes})"),
+            format!("%{}%", like_escape(term)),
+        ))
+    }
+
+    /// Rows matching `filter`, i.e. how many the filtered grid has in total.
+    pub fn count_filtered(&self, table: &str, filter: &str) -> Result<i64> {
+        let columns = self.columns(table)?;
+        match Self::filter_clause(&columns, filter) {
+            None => self.count(table),
+            Some((where_sql, pattern)) => {
+                let sql = format!("SELECT COUNT(*) FROM \"{}\"{}", esc(table), where_sql);
+                Ok(self.conn.query_row(&sql, params![pattern], |r| r.get(0))?)
+            }
+        }
+    }
+
     pub fn count(&self, table: &str) -> Result<i64> {
         let n: i64 = self.conn.query_row(
             &format!("SELECT COUNT(*) FROM \"{}\"", esc(table)),
@@ -109,10 +138,13 @@ impl SqliteStore {
         limit: i64,
         offset: i64,
         sort: Option<&Sort>,
+        filter: &str,
     ) -> Result<RowsView> {
         let columns = self.columns(table)?;
-        let total = self.count(table)?;
+        let total = self.count_filtered(table, filter)?;
         let ncols = columns.len();
+        let clause = Self::filter_clause(&columns, filter);
+        let where_sql = clause.as_ref().map(|(w, _)| w.as_str()).unwrap_or("");
 
         // Try to select rowid alongside the real columns. Falls back to a
         // plain select for WITHOUT ROWID tables where `rowid` is not a column.
@@ -135,8 +167,9 @@ impl SqliteStore {
                 _ => "rowid".to_string(),
             };
             format!(
-                "SELECT rowid, * FROM \"{}\" ORDER BY {} LIMIT {} OFFSET {}",
+                "SELECT rowid, * FROM \"{}\"{} ORDER BY {} LIMIT {} OFFSET {}",
                 esc(table),
+                where_sql,
                 order,
                 limit,
                 offset
@@ -151,8 +184,9 @@ impl SqliteStore {
                 _ => "1".to_string(),
             };
             format!(
-                "SELECT * FROM \"{}\" ORDER BY {} LIMIT {} OFFSET {}",
+                "SELECT * FROM \"{}\"{} ORDER BY {} LIMIT {} OFFSET {}",
                 esc(table),
+                where_sql,
                 order,
                 limit,
                 offset
@@ -162,7 +196,10 @@ impl SqliteStore {
         let mut stmt = self.conn.prepare(&sql)?;
         let mut rows_out = Vec::new();
         let mut rowids = Vec::new();
-        let mut q = stmt.query([])?;
+        let mut q = match &clause {
+            Some((_, pattern)) => stmt.query(params![pattern])?,
+            None => stmt.query([])?,
+        };
         while let Some(row) = q.next()? {
             let (base, rid) = if with_rowid {
                 (1usize, row.get::<_, i64>(0).ok())

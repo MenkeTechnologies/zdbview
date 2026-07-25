@@ -225,8 +225,9 @@ is published on crates.io); disable with `--no-default-features`.
 | `j` / `k`, arrows | move; `←` / `→` change column |
 | `gg` / `G` | jump to top / bottom |
 | `Enter` | open detail (row / record); focus rows (table list) |
-| `/` | search; `n` / `N` next / previous match |
-| `Ctrl-f` / `Ctrl-b` | page forward / back (SQLite) |
+| `/` | **filter** the list/table as you type; `Enter` keeps it, `Esc` clears it |
+| `n` / `N` | next / previous match of the filter pattern |
+| `Ctrl-f` / `Ctrl-b`, `PgUp` / `PgDn` | page by a screenful (every view) |
 | `e` `a` `d` `:` | edit / add / delete / SQL (SQLite) |
 | `s` | sort by the cursor column (ascending → descending → off) |
 | `<` / `>` | move the sort to the previous / next column |
@@ -242,7 +243,7 @@ is published on crates.io); disable with `--no-default-features`.
 | `h` / `?` | help overlay |
 | mouse | wheel scrolls, click selects, right-click selects + opens detail |
 | `q` | quit |
-| `Esc` | back out of a nested screen (quits on the main screen) |
+| `Esc` | back out of a nested screen; on the first level, back to the file list |
 
 `h` is the help key, not a motion — columns move with `←` / `→`. The overlay keys
 (`h`, `c`, `C`) work on every screen, including the recent-files picker.
@@ -328,10 +329,33 @@ the `rowid` tiebreaker keeps paging stable when the sort column has duplicates.
 Search and the `(row N of M)` readout follow the displayed order, so `n` / `N`
 step to the next match *on screen* rather than the next by `rowid`.
 
-SQLite search is **whole-table** (SQL-backed across every column), not limited to
-the loaded page; rkyv search scans record keys, the string list, or raw bytes.
-Text searches are case-insensitive and wrap; the hex byte search is
-case-sensitive.
+## Filtering
+
+`/` **filters** the current list as you type, the same model as `iftoprs`: only
+matching rows stay listed, the title carries the count (`tables 2/3  /user`,
+`1/4 keys  /alpha`), `Enter` keeps the filter and `Esc` clears it and puts the
+cursor back where `/` was pressed. Navigation walks the filtered list, so `j`/`k`
+never land on a hidden row.
+
+For SQLite the filter is a SQL `WHERE` across every column, so it covers the
+**whole table** — the row count and paging follow the filter, not just the loaded
+page. The table list, the rkyv Records and Strings views, and the file picker
+filter the same way; the Hex view is unfiltered (bytes have no rows) and keeps
+`/` as a byte search. Matching is case-insensitive substring; the hex byte search
+is case-sensitive.
+
+## Large archives
+
+Opening a big shard used to block: a 382 MB `elisprs` heap image took ~4 s to
+scan for strings and ~25 s for rkyv to validate, which reads as a hang. Now the
+same file opens in **~213 ms**:
+
+- rkyv validation for anything over 4 MB runs on a background thread. The
+  structural view (Info / Strings / Hex) is usable immediately and the Records
+  view appears when the decode lands, with a toast naming the format.
+- String extraction is bounded to 20k runs from the first 64 MB. The Info line and
+  the Strings title say so (`Strings (20000+)`) rather than implying the list is
+  exhaustive.
 
 ## Detail view
 

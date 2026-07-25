@@ -15,7 +15,25 @@ pub struct RkyvStore {
     pub bytes: Vec<u8>,
 }
 
+/// Most printable runs collected from one archive. Past this the list is no
+/// longer something a person reads, and every entry costs a heap allocation.
+const MAX_STRING_HITS: usize = 20_000;
+/// Bytes scanned for printable runs. A 382 MB shard took 4.2 s to scan in full,
+/// which is a stall the picker's file open cannot afford.
+const STRINGS_SCAN_CAP: usize = 64 * 1024 * 1024;
+
+/// The result of a bounded string extraction.
+#[derive(Debug, Default)]
+pub struct Strings {
+    pub hits: Vec<StringHit>,
+    /// A bound was hit, so this is not every run in the file.
+    pub truncated: bool,
+    /// How many bytes were scanned.
+    pub scanned: usize,
+}
+
 /// A run of printable ASCII found in the archive, with its byte offset.
+#[derive(Debug)]
 pub struct StringHit {
     pub offset: usize,
     pub text: String,
@@ -34,11 +52,18 @@ impl RkyvStore {
         self.bytes.len()
     }
 
-    /// Extract runs of printable ASCII of at least `min_len` bytes.
-    pub fn strings(&self, min_len: usize) -> Vec<StringHit> {
+    /// Extract runs of printable ASCII of at least `min_len` bytes, bounded so a
+    /// huge archive cannot stall the UI: at most [`MAX_STRING_HITS`] runs from the
+    /// first [`STRINGS_SCAN_CAP`] bytes. `truncated` says whether either bound
+    /// was hit, which the Strings view reports.
+    pub fn strings(&self, min_len: usize) -> Strings {
+        let scan_end = self.bytes.len().min(STRINGS_SCAN_CAP);
         let mut hits = Vec::new();
         let mut start: Option<usize> = None;
-        for (i, &b) in self.bytes.iter().enumerate() {
+        for (i, &b) in self.bytes[..scan_end].iter().enumerate() {
+            if hits.len() >= MAX_STRING_HITS {
+                break;
+            }
             let printable = (0x20..0x7f).contains(&b);
             match (printable, start) {
                 (true, None) => start = Some(i),
@@ -55,14 +80,19 @@ impl RkyvStore {
             }
         }
         if let Some(s) = start {
-            if self.bytes.len() - s >= min_len {
+            if hits.len() < MAX_STRING_HITS && scan_end - s >= min_len {
                 hits.push(StringHit {
                     offset: s,
-                    text: String::from_utf8_lossy(&self.bytes[s..]).into_owned(),
+                    text: String::from_utf8_lossy(&self.bytes[s..scan_end]).into_owned(),
                 });
             }
         }
-        hits
+        let truncated = hits.len() >= MAX_STRING_HITS || scan_end < self.bytes.len();
+        Strings {
+            hits,
+            truncated,
+            scanned: scan_end,
+        }
     }
 
     /// One 16-byte `offset  hex bytes  |ascii|` line, `xxd` style. Formatting

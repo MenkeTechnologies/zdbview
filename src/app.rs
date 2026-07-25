@@ -58,12 +58,25 @@ enum Mode {
 
 /// The views for a rkyv/binary file. `Records` is only available when the
 /// archive was recognized and decoded to key/value.
-#[derive(PartialEq, Eq, Clone, Copy)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
 enum RkyvView {
     Records,
     Info,
     Strings,
     Hex,
+}
+
+/// Where the cursor was when `/` was pressed. An incremental search always looks
+/// from here, so the match moves with the pattern instead of walking forward one
+/// hop per keystroke, and Esc puts things back.
+#[derive(Debug, Clone, Copy)]
+struct SearchOrigin {
+    table_idx: usize,
+    page_offset: i64,
+    row_idx: usize,
+    record_idx: usize,
+    string_idx: usize,
+    hex_row: usize,
 }
 
 /// Why the app loop ended: the user quit, or asked for the file picker again.
@@ -169,6 +182,22 @@ pub struct App {
     hex_area: Rect,
     /// Set by `o`: leave the app loop and show the file picker again.
     reopen: bool,
+    /// Position `/` started from, while a search prompt is open.
+    search_origin: Option<SearchOrigin>,
+    /// Active `/` filter: only matching rows/records/strings are listed. Empty
+    /// when nothing is filtered.
+    filter: String,
+    /// The extracted string list hit its bounds, so it is not exhaustive.
+    strings_truncated: bool,
+    /// Bytes the string scan covered (the whole file unless it was bounded).
+    strings_scanned: usize,
+    /// A decode running on another thread, for an archive too big to validate
+    /// while the user waits.
+    decoding: Option<std::sync::mpsc::Receiver<Option<Decoded>>>,
+    /// Rows of the focused scrollable region in the last frame. Paging moves by
+    /// this much, so PageUp/PageDown match what is actually on screen instead of
+    /// a fixed guess.
+    page_rows: usize,
     /// Active row-grid ordering, or `None` for the table's natural `rowid`
     /// order. Reset when another table is selected.
     sort: Option<Sort>,
@@ -224,10 +253,23 @@ impl App {
             hex: None,
             hex_area: Rect::ZERO,
             reopen: false,
+            search_origin: None,
+            filter: String::new(),
+            strings_truncated: false,
+            strings_scanned: 0,
+            decoding: None,
+            page_rows: 10,
             ov: Overlays::new(theme),
         };
         app.init();
         app
+    }
+
+    /// Leave the open file and ask for the picker again (`o`, or `Esc` on the
+    /// first level).
+    fn back_to_files(&mut self) {
+        self.reopen = true;
+        self.quit = true;
     }
 
     /// Which key sections the help overlay lists for what is on screen.
@@ -255,20 +297,35 @@ impl App {
                 if !s.tables.is_empty() {
                     self.load_table();
                 }
-                self.status = "j/k ←/→ move · Tab focus · / search (n/N) · ^f/^b page · e edit · a add · d delete · : SQL · s sort · c scheme · o files · h help · q quit".into();
+                self.status = "j/k ←/→ move · Tab focus · / filter · ^f/^b page · e edit · a add · d delete · : SQL · s sort · c scheme · o/Esc files · h help · q quit".into();
             }
             Store::Rkyv(r) => {
-                self.strings = r.strings(MIN_STRING);
+                let s = r.strings(MIN_STRING);
+                self.strings_truncated = s.truncated;
+                self.strings_scanned = s.scanned;
+                self.strings = s.hits;
+                // Validating a large archive is slow — 25s for a 382MB shard —
+                // so it runs on a thread and the structural view opens at once.
+                // The Records view appears when the decode lands.
+                if r.bytes.len() > DECODE_INLINE_MAX {
+                    self.decoding = Some(spawn_decode(r.bytes.clone()));
+                    self.rkyv_view = RkyvView::Info;
+                    self.status = format!(
+                        "decoding {} in the background · 1 Info · 2 Strings · 3 Hex · o/Esc files · q quit",
+                        human_size(r.bytes.len() as u64)
+                    );
+                    return;
+                }
                 self.decoded = formats::try_decode(&r.bytes);
                 if let Some(d) = &self.decoded {
                     self.rkyv_view = RkyvView::Records;
                     self.status = format!(
-                        "{} · {} records · Enter detail · a add e hex-edit r rename d delete · / search · 0/1/2/3 views · c scheme · o files · h help · q quit",
+                        "{} · {} records · Enter detail · a add e hex-edit r rename d delete · / filter · 0/1/2/3 views · c scheme · o/Esc files · h help · q quit",
                         d.format,
                         d.records.len()
                     );
                 } else {
-                    self.status = "1 Info · 2 Strings · 3 Hex · j/k scroll · / search (n/N) · c scheme · o files · h help · q quit  (rkyv: unrecognized)".into();
+                    self.status = "1 Info · 2 Strings · 3 Hex · j/k scroll · / filter · c scheme · o/Esc files · h help · q quit  (rkyv: unrecognized)".into();
                 }
             }
         }
@@ -276,6 +333,7 @@ impl App {
 
     pub fn run(&mut self, terminal: &mut DefaultTerminal) -> Result<Outcome> {
         while !self.quit {
+            self.poll_decode();
             terminal.draw(|f| self.render(f))?;
             if !event::poll(TICK)? {
                 self.ov.expire_toast();
@@ -354,8 +412,7 @@ impl App {
         // `o` goes back to the file picker from any screen but the hex editor,
         // where it inserts a byte.
         if code == KeyCode::Char('o') && self.screen != Screen::HexEdit {
-            self.reopen = true;
-            self.quit = true;
+            self.back_to_files();
             return;
         }
 
@@ -474,8 +531,12 @@ impl App {
             }
             KeyCode::Char('g') => self.detail_scroll = 0,
             KeyCode::Char('G') => self.detail_scroll = max_scroll,
-            KeyCode::PageDown => self.detail_scroll = (self.detail_scroll + 16).min(max_scroll),
-            KeyCode::PageUp => self.detail_scroll = self.detail_scroll.saturating_sub(16),
+            KeyCode::PageDown => {
+                self.detail_scroll = (self.detail_scroll + self.page_step()).min(max_scroll)
+            }
+            KeyCode::PageUp => {
+                self.detail_scroll = self.detail_scroll.saturating_sub(self.page_step())
+            }
             _ => {}
         }
     }
@@ -492,8 +553,10 @@ impl App {
                 self.schema_scroll = self.schema_scroll.saturating_sub(1)
             }
             KeyCode::Char('g') => self.schema_scroll = 0,
-            KeyCode::PageDown => self.schema_scroll += 16,
-            KeyCode::PageUp => self.schema_scroll = self.schema_scroll.saturating_sub(16),
+            KeyCode::PageDown => self.schema_scroll += self.page_step(),
+            KeyCode::PageUp => {
+                self.schema_scroll = self.schema_scroll.saturating_sub(self.page_step())
+            }
             _ => {}
         }
     }
@@ -575,11 +638,13 @@ impl App {
             None => return,
         };
         let total = self.rows.as_ref().map(|r| r.total).unwrap_or(0);
-        let view = match self
-            .sqlite()
-            .unwrap()
-            .rows(&table, total.max(1), 0, self.sort.as_ref())
-        {
+        let view = match self.sqlite().unwrap().rows(
+            &table,
+            total.max(1),
+            0,
+            self.sort.as_ref(),
+            &self.filter,
+        ) {
             Ok(v) => v,
             Err(e) => {
                 self.notify(format!("export failed: {}", e));
@@ -635,8 +700,8 @@ impl App {
         // Ctrl-f / Ctrl-b page forward / back (vim page motions).
         if ctrl {
             match code {
-                KeyCode::Char('f') => self.page(PAGE),
-                KeyCode::Char('b') => self.page(-PAGE),
+                KeyCode::Char('f') => self.page_sqlite(true),
+                KeyCode::Char('b') => self.page_sqlite(false),
                 _ => {}
             }
             return;
@@ -660,7 +725,10 @@ impl App {
             KeyCode::Char('/') => self.open_modal(Mode::Search(String::new())),
             KeyCode::Char('n') => self.search_next(true),
             KeyCode::Char('N') => self.search_next(false),
-            KeyCode::Char('q') | KeyCode::Esc => self.quit = true,
+            KeyCode::Char('q') => self.quit = true,
+            // First level: Esc backs out to the file list, as it does from any
+            // nested screen; `q` is the one that quits.
+            KeyCode::Esc => self.back_to_files(),
             KeyCode::Tab => {
                 self.focus = if self.focus == Focus::Left {
                     Focus::Right
@@ -669,11 +737,21 @@ impl App {
                 };
             }
             KeyCode::Up | KeyCode::Char('k') => match self.focus {
-                Focus::Left => self.select_table(self.table_idx.wrapping_sub(1)),
+                Focus::Left => {
+                    let visible = self.visible_tables();
+                    if let Some(i) = Self::step_visible(&visible, self.table_idx, -1) {
+                        self.select_table(i);
+                    }
+                }
                 Focus::Right => self.row_idx = self.row_idx.saturating_sub(1),
             },
             KeyCode::Down | KeyCode::Char('j') => match self.focus {
-                Focus::Left => self.select_table(self.table_idx + 1),
+                Focus::Left => {
+                    let visible = self.visible_tables();
+                    if let Some(i) = Self::step_visible(&visible, self.table_idx, 1) {
+                        self.select_table(i);
+                    }
+                }
                 Focus::Right => {
                     if let Some(r) = &self.rows {
                         if self.row_idx + 1 < r.rows.len() {
@@ -702,8 +780,8 @@ impl App {
                 Focus::Left => self.focus = Focus::Right,
                 Focus::Right => self.enter_detail(),
             },
-            KeyCode::PageDown => self.page(PAGE),
-            KeyCode::PageUp => self.page(-PAGE),
+            KeyCode::PageDown => self.page_sqlite(true),
+            KeyCode::PageUp => self.page_sqlite(false),
             KeyCode::Char('e') => self.begin_edit_cell(),
             KeyCode::Char('a') => self.insert_row(),
             KeyCode::Char('d') => {
@@ -774,46 +852,24 @@ impl App {
             KeyCode::Char('/') => self.open_modal(Mode::Search(String::new())),
             KeyCode::Char('n') => self.search_next(true),
             KeyCode::Char('N') => self.search_next(false),
-            KeyCode::Char('q') | KeyCode::Esc => self.quit = true,
+            KeyCode::Char('q') => self.quit = true,
+            // First level: Esc backs out to the file list, as it does from any
+            // nested screen; `q` is the one that quits.
+            KeyCode::Esc => self.back_to_files(),
             KeyCode::Char('0') => {
                 if self.decoded.is_some() {
                     self.rkyv_view = RkyvView::Records;
+                } else if self.decoding.is_some() {
+                    self.notify("still decoding — Records will open when it lands");
                 }
             }
             KeyCode::Char('1') => self.rkyv_view = RkyvView::Info,
             KeyCode::Char('2') => self.rkyv_view = RkyvView::Strings,
             KeyCode::Char('3') => self.rkyv_view = RkyvView::Hex,
-            KeyCode::Up | KeyCode::Char('k') => match self.rkyv_view {
-                RkyvView::Records => self.record_idx = self.record_idx.saturating_sub(1),
-                RkyvView::Strings => self.string_idx = self.string_idx.saturating_sub(1),
-                RkyvView::Hex => self.hex_row = self.hex_row.saturating_sub(1),
-                RkyvView::Info => {}
-            },
-            KeyCode::Down | KeyCode::Char('j') => match self.rkyv_view {
-                RkyvView::Records => {
-                    let n = self.decoded.as_ref().map(|d| d.records.len()).unwrap_or(0);
-                    if self.record_idx + 1 < n {
-                        self.record_idx += 1;
-                    }
-                }
-                RkyvView::Strings => {
-                    if self.string_idx + 1 < self.strings.len() {
-                        self.string_idx += 1;
-                    }
-                }
-                RkyvView::Hex => self.hex_row += 1,
-                RkyvView::Info => {}
-            },
-            KeyCode::PageDown => {
-                if self.rkyv_view == RkyvView::Hex {
-                    self.hex_row += 16;
-                }
-            }
-            KeyCode::PageUp => {
-                if self.rkyv_view == RkyvView::Hex {
-                    self.hex_row = self.hex_row.saturating_sub(16);
-                }
-            }
+            KeyCode::Up | KeyCode::Char('k') => self.move_rkyv(-1),
+            KeyCode::Down | KeyCode::Char('j') => self.move_rkyv(1),
+            KeyCode::PageDown => self.page_rkyv(true),
+            KeyCode::PageUp => self.page_rkyv(false),
             KeyCode::Enter => {
                 if self.rkyv_view == RkyvView::Records {
                     self.enter_detail();
@@ -876,10 +932,20 @@ impl App {
         match key.code {
             KeyCode::Esc => {
                 self.mode = Mode::Normal;
+                // A cancelled `/` drops the filter and puts the cursor back.
+                if let Some(o) = self.search_origin.take() {
+                    self.set_filter(String::new());
+                    self.restore_position(o);
+                    self.status.clear();
+                }
                 return;
             }
             KeyCode::Enter => {
                 self.mode = Mode::Normal;
+                // Enter keeps the filter the typing already applied.
+                if self.search_origin.take().is_some() {
+                    return;
+                }
                 commit(self, &buf);
                 return;
             }
@@ -918,10 +984,159 @@ impl App {
         }
         self.input_cursor = cur;
         self.mode = mk(buf);
+        // A `/` prompt filters the list as it is typed.
+        if let Mode::Search(pattern) = &self.mode {
+            let pattern = pattern.clone();
+            self.filter_preview(&pattern);
+        }
+    }
+
+    fn snapshot_position(&self) -> SearchOrigin {
+        SearchOrigin {
+            table_idx: self.table_idx,
+            page_offset: self.page_offset,
+            row_idx: self.row_idx,
+            record_idx: self.record_idx,
+            string_idx: self.string_idx,
+            hex_row: self.hex_row,
+        }
+    }
+
+    fn restore_position(&mut self, o: SearchOrigin) {
+        self.table_idx = o.table_idx;
+        self.record_idx = o.record_idx;
+        self.string_idx = o.string_idx;
+        self.hex_row = o.hex_row;
+        self.row_idx = o.row_idx;
+        // Only reload when the page actually moved: a query per keystroke would
+        // make typing feel heavy on a large table.
+        if self.page_offset != o.page_offset {
+            self.page_offset = o.page_offset;
+            self.load_table();
+            self.row_idx = o.row_idx;
+        }
+    }
+
+    /// Apply `pattern` as the list filter, on every keystroke. Only matching
+    /// rows/records/strings stay listed — the same model as iftoprs's `/`, rather
+    /// than hopping between matches.
+    ///
+    /// For SQLite the filter is a `WHERE` over every column, so it covers the
+    /// whole table and not just the loaded page.
+    fn filter_preview(&mut self, pattern: &str) {
+        self.set_filter(pattern.to_string());
+    }
+
+    /// Set the active filter and rebuild whatever the current view lists.
+    fn set_filter(&mut self, pattern: String) {
+        if self.filter == pattern {
+            return;
+        }
+        self.filter = pattern;
+        match &self.store {
+            Store::Sqlite(_) => {
+                // With the table list focused, follow the filter onto a listed
+                // table; otherwise the grid keeps showing a hidden one.
+                if self.focus == Focus::Left {
+                    let visible = self.visible_tables();
+                    if !visible.contains(&self.table_idx) {
+                        if let Some(&first) = visible.first() {
+                            self.table_idx = first;
+                        }
+                    }
+                }
+                // The row grid is filtered in SQL, so the page restarts.
+                self.page_offset = 0;
+                self.row_idx = 0;
+                self.load_table();
+            }
+            Store::Rkyv(_) => {
+                // Keep the selection on a listed row.
+                self.record_idx = self.first_visible_record().unwrap_or(0);
+                self.string_idx = self.first_visible_string().unwrap_or(0);
+            }
+        }
+        self.status = if self.filter.is_empty() {
+            String::new()
+        } else {
+            let n = self.visible_count();
+            format!(
+                "/{}  ({} match{})",
+                self.filter,
+                n,
+                if n == 1 { "" } else { "es" }
+            )
+        };
+    }
+
+    /// Does `hay` pass the active filter? An empty filter passes everything.
+    fn passes(&self, hay: &str) -> bool {
+        self.filter.is_empty() || hay.to_lowercase().contains(&self.filter.to_lowercase())
+    }
+
+    /// Indices of the records the filter leaves listed.
+    fn visible_records(&self) -> Vec<usize> {
+        match &self.decoded {
+            Some(d) => d
+                .records
+                .iter()
+                .enumerate()
+                .filter(|(_, r)| self.passes(&r.key))
+                .map(|(i, _)| i)
+                .collect(),
+            None => Vec::new(),
+        }
+    }
+
+    /// Indices of the extracted strings the filter leaves listed.
+    fn visible_strings(&self) -> Vec<usize> {
+        self.strings
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| self.passes(&s.text))
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    /// Table names the filter leaves listed (the left pane).
+    fn visible_tables(&self) -> Vec<usize> {
+        let tables = self.sqlite().map(|s| s.tables.clone()).unwrap_or_default();
+        tables
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| self.passes(t))
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    fn first_visible_record(&self) -> Option<usize> {
+        self.visible_records().first().copied()
+    }
+
+    fn first_visible_string(&self) -> Option<usize> {
+        self.visible_strings().first().copied()
+    }
+
+    /// How many rows the current view lists under the filter, for the status line.
+    fn visible_count(&self) -> usize {
+        match &self.store {
+            Store::Sqlite(_) => match self.focus {
+                Focus::Left => self.visible_tables().len(),
+                Focus::Right => self.rows.as_ref().map(|r| r.total as usize).unwrap_or(0),
+            },
+            Store::Rkyv(_) => match self.rkyv_view {
+                RkyvView::Records => self.visible_records().len(),
+                RkyvView::Strings => self.visible_strings().len(),
+                _ => 0,
+            },
+        }
     }
 
     /// Open a text-input modal, placing the cursor at the end of its buffer.
     fn open_modal(&mut self, mode: Mode) {
+        if matches!(mode, Mode::Search(_)) {
+            self.search_origin = Some(self.snapshot_position());
+        }
         self.input_cursor = match &mode {
             Mode::EditCell(s)
             | Mode::Command(s)
@@ -1114,7 +1329,9 @@ impl App {
             Store::Rkyv(r) => (r.strings(MIN_STRING), crate::formats::try_decode(&r.bytes)),
             _ => return,
         };
-        self.strings = strings;
+        self.strings_truncated = strings.truncated;
+        self.strings_scanned = strings.scanned;
+        self.strings = strings.hits;
         self.decoded = decoded;
         let n = self.decoded.as_ref().map(|d| d.records.len()).unwrap_or(0);
         if self.record_idx >= n {
@@ -1228,7 +1445,7 @@ impl App {
     fn load_table(&mut self) {
         let (table, res) = match (self.current_table(), self.sqlite()) {
             (Some(t), Some(s)) => {
-                let r = s.rows(&t, PAGE, self.page_offset, self.sort.as_ref());
+                let r = s.rows(&t, PAGE, self.page_offset, self.sort.as_ref(), &self.filter);
                 (t, r)
             }
             _ => return,
@@ -1242,6 +1459,125 @@ impl App {
             }
             Err(e) => self.status = format!("load {}: {}", table, e),
         }
+    }
+
+    /// Step `cur` by `delta` positions through `visible`, clamped to its ends.
+    /// Navigation has to walk the filtered list, or j/k would land on rows the
+    /// filter has hidden.
+    fn step_visible(visible: &[usize], cur: usize, delta: isize) -> Option<usize> {
+        if visible.is_empty() {
+            return None;
+        }
+        let pos = visible.iter().position(|&i| i == cur).unwrap_or(0) as isize;
+        let next = (pos + delta).clamp(0, visible.len() as isize - 1) as usize;
+        Some(visible[next])
+    }
+
+    /// Install a background decode's result once it arrives.
+    fn poll_decode(&mut self) {
+        let result = match self.decoding.as_ref() {
+            Some(rx) => match rx.try_recv() {
+                Ok(d) => d,
+                Err(std::sync::mpsc::TryRecvError::Empty) => return,
+                // The thread died without sending: treat it as undecodable.
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => None,
+            },
+            None => return,
+        };
+        self.decoding = None;
+        self.decoded = result;
+        match &self.decoded {
+            Some(d) => {
+                let (format, records) = (d.format.clone(), d.records.len());
+                self.rkyv_view = RkyvView::Records;
+                self.notify(format!("{} · {} records", format, records));
+            }
+            None => self.notify("unrecognized archive — structural view"),
+        }
+    }
+
+    /// A screenful, never zero.
+    fn page_step(&self) -> usize {
+        self.page_rows.max(1)
+    }
+
+    /// PageUp/PageDown (and `^F`/`^B`) for the SQLite panes: move the selection by
+    /// a screenful, stepping to the next/previous SQL page at the edges.
+    fn page_sqlite(&mut self, down: bool) {
+        let step = self.page_step();
+        match self.focus {
+            Focus::Left => {
+                let visible = self.visible_tables();
+                let delta = if down {
+                    step as isize
+                } else {
+                    -(step as isize)
+                };
+                if let Some(i) = Self::step_visible(&visible, self.table_idx, delta) {
+                    self.select_table(i);
+                }
+            }
+            Focus::Right => {
+                let (loaded, total) = match &self.rows {
+                    Some(r) => (r.rows.len(), r.total),
+                    None => return,
+                };
+                if loaded == 0 {
+                    return;
+                }
+                if down {
+                    if self.row_idx + step < loaded {
+                        self.row_idx += step;
+                    } else if self.page_offset + PAGE < total {
+                        self.page(PAGE);
+                    } else {
+                        self.row_idx = loaded - 1;
+                    }
+                } else if self.row_idx >= step {
+                    self.row_idx -= step;
+                } else if self.page_offset > 0 {
+                    self.page(-PAGE);
+                    // Land at the bottom of the page we just came back to.
+                    self.row_idx = self.rows.as_ref().map(|r| r.rows.len()).unwrap_or(1) - 1;
+                } else {
+                    self.row_idx = 0;
+                }
+            }
+        }
+    }
+
+    /// Move the rkyv selection by `delta` listed rows (the Hex view scrolls
+    /// instead, since bytes are not filtered).
+    fn move_rkyv(&mut self, delta: isize) {
+        match self.rkyv_view {
+            RkyvView::Records => {
+                let visible = self.visible_records();
+                if let Some(i) = Self::step_visible(&visible, self.record_idx, delta) {
+                    self.record_idx = i;
+                }
+            }
+            RkyvView::Strings => {
+                let visible = self.visible_strings();
+                if let Some(i) = Self::step_visible(&visible, self.string_idx, delta) {
+                    self.string_idx = i;
+                }
+            }
+            RkyvView::Hex => {
+                let rows = match &self.store {
+                    Store::Rkyv(r) => r.len().div_ceil(16),
+                    _ => 0,
+                };
+                let next = (self.hex_row as isize + delta).max(0) as usize;
+                self.hex_row = next.min(rows.saturating_sub(1));
+            }
+            RkyvView::Info => {}
+        }
+    }
+
+    /// The same for the rkyv views, a screenful at a time.
+    fn page_rkyv(&mut self, down: bool) {
+        let step = self.page_step() as isize;
+        self.move_rkyv(if down { step } else { -step });
     }
 
     fn page(&mut self, delta: i64) {
@@ -1534,6 +1870,18 @@ impl App {
 
     fn render(&mut self, f: &mut Frame) {
         let outer = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(f.area());
+        // A screenful for paging: the body minus borders, and minus the header
+        // row of whichever screen has one. Recomputed every frame so a resize is
+        // picked up without any extra plumbing.
+        let body = outer[0].height as usize;
+        self.page_rows = match self.screen {
+            // The detail screen's value pane sits under a 9-row field list.
+            Screen::Detail => body.saturating_sub(11),
+            // The row grid has a header row on top of its borders.
+            Screen::Main if matches!(self.store, Store::Sqlite(_)) => body.saturating_sub(3),
+            _ => body.saturating_sub(2),
+        }
+        .max(1);
 
         match self.screen {
             Screen::Detail => self.render_detail(f, outer[0]),
@@ -1689,21 +2037,45 @@ impl App {
         let (rect_left, rect_right) = (cols[0], cols[1]);
 
         let s = self.sqlite().unwrap();
-        // Left: table list.
-        let items: Vec<ListItem> = s.tables.iter().map(|t| ListItem::new(t.clone())).collect();
+        // Left: the tables the filter leaves listed.
+        let visible: Vec<usize> = s
+            .tables
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| filter_passes(&self.filter, t))
+            .map(|(i, _)| i)
+            .collect();
+        let items: Vec<ListItem> = visible
+            .iter()
+            .map(|&i| ListItem::new(s.tables[i].clone()))
+            .collect();
         let mut lstate = ListState::default();
-        lstate.select(Some(self.table_idx));
+        lstate.select(
+            visible
+                .iter()
+                .position(|&i| i == self.table_idx)
+                .or(Some(0)),
+        );
         let left_border = self.pane_style(Focus::Left);
         let list = List::new(items)
             .block(
                 Block::default()
                     .borders(Borders::ALL)
                     .border_style(left_border)
-                    .title(format!(
-                        " {} — tables ({}) ",
-                        s.path.file_name().and_then(|n| n.to_str()).unwrap_or("db"),
-                        s.tables.len()
-                    )),
+                    .title(if self.filter.is_empty() {
+                        format!(
+                            " {} — tables ({}) ",
+                            s.path.file_name().and_then(|n| n.to_str()).unwrap_or("db"),
+                            s.tables.len()
+                        )
+                    } else {
+                        format!(
+                            " tables {}/{}  /{} ",
+                            visible.len(),
+                            s.tables.len(),
+                            self.filter
+                        )
+                    }),
             )
             .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
         f.render_stateful_widget(list, cols[0], &mut lstate);
@@ -1818,20 +2190,42 @@ impl App {
             None => return,
         };
 
-        // Left: keys.
-        let items: Vec<ListItem> = d
+        // Left: keys the filter leaves listed.
+        let visible: Vec<usize> = d
             .records
             .iter()
-            .map(|rec| ListItem::new(truncate(&rec.key, 60)))
+            .enumerate()
+            .filter(|(_, r)| filter_passes(&self.filter, &r.key))
+            .map(|(i, _)| i)
+            .collect();
+        let items: Vec<ListItem> = visible
+            .iter()
+            .map(|&i| ListItem::new(truncate(&d.records[i].key, 60)))
             .collect();
         let mut st = ListState::default();
-        st.select(Some(self.record_idx.min(d.records.len().saturating_sub(1))));
+        st.select(
+            visible
+                .iter()
+                .position(|&i| i == self.record_idx)
+                .or(Some(0)),
+        );
+        let title = if self.filter.is_empty() {
+            format!(" {} — {} keys ", d.format, d.records.len())
+        } else {
+            format!(
+                " {} — {}/{} keys  /{} ",
+                d.format,
+                visible.len(),
+                d.records.len(),
+                self.filter
+            )
+        };
         let list = List::new(items)
             .block(
                 Block::default()
                     .borders(Borders::ALL)
                     .border_style(Style::default().fg(self.ov.theme.accent))
-                    .title(format!(" {} — {} keys ", d.format, d.records.len())),
+                    .title(title),
             )
             .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
         f.render_stateful_widget(list, cols[0], &mut st);
@@ -1884,11 +2278,21 @@ impl App {
             ]),
             Line::from(vec![
                 Span::styled("strings: ", Style::default().fg(self.ov.theme.dim)),
-                Span::raw(format!(
-                    "{} runs (>= {} printable bytes)",
-                    self.strings.len(),
-                    MIN_STRING
-                )),
+                Span::raw(if self.strings_truncated {
+                    // Say so rather than implying the list is everything.
+                    format!(
+                        "{} runs (>= {} printable bytes) — capped, scanned first {}",
+                        self.strings.len(),
+                        MIN_STRING,
+                        human_size(self.strings_scanned as u64)
+                    )
+                } else {
+                    format!(
+                        "{} runs (>= {} printable bytes)",
+                        self.strings.len(),
+                        MIN_STRING
+                    )
+                }),
             ]),
         ];
 
@@ -1948,10 +2352,11 @@ impl App {
     }
 
     fn render_rkyv_strings(&self, f: &mut Frame, area: Rect) {
-        let items: Vec<ListItem> = self
-            .strings
+        let visible = self.visible_strings();
+        let items: Vec<ListItem> = visible
             .iter()
-            .map(|h| {
+            .map(|&i| {
+                let h = &self.strings[i];
                 ListItem::new(Line::from(vec![
                     Span::styled(
                         format!("{:08x}  ", h.offset),
@@ -1962,15 +2367,26 @@ impl App {
             })
             .collect();
         let mut st = ListState::default();
-        st.select(Some(
-            self.string_idx.min(self.strings.len().saturating_sub(1)),
-        ));
-        let list = List::new(items)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(format!(" Strings ({}) ", self.strings.len())),
+        st.select(
+            visible
+                .iter()
+                .position(|&i| i == self.string_idx)
+                .or(Some(0)),
+        );
+        let capped = if self.strings_truncated { "+" } else { "" };
+        let title = if self.filter.is_empty() {
+            format!(" Strings ({}{}) ", self.strings.len(), capped)
+        } else {
+            format!(
+                " Strings ({}/{}{})  /{} ",
+                visible.len(),
+                self.strings.len(),
+                capped,
+                self.filter
             )
+        };
+        let list = List::new(items)
+            .block(Block::default().borders(Borders::ALL).title(title))
             .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
         f.render_stateful_widget(list, area, &mut st);
     }
@@ -2147,6 +2563,10 @@ pub fn pick_mru(terminal: &mut DefaultTerminal, mut p: Picker<'_>) -> Result<Opt
     let mut pending_g = false;
     let mut search = String::new();
     let mut searching = false;
+    // Where `/` was pressed, so the incremental match is measured from there.
+    let mut search_origin = 0usize;
+    // First row the list drew last frame, for mapping a click to an entry.
+    let mut list_offset = 0usize;
     // Recent files first, then whatever the scan turns up.
     let mut choices: Vec<Choice> = entries.iter().map(Choice::from_entry).collect();
     merge_hits(&mut choices, scanned.clone());
@@ -2185,8 +2605,14 @@ pub fn pick_mru(terminal: &mut DefaultTerminal, mut p: Picker<'_>) -> Result<Opt
             }
             None => None,
         };
+        // List height for paging: the body minus its borders.
+        let page = terminal
+            .size()
+            .map(|s| s.height.saturating_sub(3) as usize)
+            .unwrap_or(10)
+            .max(1);
         terminal.draw(|f| {
-            render_picker(f, &choices, idx, query, scanning, cache_age, &ov.theme);
+            list_offset = render_picker(f, &choices, idx, query, scanning, cache_age, &ov.theme);
             ov.render(f, HelpCtx::Picker);
         })?;
         if !event::poll(TICK)? {
@@ -2208,9 +2634,16 @@ pub fn pick_mru(terminal: &mut DefaultTerminal, mut p: Picker<'_>) -> Result<Opt
                 }
                 MouseEventKind::ScrollUp => idx = idx.saturating_sub(1),
                 MouseEventKind::Down(_) => {
-                    // The list starts one row below the block's top border.
-                    let clicked = (m.row as usize).saturating_sub(1);
-                    if clicked < choices.len() {
+                    // The list starts one row below the block's top border, and
+                    // is scrolled by `offset` — without that a click in a
+                    // scrolled list opened the wrong file. Rows below the last
+                    // entry (and the status line) select nothing.
+                    let row = (m.row as usize).saturating_sub(1);
+                    let clicked = row + list_offset;
+                    if row < page && clicked < choices.len() {
+                        if let Some(sc) = &scan {
+                            sc.cancel();
+                        }
                         return Ok(Some(choices[clicked].path.clone()));
                     }
                 }
@@ -2222,25 +2655,38 @@ pub fn pick_mru(terminal: &mut DefaultTerminal, mut p: Picker<'_>) -> Result<Opt
             if key.kind != KeyEventKind::Press {
                 continue;
             }
+            // Ctrl-f / Ctrl-b page like the app's grids do.
+            if key.modifiers.contains(KeyModifiers::CONTROL) {
+                match key.code {
+                    KeyCode::Char('f') => idx = (idx + page).min(choices.len().saturating_sub(1)),
+                    KeyCode::Char('b') => idx = idx.saturating_sub(page),
+                    _ => {}
+                }
+                continue;
+            }
 
-            // Search-input capture takes priority.
+            // Search-input capture takes priority. The selection follows the
+            // pattern as it is typed, from where `/` was pressed.
             if searching {
                 match key.code {
                     KeyCode::Esc => {
                         searching = false;
                         search.clear();
+                        idx = search_origin;
                     }
-                    KeyCode::Enter => {
-                        searching = false;
-                        if let Some(i) = picker_find(&choices, idx, true, &search) {
-                            idx = i;
-                        }
-                    }
+                    KeyCode::Enter => searching = false,
                     KeyCode::Backspace => {
                         search.pop();
                     }
                     KeyCode::Char(c) => search.push(c),
                     _ => {}
+                }
+                if searching {
+                    idx = if search.is_empty() {
+                        search_origin
+                    } else {
+                        picker_find_from(&choices, search_origin, &search).unwrap_or(search_origin)
+                    };
                 }
                 continue;
             }
@@ -2270,6 +2716,7 @@ pub fn pick_mru(terminal: &mut DefaultTerminal, mut p: Picker<'_>) -> Result<Opt
                 KeyCode::Char('/') => {
                     searching = true;
                     search.clear();
+                    search_origin = idx;
                 }
                 KeyCode::Char('n') => {
                     if let Some(i) = picker_find(&choices, idx, true, &search) {
@@ -2298,6 +2745,11 @@ pub fn pick_mru(terminal: &mut DefaultTerminal, mut p: Picker<'_>) -> Result<Opt
                     ov.toast("rescanning");
                 }
                 KeyCode::Char('G') => idx = choices.len().saturating_sub(1),
+                // A screenful, from the height this frame was drawn at.
+                KeyCode::PageDown => {
+                    idx = (idx + page).min(choices.len().saturating_sub(1));
+                }
+                KeyCode::PageUp => idx = idx.saturating_sub(page),
                 KeyCode::Up | KeyCode::Char('k') => idx = idx.saturating_sub(1),
                 KeyCode::Down | KeyCode::Char('j') => {
                     if idx + 1 < choices.len() {
@@ -2317,6 +2769,22 @@ pub fn pick_mru(terminal: &mut DefaultTerminal, mut p: Picker<'_>) -> Result<Opt
             }
         }
     }
+}
+
+/// First row at or after `from` whose path contains `q`, for the incremental
+/// search while typing.
+fn picker_find_from(choices: &[Choice], from: usize, q: &str) -> Option<usize> {
+    if q.is_empty() {
+        return None;
+    }
+    let ql = q.to_lowercase();
+    find_from(choices.len(), from, |i| {
+        choices[i]
+            .path
+            .to_str()
+            .map(|p| p.to_lowercase().contains(&ql))
+            .unwrap_or(false)
+    })
 }
 
 /// Find the next/previous picker row whose path contains `q` (the whole path, so
@@ -2344,8 +2812,9 @@ fn render_picker(
     scanning: Option<usize>,
     cache_age: Option<std::time::Duration>,
     t: &Theme,
-) {
+) -> usize {
     let outer = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(f.area());
+    let mut offset = 0usize;
 
     if choices.is_empty() {
         let body = match scanning {
@@ -2430,6 +2899,7 @@ fn render_picker(
             )
             .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
         f.render_stateful_widget(list, outer[0], &mut st);
+        offset = st.offset();
     }
 
     // Bottom line: the search prompt, else the selected row's format / size.
@@ -2446,13 +2916,44 @@ fn render_picker(
             // Kept short so the selected row's format still fits beside it on a
             // narrow terminal; `h` lists the rest.
             Paragraph::new(format!(
-                "j/k move · / search · Enter open · c scheme · h help · q quit{}",
+                "j/k move · / filter · Enter open · c scheme · h help · q quit{}",
                 detail
             ))
             .style(Style::default().fg(Color::Black).bg(t.help_key))
         }
     };
     f.render_widget(help, outer[1]);
+    offset
+}
+
+/// Archives up to this size are decoded inline; bigger ones go to a thread.
+/// 12MB takes ~0.8s to validate, 382MB takes ~25s, so the line sits below the
+/// point where a person would notice the wait.
+const DECODE_INLINE_MAX: usize = 4 * 1024 * 1024;
+
+/// Validate and decode `bytes` on another thread.
+fn spawn_decode(bytes: Vec<u8>) -> std::sync::mpsc::Receiver<Option<Decoded>> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(formats::try_decode(&bytes));
+    });
+    rx
+}
+
+/// Whether `hay` passes `filter` (case-insensitive substring; empty passes all).
+fn filter_passes(filter: &str, hay: &str) -> bool {
+    filter.is_empty() || hay.to_lowercase().contains(&filter.to_lowercase())
+}
+
+/// First index at or after `from` (wrapping once) for which `pred` holds. Unlike
+/// [`find_next`], `from` itself counts — an incremental search must be able to
+/// stay where it is as the pattern grows.
+fn find_from(len: usize, from: usize, pred: impl Fn(usize) -> bool) -> Option<usize> {
+    if len == 0 {
+        return None;
+    }
+    let start = from.min(len - 1);
+    (0..len).map(|step| (start + step) % len).find(|&i| pred(i))
 }
 
 /// Find the next index (wrapping) from `from` for which `pred` holds, scanning
@@ -2745,6 +3246,29 @@ mod tests {
     fn rkyv_app() -> App {
         let path = scratch("bin");
         std::fs::write(&path, b"zdbview overlay render test payload").unwrap();
+        let store = Store::Rkyv(RkyvStore::open(&path).unwrap());
+        let _ = std::fs::remove_file(&path);
+        App::new(store, Some(ThemeName::NeonSprawl))
+    }
+
+    /// An App over a SQLite table with `n` rows, for paging tests.
+    fn sqlite_app_rows(n: usize) -> (App, std::path::PathBuf) {
+        let path = scratch("db");
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute("CREATE TABLE t (a TEXT, b TEXT)", []).unwrap();
+        for i in 0..n {
+            conn.execute("INSERT INTO t VALUES (?1, 'y')", [i.to_string()])
+                .unwrap();
+        }
+        drop(conn);
+        let store = Store::Sqlite(SqliteStore::open(&path).unwrap());
+        (App::new(store, Some(ThemeName::NeonSprawl)), path)
+    }
+
+    /// An App over arbitrary binary content.
+    fn rkyv_app_with(bytes: &[u8]) -> App {
+        let path = scratch("bin");
+        std::fs::write(&path, bytes).unwrap();
         let store = Store::Rkyv(RkyvStore::open(&path).unwrap());
         let _ = std::fs::remove_file(&path);
         App::new(store, Some(ThemeName::NeonSprawl))
@@ -3056,8 +3580,10 @@ mod tests {
         );
         let render = |choices: &[super::Choice], scanning: Option<usize>| -> Vec<String> {
             let mut term = Terminal::new(TestBackend::new(100, 8)).unwrap();
-            term.draw(|f| super::render_picker(f, choices, 0, None, scanning, None, &theme))
-                .unwrap();
+            term.draw(|f| {
+                super::render_picker(f, choices, 0, None, scanning, None, &theme);
+            })
+            .unwrap();
             let buf = term.backend().buffer().clone();
             (0..buf.area().height)
                 .map(|y| {
@@ -3094,6 +3620,362 @@ mod tests {
         assert!(contains(&rows, "Scanning for databases"));
     }
 
+    /// `/` filters the list as the pattern is typed — the iftoprs model — instead
+    /// of hopping between matches.
+    #[test]
+    fn slash_filters_the_records_list_while_typing() {
+        let path = scratch("rkyv");
+        let recs: Vec<(String, Vec<u8>)> = ["alpha", "bravo", "charlie", "delta"]
+            .iter()
+            .map(|n| (format!("/tmp/{n}.sh"), vec![b'x']))
+            .collect();
+        std::fs::write(&path, crate::formats::test_script_shard_bytes_many(&recs)).unwrap();
+        let store = Store::Rkyv(RkyvStore::open(&path).unwrap());
+        let mut app = App::new(store, Some(ThemeName::NeonSprawl));
+        assert_eq!(app.visible_records().len(), 4);
+
+        press(&mut app, '/');
+        press(&mut app, 'a');
+        // Only keys containing "a" stay listed: alpha, bravo, charlie, delta all
+        // do, so narrow further.
+        press(&mut app, 'l');
+        let listed: Vec<String> = app
+            .visible_records()
+            .iter()
+            .map(|&i| app.decoded.as_ref().unwrap().records[i].key.clone())
+            .collect();
+        assert_eq!(listed.len(), 1, "got {listed:?}");
+        assert!(listed[0].contains("alpha"));
+        assert!(app.status.contains("1 match"), "got {:?}", app.status);
+        // The selection sits on a listed row.
+        assert!(app.visible_records().contains(&app.record_idx));
+
+        // The rendered list shows only the match.
+        let rows = frame_rows(&mut app, 100, 16);
+        assert!(contains(&rows, "alpha"));
+        assert!(!contains(&rows, "bravo"), "filtered-out key still drawn");
+        assert!(contains(&rows, "1/4 keys"), "count missing from the title");
+
+        // Backspacing widens the filter again.
+        app.on_key(KeyEvent::from(KeyCode::Backspace));
+        assert_eq!(app.visible_records().len(), 4, "'a' matches every key");
+
+        // A pattern matching nothing empties the list and says so.
+        for c in "zzz".chars() {
+            press(&mut app, c);
+        }
+        assert!(app.visible_records().is_empty());
+        assert!(app.status.contains("0 matches"), "got {:?}", app.status);
+
+        // Esc drops the filter and restores the position.
+        app.on_key(KeyEvent::from(KeyCode::Esc));
+        assert!(app.filter.is_empty(), "Esc must clear the filter");
+        assert_eq!(app.visible_records().len(), 4);
+        assert_eq!(app.record_idx, 0);
+
+        // Enter keeps it applied.
+        press(&mut app, '/');
+        for c in "brav".chars() {
+            press(&mut app, c);
+        }
+        app.on_key(KeyEvent::from(KeyCode::Enter));
+        assert_eq!(app.filter, "brav", "Enter keeps the filter");
+        assert_eq!(app.visible_records().len(), 1);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Navigation stays inside the filtered list.
+    #[test]
+    fn navigation_skips_filtered_out_rows() {
+        let path = scratch("rkyv");
+        let recs: Vec<(String, Vec<u8>)> = ["a_one", "b_skip", "a_two", "c_skip", "a_three"]
+            .iter()
+            .map(|n| (format!("/tmp/{n}.sh"), vec![b'x']))
+            .collect();
+        std::fs::write(&path, crate::formats::test_script_shard_bytes_many(&recs)).unwrap();
+        let store = Store::Rkyv(RkyvStore::open(&path).unwrap());
+        let mut app = App::new(store, Some(ThemeName::NeonSprawl));
+        press(&mut app, '/');
+        for c in "a_".chars() {
+            press(&mut app, c);
+        }
+        app.on_key(KeyEvent::from(KeyCode::Enter));
+        let visible = app.visible_records();
+        assert_eq!(visible.len(), 3, "three keys start with a_");
+        app.record_idx = visible[0];
+        for expected in &visible[1..] {
+            press(&mut app, 'j');
+            assert_eq!(
+                app.record_idx, *expected,
+                "j must land on the next listed row"
+            );
+        }
+        // At the end it stays put rather than falling onto a hidden row.
+        press(&mut app, 'j');
+        assert_eq!(app.record_idx, *visible.last().unwrap());
+        press(&mut app, 'k');
+        assert_eq!(app.record_idx, visible[1]);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The Strings view filters the same way.
+    #[test]
+    fn slash_filters_the_strings_view() {
+        let mut app = rkyv_app_with(b"\x00\x00alpha\x00\x00bravo\x00\x00charlie\x00\x00");
+        app.on_key(KeyEvent::from(KeyCode::Char('2')));
+        let all = app.visible_strings().len();
+        assert!(all >= 3, "{:?}", app.strings);
+        press(&mut app, '/');
+        for c in "brav".chars() {
+            press(&mut app, c);
+        }
+        let listed = app.visible_strings();
+        assert_eq!(listed.len(), 1);
+        assert!(app.strings[listed[0]].text.contains("bravo"));
+        let rows = frame_rows(&mut app, 100, 16);
+        assert!(contains(&rows, "bravo") && !contains(&rows, "alpha"));
+        app.on_key(KeyEvent::from(KeyCode::Esc));
+        assert_eq!(app.visible_strings().len(), all);
+    }
+
+    /// SQLite rows are filtered in SQL, so the whole table is covered and the
+    /// totals follow the filter rather than the page.
+    #[test]
+    fn slash_filters_sqlite_rows_across_the_whole_table() {
+        let (mut app, path) = sqlite_app_rows(60);
+        app.on_key(KeyEvent::from(KeyCode::Tab)); // focus the grid
+        assert_eq!(app.rows.as_ref().unwrap().total, 60);
+        press(&mut app, '/');
+        press(&mut app, '4');
+        let view = app.rows.as_ref().unwrap();
+        // Rows 4, 14, 24, 34, 40..49, 54 contain a '4'.
+        assert_eq!(view.total, 15, "total must count matches, not all rows");
+        assert!(
+            view.rows.iter().all(|r| r.iter().any(|c| c.contains('4'))),
+            "every listed row must match: {:?}",
+            view.rows
+        );
+        assert!(app.status.contains("15 matches"), "got {:?}", app.status);
+
+        // Esc restores the unfiltered grid.
+        app.on_key(KeyEvent::from(KeyCode::Esc));
+        assert_eq!(app.rows.as_ref().unwrap().total, 60);
+        assert!(app.filter.is_empty());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The table list filters too.
+    #[test]
+    fn slash_filters_the_table_list() {
+        let path = scratch("db");
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        for t in ["users", "user_roles", "orders"] {
+            conn.execute(&format!("CREATE TABLE {t} (x)"), []).unwrap();
+        }
+        drop(conn);
+        let store = Store::Sqlite(SqliteStore::open(&path).unwrap());
+        let mut app = App::new(store, Some(ThemeName::NeonSprawl));
+        assert_eq!(app.visible_tables().len(), 3);
+        press(&mut app, '/');
+        for c in "user".chars() {
+            press(&mut app, c);
+        }
+        assert_eq!(app.visible_tables().len(), 2);
+        let rows = frame_rows(&mut app, 100, 16);
+        assert!(contains(&rows, "users"));
+        assert!(
+            !contains(&rows, "orders"),
+            "a filtered-out table is still on screen: {rows:#?}"
+        );
+        assert!(
+            contains(&rows, "tables 2/3"),
+            "count missing: {:?}",
+            rows[0]
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn find_from_is_inclusive_and_wraps() {
+        let pred = |i: usize| i == 1 || i == 4;
+        assert_eq!(super::find_from(5, 1, pred), Some(1), "from itself counts");
+        assert_eq!(super::find_from(5, 2, pred), Some(4));
+        assert_eq!(super::find_from(5, 0, pred), Some(1));
+        assert_eq!(super::find_from(5, 4, pred), Some(4));
+        // Wraps past the end back to the first match.
+        assert_eq!(super::find_from(5, 3, |i| i == 0), Some(0));
+        assert_eq!(super::find_from(5, 9, pred), Some(4), "clamps a wild start");
+        assert_eq!(super::find_from(0, 0, pred), None);
+        assert_eq!(super::find_from(5, 0, |_| false), None);
+    }
+
+    /// PageUp/PageDown must move by what is on screen. They used to be bound to
+    /// the 500-row SQL window, which did nothing at all on a smaller table, and
+    /// were missing outright from the Records and Strings views.
+    #[test]
+    fn paging_moves_by_a_screenful() {
+        let (mut app, path) = sqlite_app_rows(120);
+        app.on_key(KeyEvent::from(KeyCode::Tab)); // focus the grid
+                                                  // A 24-row terminal keeps 23 rows for the body (one is the status bar),
+                                                  // of which the grid shows 20 (two borders and a header row).
+        frame_rows(&mut app, 80, 24);
+        assert_eq!(app.page_rows, 20);
+        app.on_key(KeyEvent::from(KeyCode::PageDown));
+        assert_eq!(app.row_idx, 20, "PageDown moves one screenful");
+        app.on_key(KeyEvent::from(KeyCode::PageDown));
+        assert_eq!(app.row_idx, 40);
+        app.on_key(KeyEvent::from(KeyCode::PageUp));
+        assert_eq!(app.row_idx, 20);
+        // Ctrl-f / Ctrl-b do the same.
+        app.on_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL));
+        assert_eq!(app.row_idx, 40);
+        app.on_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL));
+        assert_eq!(app.row_idx, 20);
+        // Paging down past the end stops on the last row, it does not wrap.
+        for _ in 0..20 {
+            app.on_key(KeyEvent::from(KeyCode::PageDown));
+        }
+        assert_eq!(app.row_idx, 119, "clamps to the last loaded row");
+        app.on_key(KeyEvent::from(KeyCode::PageUp));
+        assert_eq!(app.row_idx, 99);
+        // And up past the start stops at the top.
+        for _ in 0..20 {
+            app.on_key(KeyEvent::from(KeyCode::PageUp));
+        }
+        assert_eq!(app.row_idx, 0);
+        let _ = std::fs::remove_file(&path);
+
+        // A smaller terminal pages by less.
+        let (mut app, path) = sqlite_app_rows(120);
+        app.on_key(KeyEvent::from(KeyCode::Tab));
+        frame_rows(&mut app, 80, 12);
+        assert_eq!(app.page_rows, 8);
+        app.on_key(KeyEvent::from(KeyCode::PageDown));
+        assert_eq!(app.row_idx, 8);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The rkyv views scroll their own index, and paging must reach all of them.
+    #[test]
+    fn paging_works_in_every_rkyv_view() {
+        let mut app = rkyv_app_with(&vec![b'A'; 4096]);
+        frame_rows(&mut app, 80, 24);
+        let step = app.page_rows;
+        assert!(step > 1);
+
+        // Hex view: pages of rows, not a fixed 16 bytes.
+        app.on_key(KeyEvent::from(KeyCode::Char('3')));
+        app.on_key(KeyEvent::from(KeyCode::PageDown));
+        assert_eq!(app.hex_row, step);
+        app.on_key(KeyEvent::from(KeyCode::PageUp));
+        assert_eq!(app.hex_row, 0);
+
+        // Strings view: one long run of 'A's makes exactly one entry, so paging
+        // clamps rather than running away.
+        app.on_key(KeyEvent::from(KeyCode::Char('2')));
+        app.on_key(KeyEvent::from(KeyCode::PageDown));
+        assert_eq!(app.string_idx, app.strings.len().saturating_sub(1));
+        app.on_key(KeyEvent::from(KeyCode::PageUp));
+        assert_eq!(app.string_idx, 0);
+
+        // Info scrolls nothing, and must not panic.
+        app.on_key(KeyEvent::from(KeyCode::Char('1')));
+        app.on_key(KeyEvent::from(KeyCode::PageDown));
+    }
+
+    /// Records paging walks the record list.
+    #[test]
+    fn paging_walks_the_records_view() {
+        let path = scratch("rkyv");
+        // 40 records, so a page is bounded by the record count.
+        let mut keys: Vec<(String, Vec<u8>)> = Vec::new();
+        for i in 0..40 {
+            keys.push((format!("/tmp/s{i:02}.sh"), vec![b'x']));
+        }
+        std::fs::write(&path, crate::formats::test_script_shard_bytes_many(&keys)).unwrap();
+        let store = Store::Rkyv(RkyvStore::open(&path).unwrap());
+        let mut app = App::new(store, Some(ThemeName::NeonSprawl));
+        frame_rows(&mut app, 80, 14);
+        let step = app.page_rows;
+        assert_eq!(app.record_idx, 0);
+        app.on_key(KeyEvent::from(KeyCode::PageDown));
+        assert_eq!(app.record_idx, step);
+        app.on_key(KeyEvent::from(KeyCode::PageUp));
+        assert_eq!(app.record_idx, 0);
+        for _ in 0..20 {
+            app.on_key(KeyEvent::from(KeyCode::PageDown));
+        }
+        assert_eq!(app.record_idx, 39, "clamps to the last record");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The detail screen's value pane and the schema view page too.
+    #[test]
+    fn paging_scrolls_the_detail_and_schema_screens() {
+        let (mut app, path) = sqlite_app_rows(5);
+        app.on_key(KeyEvent::from(KeyCode::Tab));
+        app.on_key(KeyEvent::from(KeyCode::Enter)); // detail
+        assert_eq!(app.screen, super::Screen::Detail);
+        app.detail_value = vec![0u8; 16 * 400];
+        frame_rows(&mut app, 80, 30);
+        let step = app.page_rows;
+        assert!(step > 1);
+        app.on_key(KeyEvent::from(KeyCode::PageDown));
+        assert_eq!(app.detail_scroll, step);
+        app.on_key(KeyEvent::from(KeyCode::PageUp));
+        assert_eq!(app.detail_scroll, 0);
+        app.on_key(KeyEvent::from(KeyCode::Esc));
+
+        app.on_key(KeyEvent::from(KeyCode::Char('S'))); // schema
+        assert_eq!(app.screen, super::Screen::Schema);
+        frame_rows(&mut app, 80, 30);
+        let step = app.page_rows;
+        app.on_key(KeyEvent::from(KeyCode::PageDown));
+        assert_eq!(app.schema_scroll, step);
+        app.on_key(KeyEvent::from(KeyCode::PageUp));
+        assert_eq!(app.schema_scroll, 0);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Esc on the first level backs out to the file list; `q` is what quits. Esc
+    /// inside a nested screen still just leaves that screen.
+    #[test]
+    fn esc_on_the_first_level_returns_to_the_file_list() {
+        // rkyv main screen.
+        let mut app = rkyv_app();
+        app.on_key(KeyEvent::from(KeyCode::Esc));
+        assert!(app.reopen, "Esc must ask for the file list");
+        assert!(app.quit, "and end the app loop");
+
+        // `q` still quits outright.
+        let mut app = rkyv_app();
+        press(&mut app, 'q');
+        assert!(app.quit);
+        assert!(!app.reopen, "q must not reopen the picker");
+
+        // SQLite main screen behaves the same.
+        let (mut app, path) = sqlite_app();
+        app.on_key(KeyEvent::from(KeyCode::Esc));
+        assert!(app.reopen && app.quit);
+        let _ = std::fs::remove_file(&path);
+
+        // A nested screen keeps Esc for backing out of itself.
+        let (mut app, path) = script_shard_app();
+        app.on_key(KeyEvent::from(KeyCode::Enter)); // detail
+        assert_eq!(app.screen, super::Screen::Detail);
+        app.on_key(KeyEvent::from(KeyCode::Esc));
+        assert_eq!(app.screen, super::Screen::Main);
+        assert!(
+            !app.reopen,
+            "Esc in a nested screen must not leave the file"
+        );
+        assert!(!app.quit);
+        // From the main screen the next Esc does back out.
+        app.on_key(KeyEvent::from(KeyCode::Esc));
+        assert!(app.reopen && app.quit);
+        let _ = std::fs::remove_file(&path);
+    }
+
     /// `o` leaves the app loop asking for the picker again, rather than quitting.
     #[test]
     fn o_returns_to_the_file_picker() {
@@ -3125,8 +4007,10 @@ mod tests {
         );
         let render = |age: Option<std::time::Duration>| -> Vec<String> {
             let mut term = Terminal::new(TestBackend::new(100, 6)).unwrap();
-            term.draw(|f| super::render_picker(f, &choices, 0, None, None, age, &theme))
-                .unwrap();
+            term.draw(|f| {
+                super::render_picker(f, &choices, 0, None, None, age, &theme);
+            })
+            .unwrap();
             let buf = term.backend().buffer().clone();
             (0..buf.area().height)
                 .map(|y| {
@@ -3154,6 +4038,87 @@ mod tests {
         assert_eq!(super::age_label(Duration::from_secs(600)), "10m old");
         assert_eq!(super::age_label(Duration::from_secs(7200)), "2h old");
         assert_eq!(super::age_label(Duration::from_secs(3 * 86_400)), "3d old");
+    }
+
+    /// Opening a large archive must not block: the 382MB shard here took 25s to
+    /// validate, which read as a hang. It now opens on the structural view and
+    /// the decode lands later.
+    #[test]
+    fn a_large_archive_opens_without_blocking() {
+        // A buffer past the inline limit that is not a recognized shard, so the
+        // background decode returns None.
+        let big = vec![0x41u8; super::DECODE_INLINE_MAX + 1024];
+        let t0 = std::time::Instant::now();
+        let mut app = rkyv_app_with(&big);
+        let open = t0.elapsed();
+        assert!(
+            open < std::time::Duration::from_secs(2),
+            "opening took {open:?}"
+        );
+        assert!(
+            app.decoding.is_some(),
+            "decode must be running in the background"
+        );
+        assert!(app.decoded.is_none(), "and not have blocked for the result");
+        assert_eq!(app.rkyv_view, super::RkyvView::Info);
+        assert!(app.status.contains("decoding"), "got {:?}", app.status);
+
+        // Records is not reachable until it lands, and says so.
+        app.on_key(KeyEvent::from(KeyCode::Char('0')));
+        assert_eq!(app.rkyv_view, super::RkyvView::Info);
+        assert!(
+            app.status.contains("still decoding"),
+            "got {:?}",
+            app.status
+        );
+
+        // Wait for the thread, then install the result the way the loop does.
+        let rx = app.decoding.as_ref().unwrap();
+        let _ = rx.recv_timeout(std::time::Duration::from_secs(30));
+        app.poll_decode();
+        assert!(
+            app.decoding.is_none(),
+            "the receiver is dropped once it lands"
+        );
+        assert!(app.decoded.is_none(), "0x41 filler is not a shard");
+        assert!(app.status.contains("unrecognized"), "got {:?}", app.status);
+
+        // A small archive still decodes inline, so nothing changed for shards.
+        let (app, path) = script_shard_app();
+        assert!(app.decoding.is_none());
+        assert!(app.decoded.is_some(), "small shards decode on open");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// String extraction is bounded, so a huge archive cannot stall the open.
+    #[test]
+    fn string_extraction_is_bounded() {
+        // Alternating printable runs and NULs: one run per 8 bytes, far more runs
+        // than the cap allows.
+        let mut bytes = Vec::new();
+        while bytes.len() < 400_000 {
+            bytes.extend_from_slice(b"abcdefg\x00");
+        }
+        let path = scratch("bin");
+        std::fs::write(&path, &bytes).unwrap();
+        let store = RkyvStore::open(&path).unwrap();
+        let t0 = std::time::Instant::now();
+        let s = store.strings(4);
+        let took = t0.elapsed();
+        assert!(took < std::time::Duration::from_secs(1), "took {took:?}");
+        assert!(s.hits.len() <= 20_000, "cap ignored: {}", s.hits.len());
+        assert!(s.truncated, "truncation must be reported");
+        let _ = std::fs::remove_file(&path);
+
+        // A small file is complete, not flagged.
+        let path = scratch("bin");
+        std::fs::write(&path, b"hello\x00world\x00").unwrap();
+        let store = RkyvStore::open(&path).unwrap();
+        let s = store.strings(4);
+        assert_eq!(s.hits.len(), 2);
+        assert!(!s.truncated);
+        assert_eq!(s.scanned, 12);
+        let _ = std::fs::remove_file(&path);
     }
 
     /// Help lists the section for what is on screen.

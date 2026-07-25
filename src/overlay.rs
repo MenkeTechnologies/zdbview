@@ -71,6 +71,9 @@ pub struct Overlays {
     pub editor_palette: [u8; 6],
     pub editor_slot: usize,
     pub toast: Option<Toast>,
+    /// Rect of the overlay drawn last frame, so a click can tell inside from
+    /// outside. `render` is `&mut self` for exactly this.
+    last_box: Rect,
 }
 
 impl Overlays {
@@ -85,6 +88,7 @@ impl Overlays {
             editor_palette: [0; 6],
             editor_slot: 0,
             toast: None,
+            last_box: Rect::ZERO,
         }
     }
 
@@ -169,8 +173,18 @@ impl Overlays {
     }
 
     /// Mouse counterpart of [`Overlays::on_key`]: the wheel drives the chooser
-    /// and editor, a click confirms, and any click dismisses help.
+    /// and editor, a click inside confirms, and a click outside dismisses the
+    /// overlay without acting on it — clicking a row behind the chooser used to
+    /// select whatever scheme was previewed.
     pub fn on_mouse(&mut self, m: MouseEvent) -> bool {
+        if !self.active() {
+            return false;
+        }
+        let inside = self.hit(m.column, m.row);
+        if matches!(m.kind, MouseEventKind::Down(_)) && !inside {
+            self.dismiss();
+            return true;
+        }
         if self.help {
             if matches!(m.kind, MouseEventKind::Down(_)) {
                 self.help = false;
@@ -181,7 +195,14 @@ impl Overlays {
             match m.kind {
                 MouseEventKind::ScrollDown => self.chooser_key(KeyCode::Down),
                 MouseEventKind::ScrollUp => self.chooser_key(KeyCode::Up),
-                MouseEventKind::Down(MouseButton::Left) => self.chooser_key(KeyCode::Enter),
+                MouseEventKind::Down(MouseButton::Left) => {
+                    // Pick the row under the pointer, then confirm it.
+                    if let Some(i) = self.chooser_row_at(m.row) {
+                        self.chooser_idx = i;
+                        self.preview_chooser();
+                    }
+                    self.chooser_key(KeyCode::Enter);
+                }
                 _ => {}
             }
             return true;
@@ -195,6 +216,40 @@ impl Overlays {
             return true;
         }
         false
+    }
+
+    /// Is (`col`, `row`) inside the overlay drawn last frame?
+    fn hit(&self, col: u16, row: u16) -> bool {
+        let b = self.last_box;
+        col >= b.x && col < b.x + b.width && row >= b.y && row < b.y + b.height
+    }
+
+    /// Close the open overlay, restoring the scheme a chooser/editor was
+    /// previewing.
+    fn dismiss(&mut self) {
+        if self.chooser || self.editor {
+            self.theme = Theme::from_name(self.chooser_saved);
+        }
+        self.help = false;
+        self.chooser = false;
+        self.editor = false;
+    }
+
+    /// Scheme index under a click, from the chooser's layout (border, title,
+    /// blank, then one row per scheme).
+    fn chooser_row_at(&self, row: u16) -> Option<usize> {
+        let b = self.last_box;
+        let first_row = b.y + 3;
+        if row < first_row {
+            return None;
+        }
+        let rows = b.height.saturating_sub(6) as usize;
+        let first = self
+            .chooser_idx
+            .saturating_sub(rows.saturating_sub(1))
+            .min(ThemeName::ALL.len().saturating_sub(rows));
+        let idx = first + (row - first_row) as usize;
+        (idx < ThemeName::ALL.len() && (row as usize) < (first_row as usize + rows)).then_some(idx)
     }
 
     fn chooser_key(&mut self, code: KeyCode) {
@@ -279,15 +334,17 @@ impl Overlays {
     // ----- rendering --------------------------------------------------------
 
     /// Draw whichever overlay is up, then the toast on top.
-    pub fn render(&self, f: &mut Frame, ctx: HelpCtx) {
+    pub fn render(&mut self, f: &mut Frame, ctx: HelpCtx) {
+        // Each overlay reports the rect it drew, so a later click knows whether
+        // it landed inside.
         if self.help {
-            self.render_help(f, ctx);
+            self.last_box = self.render_help(f, ctx);
         }
         if self.chooser {
-            self.render_chooser(f);
+            self.last_box = self.render_chooser(f);
         }
         if self.editor {
-            self.render_editor(f);
+            self.last_box = self.render_editor(f);
         }
         if let Some(t) = &self.toast {
             if !t.expired() {
@@ -299,7 +356,7 @@ impl Overlays {
     /// The keyboard-shortcut overlay, ported from iftoprs's `draw_help`: a
     /// themed double-line box painted straight into the buffer, with the key
     /// sections laid out across three columns.
-    fn render_help(&self, f: &mut Frame, ctx: HelpCtx) {
+    fn render_help(&self, f: &mut Frame, ctx: HelpCtx) -> Rect {
         let t = &self.theme;
         let sections = help_sections(ctx);
 
@@ -387,6 +444,7 @@ impl Overlays {
             "press any key to close",
             hint,
         );
+        centered(area, bw, bh)
     }
 
     /// The scheme chooser, ported from iftoprs's `draw_theme_chooser`: each row
@@ -394,7 +452,7 @@ impl Overlays {
     /// and the highlighted row inverts onto the accent color. Unlike iftoprs
     /// (which clips at the box edge) the list scrolls, because the schemes do
     /// not all fit in a modal on a normal-height terminal.
-    fn render_chooser(&self, f: &mut Frame) {
+    fn render_chooser(&self, f: &mut Frame) -> Rect {
         let t = &self.theme;
         let area = f.area();
         let bw = 50u16.min(area.width);
@@ -459,12 +517,13 @@ impl Overlays {
             "j/k:nav  Enter:save  C:edit  Esc:cancel",
             Style::default().fg(t.dim).bg(bg),
         );
+        centered(area, bw, bh)
     }
 
     /// The palette editor, ported from iftoprs's `draw_theme_editor`: one row
     /// per color slot with its index, a swatch and an arrow sample, plus a
     /// full-palette preview bar.
-    fn render_editor(&self, f: &mut Frame) {
+    fn render_editor(&self, f: &mut Frame) -> Rect {
         let t = &self.theme;
         let p = self.editor_palette;
         let area = f.area();
@@ -547,6 +606,7 @@ impl Overlays {
             hint,
             bw.saturating_sub(4),
         );
+        centered(area, bw, bh)
     }
 
     /// The toast: a one-line pill centered inside the content pane, just above
@@ -674,7 +734,7 @@ struct HelpSection {
 const DISPLAY_KEYS: &[(&str, &str)] = &[
     ("c", "Scheme chooser"),
     ("C", "Palette editor"),
-    ("o", "Back to file list"),
+    ("o / Esc", "Back to file list"),
     ("h / ?", "Toggle help"),
     ("q", "Quit"),
 ];
@@ -728,6 +788,7 @@ fn help_sections(ctx: HelpCtx) -> Vec<HelpSection> {
                 title: "NAV",
                 keys: &[
                     ("j/k ↑↓", "Move"),
+                    ("PgUp/PgDn", "Page up / down"),
                     ("gg / G", "Top / bottom"),
                     ("Enter", "Open file"),
                     ("Esc / q", "Quit"),
@@ -735,7 +796,7 @@ fn help_sections(ctx: HelpCtx) -> Vec<HelpSection> {
             },
             HelpSection {
                 title: "SEARCH",
-                keys: &[("/", "Path search"), ("n / N", "Next / prev")],
+                keys: &[("/", "Filter by path"), ("n / N", "Next / prev")],
             },
             HelpSection {
                 title: "SCAN",
@@ -787,15 +848,20 @@ fn help_sections(ctx: HelpCtx) -> Vec<HelpSection> {
                 ("j/k ↑↓", "Move"),
                 ("←/→", "Column / pane"),
                 ("gg / G", "Top / bottom"),
-                ("^F / ^B", "Page (SQLite)"),
+                ("^F / ^B", "Page up / down"),
                 ("Tab", "Switch focus"),
                 ("Enter", "Open detail"),
-                ("Esc", "Back / quit"),
+                ("Esc", "Back / file list"),
             ],
         },
         HelpSection {
-            title: "SEARCH",
-            keys: &[("/", "Search"), ("n / N", "Next / prev")],
+            title: "FILTER",
+            keys: &[
+                ("/", "Filter as you type"),
+                ("Enter", "Keep the filter"),
+                ("Esc", "Clear it"),
+                ("n / N", "Next / prev match"),
+            ],
         },
         store,
         HelpSection {
@@ -864,7 +930,7 @@ mod tests {
     }
 
     /// Render one frame of just the overlay layer, flattened to row strings.
-    fn rows(ov: &Overlays, ctx: HelpCtx, w: u16, h: u16) -> Vec<String> {
+    fn rows(ov: &mut Overlays, ctx: HelpCtx, w: u16, h: u16) -> Vec<String> {
         let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
         term.draw(|f| ov.render(f, ctx)).unwrap();
         let buf = term.backend().buffer().clone();
@@ -922,7 +988,7 @@ mod tests {
     fn help_shows_the_section_for_its_screen() {
         let mut ov = overlays();
         ov.help = true;
-        let r = rows(&ov, HelpCtx::Rkyv, 100, 40);
+        let r = rows(&mut ov, HelpCtx::Rkyv, 100, 40);
         assert!(has(&r, "KEYBOARD SHORTCUTS"), "title missing");
         assert!(has(&r, "╔") && has(&r, "╝"), "frame missing");
         assert!(has(&r, "rkyv archive"));
@@ -932,15 +998,15 @@ mod tests {
         assert!(has(&r, "scheme: Neon Sprawl"));
         assert!(has(&r, "press any key to close"));
 
-        let r = rows(&ov, HelpCtx::Sqlite, 100, 40);
+        let r = rows(&mut ov, HelpCtx::Sqlite, 100, 40);
         assert!(has(&r, "SQLITE") && has(&r, "Raw SQL"));
         assert!(!has(&r, "RKYV"));
 
         // The picker's help lists its own bindings, not the store ones.
-        let r = rows(&ov, HelpCtx::Picker, 100, 40);
+        let r = rows(&mut ov, HelpCtx::Picker, 100, 40);
         assert!(has(&r, "recent files"));
         assert!(has(&r, "Open file"));
-        assert!(has(&r, "Path search"));
+        assert!(has(&r, "Filter by path"));
         assert!(
             has(&r, "Rescan now"),
             "picker help must list the rescan key"
@@ -969,7 +1035,7 @@ mod tests {
                 }
             }
             ov.toast("saved custom palette");
-            let r = rows(&ov, HelpCtx::Sqlite, 100, 40);
+            let r = rows(&mut ov, HelpCtx::Sqlite, 100, 40);
             for (y, row) in r.iter().enumerate() {
                 for ch in row.chars() {
                     assert!(
@@ -1011,7 +1077,7 @@ mod tests {
                     _ => ov.editor = true,
                 }
                 ov.toast("a toast wider than this terminal is wide");
-                rows(&ov, HelpCtx::Picker, w, h);
+                rows(&mut ov, HelpCtx::Picker, w, h);
             }
         }
     }
@@ -1024,12 +1090,12 @@ mod tests {
         ov.chooser = true;
         ov.chooser_idx = ThemeName::ALL.len() - 1;
         let last = ThemeName::ALL[ThemeName::ALL.len() - 1].display();
-        let r = rows(&ov, HelpCtx::Rkyv, 60, 20);
+        let r = rows(&mut ov, HelpCtx::Rkyv, 60, 20);
         assert!(has(&r, last), "last scheme not visible: {last}");
         assert!(has(&r, "SCHEME CHOOSER"));
 
         ov.chooser_idx = 0;
-        let r = rows(&ov, HelpCtx::Rkyv, 60, 20);
+        let r = rows(&mut ov, HelpCtx::Rkyv, 60, 20);
         assert!(has(&r, ThemeName::ALL[0].display()));
     }
 
@@ -1040,7 +1106,7 @@ mod tests {
         ov.editor = true;
         ov.editor_palette = [11, 22, 33, 44, 55, 66];
         ov.editor_slot = 1;
-        let r = rows(&ov, HelpCtx::Rkyv, 80, 30);
+        let r = rows(&mut ov, HelpCtx::Rkyv, 80, 30);
         assert!(has(&r, "PALETTE EDITOR"));
         for label in ["primary", "accent", "alt", "label", "dim", "dark"] {
             assert!(has(&r, label), "slot {label} missing");
@@ -1056,7 +1122,7 @@ mod tests {
     fn toast_renders_until_it_expires() {
         let mut ov = overlays();
         ov.toast("copied cell to clipboard");
-        let r = rows(&ov, HelpCtx::Rkyv, 60, 10);
+        let r = rows(&mut ov, HelpCtx::Rkyv, 60, 10);
         assert!(has(&r, "copied cell to clipboard"), "toast not drawn");
         assert!(
             r[7].contains("copied cell"),
@@ -1071,7 +1137,7 @@ mod tests {
             since: Instant::now() - std::time::Duration::from_secs(TOAST_SECS + 1),
         });
         assert!(ov.toast.as_ref().unwrap().expired());
-        let r = rows(&ov, HelpCtx::Rkyv, 60, 10);
+        let r = rows(&mut ov, HelpCtx::Rkyv, 60, 10);
         assert!(!has(&r, "copied cell"), "expired toast still drawn");
         ov.expire_toast();
         assert!(ov.toast.is_none(), "expired toast not cleared by tick");

@@ -250,14 +250,26 @@ Jump to the first / last item. In the row grid this walks to the first or last
 page, not just the visible rows.
 .TP
 .BR Ctrl\-f ", " Ctrl\-b ", " PageDown ", " PageUp
-Page forward / back through rows.
+Move a screenful, sized from the rows actually on display, in every scrolling
+view: the table list and row grid, the rkyv Records, Strings and Hex views, the
+detail and schema screens, the hex editor and the file picker. In the row grid,
+paging past either end of the loaded 500-row page steps to the next or previous
+one.
 .TP
 .B /
-Search. The pattern is matched against table names, or \(em with the row grid
-focused \(em every column of the whole table via SQL (not just the loaded page),
-record keys, the extracted strings or the raw bytes (rkyv), or the file names
-(recent-files picker). Text searches are case-insensitive and wrap; the hex
-search is a case-sensitive byte match.
+Filter the current list as the pattern is typed: only matching rows stay listed
+and the pane title carries the count.
+.B Enter
+keeps the filter,
+.B Esc
+clears it and restores the position. The pattern is matched against table names,
+or \(em with the row grid focused \(em every column of the table via a SQL
+.BR WHERE ,
+so it covers the whole table rather than the loaded page; also against record
+keys, the extracted strings, and the paths in the picker. Matching is a
+case-insensitive substring. The Hex view is not filtered: there
+.B /
+searches for a byte sequence, case-sensitively.
 .TP
 .BR n ", " N
 Jump to the next / previous match of the active search.
@@ -411,9 +423,17 @@ and the readline chords
 (kill to start / end).
 .TP
 .BR q ", " Esc
-Leave the current screen or quit. On the detail, schema, or help screen, return
-to the main view. Inside a modal (edit, SQL, search, confirm), Esc cancels the
-modal only.
+Leave the current screen.
+.B q
+quits. On the detail, schema, hex-editor or help screen, both return to the main
+view; on the main view itself
+.B Esc
+goes back to the file picker (as
+.B o
+does) while
+.B q
+exits. Inside a modal (edit, SQL, search, confirm), Esc cancels the modal only. In
+the picker, either one exits.
 .SH STARTUP SCAN
 With no
 .I FILE
@@ -461,6 +481,15 @@ list is loaded. Roots given with
 .B \-\-scan
 neither read nor write the saved scan, being a different set from the default
 roots.
+.SH LARGE ARCHIVES
+Validating a large rkyv archive is slow \(em a 382\ MB heap image takes about
+twenty-five seconds \(em so anything over 4\ MB is decoded on a background
+thread. The structural views (Info, Strings, Hex) are usable at once, and the
+Records view appears when the decode finishes.
+.PP
+String extraction is likewise bounded to twenty thousand runs taken from the first
+64\ MB. The Info view and the Strings title mark a bounded list rather than
+implying it is exhaustive.
 .SH RECENT FILES
 Every successful open is recorded, most-recent-first, deduplicated by absolute
 path and capped at 50 entries. The list is written atomically (temp file plus

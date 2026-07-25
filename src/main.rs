@@ -321,7 +321,7 @@ fn export_store(store: &Store, fmt: &str) -> Result<String> {
                     .cloned()
                     .ok_or_else(|| anyhow!("no tables to export"))?;
                 let total = s.count(&table)?;
-                let v = s.rows(&table, total.max(1), 0, None)?;
+                let v = s.rows(&table, total.max(1), 0, None, "")?;
                 Ok(export::rows_to_csv(&v.columns, &v.rows))
             } else {
                 // JSON: object of { table_name: [rows...] } for every table.
@@ -331,7 +331,7 @@ fn export_store(store: &Store, fmt: &str) -> Result<String> {
                         out.push(',');
                     }
                     let total = s.count(t)?;
-                    let v = s.rows(t, total.max(1), 0, None)?;
+                    let v = s.rows(t, total.max(1), 0, None, "")?;
                     out.push_str(&export::json_escape(t));
                     out.push(':');
                     out.push_str(&export::rows_to_json(&v.columns, &v.rows));
@@ -361,11 +361,12 @@ fn export_store(store: &Store, fmt: &str) -> Result<String> {
 }
 
 fn run(cli: &Cli, terminal: &mut DefaultTerminal, theme: Option<theme::ThemeName>) -> Result<()> {
-    // An explicit FILE has nothing to pick. Otherwise loop, because `o` in the
-    // app comes back here to choose another file.
+    // An explicit FILE opens straight away; `o` or Esc there still lead to the
+    // picker, so fall through to the loop instead of exiting.
     if let Some(file) = &cli.file {
-        open_and_run(cli, terminal, theme, file.clone())?;
-        return Ok(());
+        if open_and_run(cli, terminal, theme, file.clone())? == app::Outcome::Quit {
+            return Ok(());
+        }
     }
     loop {
         let file = match pick(cli, terminal, theme)? {
