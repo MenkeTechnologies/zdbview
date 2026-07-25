@@ -6,14 +6,128 @@
 
 use anyhow::{Context, Result};
 use rusqlite::types::ValueRef;
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 
 pub struct SqliteStore {
-    conn: Connection,
+    /// Boxed for the same reason as `cache`: a `Connection` carries a prepared-
+    /// statement cache inline, and `Store` holds a `SqliteStore` by value.
+    conn: Box<Connection>,
     pub path: PathBuf,
     pub tables: Vec<String>,
+    /// What has been learned about this database so far. Boxed to keep the store
+    /// itself small, since [`crate::store::Store`] holds one by value.
+    cache: Box<Cache>,
+    /// Installed on every connection this store owns, see [`Self::set_cancel`].
+    cancel: Option<(i32, Cancel)>,
 }
+
+/// Everything a store keeps between queries so a page does not have to re-derive
+/// it. All of it is dropped by [`SqliteStore::invalidate`].
+#[derive(Default)]
+struct Cache {
+    /// Per-table facts that hold until the schema changes: the column names,
+    /// whether the table exposes `rowid`, and the primary key. Every page used
+    /// to re-read all three, which on a filtered grid meant three extra
+    /// statements per keystroke.
+    meta: RefCell<HashMap<String, Arc<TableMeta>>>,
+    /// Connections for counting in parallel, opened on first use and kept.
+    /// Opening one is not cheap on a large database — a 23 GB file with a 300 MB
+    /// WAL costs ~4.3 s of WAL replay — so they are never per-query.
+    shards: RefCell<Vec<Connection>>,
+    /// Cached rowid ranges per table, see [`SqliteStore::rowid_ranges`].
+    ranges: RefCell<HashMap<String, RowidRanges>>,
+}
+
+/// Half-open `(lo, hi]` rowid ranges covering one table, shared out to the
+/// counting threads.
+type RowidRanges = Arc<Vec<(i64, i64)>>;
+
+/// Asked periodically while a statement runs: `true` abandons it. This is how an
+/// abandoned scan stops costing anything the moment the user types the next key.
+pub type Cancel = Arc<dyn Fn() -> bool + Send + Sync>;
+
+/// What one table's shape is, read once and cached.
+#[derive(Debug)]
+pub struct TableMeta {
+    pub columns: Vec<String>,
+    /// The table exposes `rowid`, so a row can be addressed and paged by it.
+    /// False for a `WITHOUT ROWID` table.
+    pub has_rowid: bool,
+    /// Primary-key columns in key order — the row handle when there is no rowid.
+    pub primary_key: Vec<String>,
+}
+
+/// Pragmas that decide how a large database reads. Every connection this module
+/// opens gets them, because the counting threads matter as much as the UI's.
+///
+/// * `mmap_size` — pages arrive by mmap instead of `read()`, which is what makes
+///   re-scanning a multi-gigabyte file cheap. Asking for more than the build
+///   allows is not an error, SQLite clamps it (a default build stops at 2 GiB),
+///   so ask for far more and take whatever is given.
+/// * `cache_size` — negative means KiB, so 256 MiB of pages per connection
+///   instead of the 2 MiB default. A filtered scan walks the same interior
+///   b-tree pages over and over.
+/// * `temp_store` — a sort or a materialised subquery stays out of the filesystem.
+///
+/// Best-effort by design: a build that rejects one of these must still open the
+/// file, so the result is dropped.
+fn tune(conn: &Connection, cache_kib: i64) {
+    let _ = conn.execute_batch(&format!(
+        "PRAGMA mmap_size = 1099511627776;
+         PRAGMA cache_size = -{cache_kib};
+         PRAGMA temp_store = MEMORY;"
+    ));
+    // The hot statements — one page, one range count — are otherwise re-prepared
+    // on every keystroke.
+    conn.set_prepared_statement_cache_capacity(64);
+}
+
+/// Page cache for a connection that answers whatever the user does next, and so
+/// benefits from keeping the b-tree it last walked.
+const CACHE_INTERACTIVE_KIB: i64 = 262_144;
+/// Page cache for a counting shard. A shard walks its range once and never looks
+/// back, so a large cache buys nothing and there is one of these per core.
+const CACHE_SHARD_KIB: i64 = 8_192;
+
+/// How many connections count in parallel. SQLite runs one statement on one
+/// thread, so the only way to use the machine is to give each core its own
+/// connection and its own slice of the table. Two cores are left for the UI and
+/// the reader thread.
+/// Wire `cancel` into `conn` as SQLite's progress handler.
+fn install_cancel(conn: &Connection, check_ops: i32, cancel: &Cancel) {
+    let cancel = Arc::clone(cancel);
+    let _ = conn.progress_handler(check_ops, Some(move || cancel()));
+}
+
+fn shard_count() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get().saturating_sub(2))
+        .unwrap_or(2)
+        .clamp(2, 16)
+}
+
+/// Below this wide a rowid span a parallel count is not worth its setup, so one
+/// statement does it.
+const PARALLEL_COUNT_FLOOR: i64 = 200_000;
+
+/// Ranges per worker. Equal-width rowid ranges are wildly unbalanced on a table
+/// that has been rewritten for years — in Ableton's file index the lowest eighth
+/// of the rows starts at rowid 105,596,921 of 111,378,050, so an eighth of the
+/// width would hold everything — and finding balanced cut points means walking
+/// the whole index, which cost 5.8 s of cold reads on that file: more than the
+/// count it was meant to speed up.
+///
+/// Cutting far finer than the worker count fixes the balance without reading
+/// anything. Rowids are unique integers, so a range of width `w` holds at most
+/// `w` rows: with this many ranges per worker no single range can hold more than
+/// its share unless the rowids are spread over more than this multiple of the row
+/// count, and an empty range costs one index seek.
+const RANGES_PER_WORKER: i64 = 64;
 
 /// Which column the row grid is ordered by, and in which direction. The display
 /// order is the tuple `(column, rowid)` taken in `desc`'s direction, so paging,
@@ -49,14 +163,149 @@ impl Sort {
     /// Row-value comparison against the row with `rowid = ?2`, in display order:
     /// `later` selects rows that come after it on screen.
     fn compare_to_marker(&self, table: &str, later: bool) -> String {
+        self.compare_to_marker_at(table, later, 2)
+    }
+
+    /// The same against the row named by `?1`, which is where a page fetch binds
+    /// its marker.
+    fn compare_to_marker_param(&self, table: &str, later: bool) -> String {
+        self.compare_to_marker_at(table, later, 1)
+    }
+
+    fn compare_to_marker_at(&self, table: &str, later: bool, param: usize) -> String {
         // Ascending display order puts "later" rows above the marker tuple;
         // descending inverts it.
         let op = if later != self.desc { ">" } else { "<" };
         let col = esc(&self.column);
         format!(
-            "(\"{col}\", rowid) {op} (SELECT \"{col}\", rowid FROM \"{t}\" WHERE rowid = ?2)",
+            "(\"{col}\", rowid) {op} (SELECT \"{col}\", rowid FROM \"{t}\" WHERE rowid = ?{param})",
             t = esc(table)
         )
+    }
+}
+
+/// One page request: where in which table, in what order, and what is already
+/// known about it.
+#[derive(Debug, Clone, Copy)]
+pub struct PageQuery<'a> {
+    pub table: &'a str,
+    /// Rows per page.
+    pub limit: i64,
+    /// Position of the page's first row in the display order.
+    pub offset: i64,
+    pub sort: Option<&'a Sort>,
+    pub filter: &'a str,
+    /// The page on screen, which is what lets this one be fetched by cursor.
+    pub hint: Option<&'a PageHint>,
+    /// A counted total for this table and filter, when one is known. Without it
+    /// the view reports the bound this page proves.
+    pub known_total: Option<i64>,
+}
+
+impl<'a> PageQuery<'a> {
+    /// The whole of `table`, unordered and unfiltered — what an export wants.
+    pub fn all(table: &'a str, limit: i64) -> Self {
+        PageQuery {
+            table,
+            limit,
+            offset: 0,
+            sort: None,
+            filter: "",
+            hint: None,
+            known_total: None,
+        }
+    }
+}
+
+/// The page the grid currently shows, so the next fetch can be expressed
+/// relative to it instead of by position.
+///
+/// `LIMIT n OFFSET k` makes SQLite walk and discard `k` matching rows, so on a
+/// filtered scan the cost of a page grows with how far in it is: measured on a
+/// 6.5M-row table with a filter matching 270k rows, the first page took 26 ms
+/// and `OFFSET 269000` took 6.2 s. Stepping to the neighbouring page instead
+/// asks for the rows after (or before) a known one, which is one index seek
+/// whatever the page number, and the last page is read backwards from the end.
+#[derive(Debug, Clone, Copy)]
+pub struct PageHint {
+    /// Offset the loaded page starts at.
+    pub offset: i64,
+    /// `rowid` of its first row.
+    pub first: i64,
+    /// `rowid` of its last row.
+    pub last: i64,
+    /// How many rows it holds.
+    pub len: i64,
+}
+
+/// How one page fetch addresses its rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Plan {
+    /// Walk from the start of the ordering — also what an absolute jump does,
+    /// since only a position can express it.
+    Offset,
+    /// The rows after the loaded page's last row.
+    After(i64),
+    /// The rows before its first row, read backwards.
+    Before(i64),
+    /// The final rows, read backwards from the end of the ordering.
+    Last,
+}
+
+impl Plan {
+    /// Pick the cheapest form that lands on `offset`.
+    fn pick(
+        hint: Option<&PageHint>,
+        offset: i64,
+        limit: i64,
+        known_total: Option<i64>,
+        with_rowid: bool,
+    ) -> Plan {
+        // Without a rowid there is no marker to compare against.
+        if !with_rowid {
+            return Plan::Offset;
+        }
+        // The last page is cheap from the other end, but only a counted total says
+        // which page that is.
+        if known_total.is_some_and(|t| offset > 0 && offset + limit >= t) {
+            return Plan::Last;
+        }
+        match hint {
+            Some(h) if h.len > 0 && offset == h.offset + h.len => Plan::After(h.last),
+            Some(h) if offset >= 0 && offset + limit == h.offset => Plan::Before(h.first),
+            _ => Plan::Offset,
+        }
+    }
+
+    /// Whether the rows come back in reverse display order.
+    fn reads_backwards(self) -> bool {
+        matches!(self, Plan::Before(_) | Plan::Last)
+    }
+
+    /// The marker rowid this plan compares against, if any.
+    fn marker(self) -> Option<i64> {
+        match self {
+            Plan::After(r) | Plan::Before(r) => Some(r),
+            Plan::Offset | Plan::Last => None,
+        }
+    }
+
+    /// `LIMIT` for the statement. A last page may be shorter than a full one, and
+    /// reading it backwards means asking for exactly what is left.
+    fn take(self, probe: i64, offset: i64, known_total: Option<i64>) -> i64 {
+        match (self, known_total) {
+            (Plan::Last, Some(total)) => (total - offset).clamp(1, probe),
+            _ => probe,
+        }
+    }
+
+    /// `OFFSET` for the statement — zero for every plan that uses a marker,
+    /// which is the whole point of them.
+    fn sql_offset(self, offset: i64) -> i64 {
+        match self {
+            Plan::Offset => offset,
+            _ => 0,
+        }
     }
 }
 
@@ -204,19 +453,111 @@ pub struct RowsView {
     /// Primary-key columns, in key order, for a table with no rowid. Empty when
     /// the table has one, since then the rowid is the better handle.
     pub primary_key: Vec<String>,
+    /// Rows the filter leaves. A lower bound unless `total_exact`, because the
+    /// exact figure costs a full scan — see [`SqliteStore::count_bounded`].
     pub total: i64,
+    /// `total` is the real total, not "at least this many".
+    pub total_exact: bool,
 }
 
 impl SqliteStore {
     pub fn open(path: &Path) -> Result<Self> {
         let conn =
             Connection::open(path).with_context(|| format!("open sqlite {}", path.display()))?;
+        Self::from_conn(conn, path)
+    }
+
+    /// A second store over the same file that can only read. This is what the
+    /// query thread and the counting shards use: a reader cannot be asked to
+    /// checkpoint a WAL, so browsing a database another process is writing —
+    /// Ableton's file index, a browser profile — cannot disturb it.
+    pub fn open_readonly(path: &Path) -> Result<Self> {
+        let conn = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .with_context(|| format!("open sqlite read-only {}", path.display()))?;
+        Self::from_conn(conn, path)
+    }
+
+    fn from_conn(conn: Connection, path: &Path) -> Result<Self> {
+        tune(&conn, CACHE_INTERACTIVE_KIB);
         let tables = list_tables(&conn)?;
         Ok(Self {
-            conn,
+            conn: Box::new(conn),
             path: path.to_path_buf(),
             tables,
+            cache: Box::default(),
+            cancel: None,
         })
+    }
+
+    /// Let `cancel` abandon whatever this store is running, checked every
+    /// `check_ops` SQLite instructions. It is installed on this connection and on
+    /// every counting shard, including ones opened later — the shards are where
+    /// the long scans happen, so cancelling only the main connection would leave
+    /// them burning cores for a filter the user has already retyped.
+    pub fn set_cancel(&mut self, check_ops: i32, cancel: Cancel) {
+        install_cancel(&self.conn, check_ops, &cancel);
+        for conn in self.cache.shards.borrow().iter() {
+            install_cancel(conn, check_ops, &cancel);
+        }
+        self.cancel = Some((check_ops, cancel));
+    }
+
+    /// Forget the cached schema facts. Any statement the user runs may have
+    /// changed the shape of a table, and a stale column list would then address
+    /// the wrong cell.
+    pub fn invalidate(&mut self) {
+        self.cache.meta.borrow_mut().clear();
+        self.cache.ranges.borrow_mut().clear();
+        if let Ok(t) = list_tables(&self.conn) {
+            self.tables = t;
+        }
+    }
+
+    /// Cached [`TableMeta`] for `table`.
+    fn meta(&self, table: &str) -> Result<Arc<TableMeta>> {
+        if let Some(m) = self.cache.meta.borrow().get(table) {
+            return Ok(Arc::clone(m));
+        }
+        let columns = self.read_columns(table)?;
+        // `WITHOUT ROWID` tables have no `rowid` column, so preparing the
+        // statement that selects it is the test for one.
+        let has_rowid = self
+            .conn
+            .prepare(&format!("SELECT rowid FROM \"{}\" LIMIT 0", esc(table)))
+            .is_ok();
+        let primary_key = if has_rowid {
+            Vec::new()
+        } else {
+            self.primary_key_columns(table)?
+        };
+        let m = Arc::new(TableMeta {
+            columns,
+            has_rowid,
+            primary_key,
+        });
+        self.cache
+            .meta
+            .borrow_mut()
+            .insert(table.to_string(), Arc::clone(&m));
+        Ok(m)
+    }
+
+    /// Whether `table` can be read at all. A table whose virtual-table module or
+    /// tokenizer this binary does not have — Ableton's `search_aggregation` is
+    /// FTS4 with a custom `AbletonTokenizer` — cannot be queried by anyone, and
+    /// saying so in the list beats surfacing `unknown tokenizer` as if the
+    /// selection had failed.
+    pub fn unreadable_reason(&self, table: &str) -> Option<String> {
+        match self
+            .conn
+            .prepare(&format!("SELECT 1 FROM \"{}\" LIMIT 0", esc(table)))
+        {
+            Ok(_) => None,
+            Err(e) => Some(e.to_string()),
+        }
     }
 
     /// `col LIKE ?N OR col LIKE ?N …` over every column, for the search term and
@@ -266,7 +607,169 @@ impl SqliteStore {
         Ok(n)
     }
 
+    /// The exact number of rows the filter leaves, counted on every core.
+    ///
+    /// One SQLite statement runs on one thread, so the table is cut into rowid
+    /// ranges ([`ShardPlan`]) and each range counted on its own connection. On a
+    /// 6.5M-row table with a filter that matches 270k rows this takes the count
+    /// from 4.16 s to well under a second; a table under
+    /// [`PARALLEL_COUNT_FLOOR`] rows, or one with no rowid to cut on, is counted
+    /// by a single statement because the setup would cost more than the scan.
+    pub fn count_exact(&self, table: &str, filter: &str) -> Result<i64> {
+        let meta = self.meta(table)?;
+        // The filter's parameters are `?1..`, so the two range bounds take the
+        // numbers after them.
+        let (keep, binds) = Self::and_filter(&meta.columns, filter, 1);
+
+        let params: Vec<&(dyn rusqlite::ToSql + Sync)> = binds
+            .iter()
+            .map(|b| b as &(dyn rusqlite::ToSql + Sync))
+            .collect();
+        match self.count_sharded(table, meta.has_rowid, &keep, &params)? {
+            Some(n) => Ok(n),
+            None => self.count_filtered(table, filter),
+        }
+    }
+
+    /// Count the rows of `table` that satisfy `keep` (an already-built
+    /// ` AND …` body whose parameters are `?1..`, or empty), split across cores by
+    /// rowid range. `None` means the table cannot be split — no rowid, or too few
+    /// rows for it to pay — and the caller should count it with one statement.
+    fn count_sharded(
+        &self,
+        table: &str,
+        has_rowid: bool,
+        keep: &str,
+        binds: &[&(dyn rusqlite::ToSql + Sync)],
+    ) -> Result<Option<i64>> {
+        if !has_rowid {
+            return Ok(None);
+        }
+        let Some(ranges) = self.rowid_ranges(table)? else {
+            return Ok(None);
+        };
+        // The caller's parameters are `?1..`, so the range bounds take the next
+        // two numbers.
+        let lo = binds.len() + 1;
+        let hi = binds.len() + 2;
+        let sql = format!(
+            "SELECT COUNT(*) FROM \"{}\" WHERE rowid > ?{lo} AND rowid <= ?{hi}{keep}",
+            esc(table)
+        );
+
+        let workers = shard_count().min(ranges.len());
+        let mut pool = self.cache.shards.borrow_mut();
+        self.fill_pool(&mut pool, workers)?;
+        // Ranges outnumber workers, so they are taken one at a time rather than
+        // dealt out in advance: a range that turns out to hold most of the rows
+        // then delays only itself, and the empty ones cost an index seek each.
+        let next = AtomicUsize::new(0);
+        let totals: Vec<Result<i64>> = std::thread::scope(|scope| {
+            let handles: Vec<_> = pool
+                .iter_mut()
+                .take(workers)
+                .map(|conn| {
+                    let (sql, ranges, next) = (&sql, &ranges, &next);
+                    scope.spawn(move || -> Result<i64> {
+                        let mut total = 0i64;
+                        loop {
+                            let i = next.fetch_add(1, Ordering::Relaxed);
+                            let Some(&(lo_v, hi_v)) = ranges.get(i) else {
+                                return Ok(total);
+                            };
+                            let mut params: Vec<&dyn rusqlite::ToSql> =
+                                binds.iter().map(|b| *b as &dyn rusqlite::ToSql).collect();
+                            params.push(&lo_v);
+                            params.push(&hi_v);
+                            let mut stmt = conn.prepare_cached(sql)?;
+                            total += stmt.query_row(params.as_slice(), |r| r.get::<_, i64>(0))?;
+                        }
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| {
+                    h.join()
+                        .unwrap_or_else(|_| Err(anyhow::anyhow!("count thread panicked")))
+                })
+                .collect()
+        });
+        let mut total = 0i64;
+        for t in totals {
+            total += t?;
+        }
+        Ok(Some(total))
+    }
+
+    /// Open pool connections until there are `want` of them.
+    fn fill_pool(&self, pool: &mut Vec<Connection>, want: usize) -> Result<()> {
+        while pool.len() < want {
+            let conn = Connection::open_with_flags(
+                &self.path,
+                OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            )?;
+            tune(&conn, CACHE_SHARD_KIB);
+            if let Some((ops, cancel)) = &self.cancel {
+                install_cancel(&conn, *ops, cancel);
+            }
+            pool.push(conn);
+        }
+        Ok(())
+    }
+
+    /// Half-open rowid ranges `(lo, hi]` covering `table`, cached, or `None` when
+    /// the table is too narrow for splitting the work to pay off.
+    ///
+    /// Only `MIN(rowid)` and `MAX(rowid)` are read — two index seeks — and the
+    /// cuts are then arithmetic. See [`RANGES_PER_WORKER`] for why equal widths
+    /// are enough despite rowids being unevenly spread.
+    fn rowid_ranges(&self, table: &str) -> Result<Option<RowidRanges>> {
+        if let Some(r) = self.cache.ranges.borrow().get(table) {
+            return Ok(Some(Arc::clone(r)));
+        }
+        let (min, max): (i64, i64) = self.conn.query_row(
+            &format!(
+                "SELECT COALESCE(MIN(rowid), 0), COALESCE(MAX(rowid), 0) FROM \"{}\"",
+                esc(table)
+            ),
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        // The span bounds the row count from above, so a narrow one means a small
+        // table whatever the filter.
+        let span = max.saturating_sub(min).saturating_add(1);
+        if span < PARALLEL_COUNT_FLOOR {
+            return Ok(None);
+        }
+        let count = (shard_count() as i64 * RANGES_PER_WORKER).min(span);
+        let mut ranges = Vec::with_capacity(count as usize);
+        // The low bound is exclusive, so the first range starts below `min`.
+        let mut lo = min - 1;
+        for k in 1..=count {
+            let hi = if k == count {
+                max
+            } else {
+                min - 1 + span * k / count
+            };
+            if hi > lo {
+                ranges.push((lo, hi));
+                lo = hi;
+            }
+        }
+        let ranges = Arc::new(ranges);
+        self.cache
+            .ranges
+            .borrow_mut()
+            .insert(table.to_string(), Arc::clone(&ranges));
+        Ok(Some(ranges))
+    }
+
     pub fn columns(&self, table: &str) -> Result<Vec<String>> {
+        Ok(self.meta(table)?.columns.clone())
+    }
+
+    fn read_columns(&self, table: &str) -> Result<Vec<String>> {
         let mut stmt = self
             .conn
             .prepare(&format!("PRAGMA table_info(\"{}\")", esc(table)))?;
@@ -278,74 +781,101 @@ impl SqliteStore {
 
     /// Fetch one page of rows. Includes `rowid` for edit/delete addressing when
     /// the table exposes it.
-    pub fn rows(
-        &self,
-        table: &str,
-        limit: i64,
-        offset: i64,
-        sort: Option<&Sort>,
-        filter: &str,
-    ) -> Result<RowsView> {
-        let columns = self.columns(table)?;
-        let total = self.count_filtered(table, filter)?;
+    ///
+    /// `q.hint` describes the page currently on screen, which is what lets a step
+    /// to the next or previous page skip the `OFFSET` scan; see [`PageHint`].
+    pub fn rows(&self, q: &PageQuery) -> Result<RowsView> {
+        let PageQuery {
+            table,
+            limit,
+            offset,
+            sort,
+            filter,
+            hint,
+            known_total,
+        } = *q;
+        let meta = self.meta(table)?;
+        let columns = &meta.columns;
         let ncols = columns.len();
-        let clause = Self::filter_clause(&columns, filter);
-        let where_sql = clause.as_ref().map(|(w, _)| w.as_str()).unwrap_or("");
+        let with_rowid = meta.has_rowid;
+        // `total` is only needed for two things: knowing whether a next page
+        // exists, and a number for the title. Asking SQLite to count is the wrong
+        // way to learn the first — even a capped count has to scan as far as the
+        // cap, so on a filtered grid it costs the whole table again. Fetching one
+        // row more than the page needs answers it for free, and the exact total
+        // arrives separately from `count_exact`.
+        let probe = limit.saturating_add(1);
 
-        // Try to select rowid alongside the real columns. Falls back to a
-        // plain select for WITHOUT ROWID tables where `rowid` is not a column.
-        let with_rowid = self
-            .conn
-            .prepare(&format!(
-                "SELECT rowid, * FROM \"{}\" LIMIT {} OFFSET {}",
-                esc(table),
-                limit,
-                offset
-            ))
-            .is_ok();
+        let sorted_by = match sort {
+            Some(s) if columns.contains(&s.column) => Some(s),
+            _ => None,
+        };
+        let plan = Plan::pick(hint, offset, limit, known_total, with_rowid);
 
         // An explicit ORDER BY makes paging and search-positioning
         // deterministic: a matching rowid's ordinal position is then
         // well-defined. Without a chosen sort column that order is `rowid`.
-        let sql = if with_rowid {
-            let order = match sort {
-                Some(s) if columns.contains(&s.column) => s.order_by(),
-                _ => "rowid".to_string(),
-            };
-            format!(
-                "SELECT rowid, * FROM \"{}\"{} ORDER BY {} LIMIT {} OFFSET {}",
-                esc(table),
-                where_sql,
-                order,
-                limit,
-                offset
-            )
-        } else {
+        let order = match (with_rowid, sorted_by) {
+            (true, Some(s)) => s.order_by(),
+            (true, None) => "rowid".to_string(),
             // A WITHOUT ROWID table has no rowid tiebreaker; sort on the column
             // alone, which is still stable enough for display.
-            let order = match sort {
-                Some(s) if columns.contains(&s.column) => {
-                    format!("\"{}\" {}", esc(&s.column), s.dir())
-                }
-                _ => "1".to_string(),
-            };
-            format!(
-                "SELECT * FROM \"{}\"{} ORDER BY {} LIMIT {} OFFSET {}",
-                esc(table),
-                where_sql,
-                order,
-                limit,
-                offset
-            )
+            (false, Some(s)) => format!("\"{}\" {}", esc(&s.column), s.dir()),
+            (false, None) => "1".to_string(),
+        };
+        // A backwards or last-page fetch walks the ordering from the other end,
+        // so it selects in reverse and the rows are flipped afterwards.
+        let reversed = plan.reads_backwards();
+        let order = if reversed {
+            match (with_rowid, sorted_by) {
+                (true, Some(s)) => s.order_by_reversed(),
+                (true, None) => "rowid DESC".to_string(),
+                (false, Some(s)) => format!(
+                    "\"{}\" {}",
+                    esc(&s.column),
+                    if s.desc { "ASC" } else { "DESC" }
+                ),
+                (false, None) => "1 DESC".to_string(),
+            }
+        } else {
+            order
         };
 
-        let mut stmt = self.conn.prepare(&sql)?;
+        // The marker comparison is `?1`, so a filter's parameters start at `?2`
+        // whenever there is one; with no marker they start at `?1`.
+        let marker = plan.marker();
+        let first_param = if marker.is_some() { 2 } else { 1 };
+        let (keep, binds) = Self::and_filter(columns, filter, first_param);
+        let where_sql = match (marker, keep.is_empty()) {
+            (Some(_), _) => {
+                let cmp = match sorted_by {
+                    // `compare_to_marker` reads the marker row's sort value with
+                    // a subquery on `?1`, so both forms bind the same parameter.
+                    Some(s) => s.compare_to_marker_param(table, !reversed),
+                    None => format!("rowid {} ?1", if reversed { "<" } else { ">" }),
+                };
+                format!(" WHERE {cmp}{keep}")
+            }
+            (None, false) => format!(" WHERE {}", keep.trim_start_matches(" AND ")),
+            (None, true) => String::new(),
+        };
+        let take = plan.take(probe, offset, known_total);
+        let select = if with_rowid { "rowid, *" } else { "*" };
+        let sql = format!(
+            "SELECT {select} FROM \"{}\"{where_sql} ORDER BY {order} LIMIT {take} OFFSET {}",
+            esc(table),
+            plan.sql_offset(offset)
+        );
+
+        let mut stmt = self.conn.prepare_cached(&sql)?;
         let mut rows_out = Vec::new();
         let mut rowids = Vec::new();
-        let mut q = match &clause {
-            Some((_, binds)) => stmt.query(rusqlite::params_from_iter(binds))?,
-            None => stmt.query([])?,
-        };
+        let mut params: Vec<&dyn rusqlite::ToSql> = Vec::new();
+        if let Some(m) = marker.as_ref() {
+            params.push(m);
+        }
+        params.extend(binds.iter().map(|b| b as &dyn rusqlite::ToSql));
+        let mut q = stmt.query(params.as_slice())?;
         while let Some(row) = q.next()? {
             let (base, rid) = if with_rowid {
                 (1usize, row.get::<_, i64>(0).ok())
@@ -359,19 +889,41 @@ impl SqliteStore {
             }
             rows_out.push(cells);
         }
+        if reversed {
+            rows_out.reverse();
+            rowids.reverse();
+        }
+        // The extra row was only asked for to prove there is a next page. A
+        // backwards read took it from the far end, so it is already at the front.
+        let more = rows_out.len() as i64 > limit;
+        if more {
+            if reversed {
+                rows_out.remove(0);
+                rowids.remove(0);
+            } else {
+                rows_out.pop();
+                rowids.pop();
+            }
+        }
+
+        // Best total available: the counted one when it describes this grid,
+        // otherwise what this page proves — which is exact once the page ends the
+        // table.
+        let (total, total_exact) = match known_total {
+            Some(n) => (n, true),
+            None if more => (offset + rows_out.len() as i64 + 1, false),
+            None => (offset + rows_out.len() as i64, true),
+        };
 
         Ok(RowsView {
-            columns,
+            columns: columns.clone(),
             rows: rows_out,
             rowids,
             // A table with a rowid needs no key columns; one without them is
             // addressed by its primary key, so the view carries it.
-            primary_key: if with_rowid {
-                Vec::new()
-            } else {
-                self.primary_key_columns(table)?
-            },
+            primary_key: meta.primary_key.clone(),
             total,
+            total_exact,
         })
     }
 
@@ -496,28 +1048,36 @@ impl SqliteStore {
         sort: Option<&Sort>,
         filter: &str,
     ) -> Result<i64> {
-        let columns = self.columns(table)?;
+        let meta = self.meta(table)?;
         // The ordinal has to count the rows the grid actually lists, or a filtered
-        // search scrolls to a page the row is not on. `?1` and `?2` are both the
-        // marker rowid here, so the filter's parameters start at `?3`.
-        let (keep, keep_binds) = Self::and_filter(&columns, filter, 3);
-        let sql = match sort {
+        // search scrolls to a page the row is not on. The marker rowid is `?1` and
+        // the filter's parameters start at `?2`.
+        let (filter_body, filter_binds) = Self::and_filter(&meta.columns, filter, 2);
+        let position = match sort {
             // Everything not strictly after the marker row is at or before it.
-            Some(s) => format!(
-                "SELECT COUNT(*) FROM \"{}\" WHERE NOT ({}){}",
-                esc(table),
-                s.compare_to_marker(table, true),
-                keep
-            ),
-            None => format!(
-                "SELECT COUNT(*) FROM \"{}\" WHERE rowid <= ?2{}",
-                esc(table),
-                keep
-            ),
+            Some(s) => format!("NOT ({})", s.compare_to_marker_param(table, true)),
+            None => "rowid <= ?1".to_string(),
         };
-        let mut binds: Vec<&dyn rusqlite::ToSql> = vec![&rowid, &rowid];
-        binds.extend(keep_binds.iter().map(|b| b as &dyn rusqlite::ToSql));
-        let n: i64 = self.conn.query_row(&sql, binds.as_slice(), |r| r.get(0))?;
+        let mut binds: Vec<&(dyn rusqlite::ToSql + Sync)> = vec![&rowid];
+        binds.extend(
+            filter_binds
+                .iter()
+                .map(|b| b as &(dyn rusqlite::ToSql + Sync)),
+        );
+
+        // Like the total, this is a full scan of the filtered set, so it is split
+        // across cores when the table is big enough to be worth it.
+        let keep = format!(" AND {position}{filter_body}");
+        if let Some(n) = self.count_sharded(table, meta.has_rowid, &keep, &binds)? {
+            return Ok(n);
+        }
+        let sql = format!(
+            "SELECT COUNT(*) FROM \"{}\" WHERE {position}{filter_body}",
+            esc(table)
+        );
+        let params: Vec<&dyn rusqlite::ToSql> =
+            binds.iter().map(|b| *b as &dyn rusqlite::ToSql).collect();
+        let n: i64 = self.conn.query_row(&sql, params.as_slice(), |r| r.get(0))?;
         Ok(n)
     }
 
@@ -1475,4 +2035,327 @@ fn like_escape(term: &str) -> String {
         out.push(c);
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A database of `rows` rows in one table, with a `name` column holding
+    /// `word-<i>` and every fifth row containing `kick`.
+    fn fixture(name: &str, rows: i64) -> (PathBuf, SqliteStore) {
+        let mut path = std::env::temp_dir();
+        path.push(format!("zdbview_sqlite_{}_{name}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch("CREATE TABLE t (name TEXT, n INTEGER)")
+            .unwrap();
+        {
+            let tx = conn.unchecked_transaction().unwrap();
+            let mut stmt = tx
+                .prepare("INSERT INTO t (name, n) VALUES (?1, ?2)")
+                .unwrap();
+            for i in 0..rows {
+                let word = if i % 5 == 0 {
+                    format!("kick-{i}")
+                } else {
+                    format!("word-{i}")
+                };
+                stmt.execute(params![word, i]).unwrap();
+            }
+            drop(stmt);
+            tx.commit().unwrap();
+        }
+        drop(conn);
+        let store = SqliteStore::open(&path).unwrap();
+        (path, store)
+    }
+
+    fn page<'a>(
+        table: &'a str,
+        limit: i64,
+        offset: i64,
+        filter: &'a str,
+        hint: Option<&'a PageHint>,
+        known_total: Option<i64>,
+    ) -> PageQuery<'a> {
+        PageQuery {
+            table,
+            limit,
+            offset,
+            sort: None,
+            filter,
+            hint,
+            known_total,
+        }
+    }
+
+    fn hint_for(view: &RowsView, offset: i64) -> PageHint {
+        PageHint {
+            offset,
+            first: view.rowids.first().copied().flatten().unwrap(),
+            last: view.rowids.last().copied().flatten().unwrap(),
+            len: view.rows.len() as i64,
+        }
+    }
+
+    /// Stepping page by page with a cursor must land on exactly the rows an
+    /// `OFFSET` fetch would return — that equivalence is the whole licence for
+    /// skipping the offset scan.
+    #[test]
+    fn cursor_paging_matches_offset_paging_forwards_and_back() {
+        let (path, store) = fixture("cursor", 250);
+        let first = store.rows(&page("t", 50, 0, "", None, None)).unwrap();
+        let mut hint = hint_for(&first, 0);
+
+        for step in 1..5 {
+            let offset = step * 50;
+            let by_cursor = store
+                .rows(&page("t", 50, offset, "", Some(&hint), None))
+                .unwrap();
+            let by_offset = store.rows(&page("t", 50, offset, "", None, None)).unwrap();
+            assert_eq!(
+                by_cursor.rowids, by_offset.rowids,
+                "page at offset {offset} differs between cursor and offset paging"
+            );
+            assert_eq!(by_cursor.rows, by_offset.rows);
+            hint = hint_for(&by_cursor, offset);
+        }
+        // And backwards, which reads the ordering from the far end.
+        for step in (0..4).rev() {
+            let offset = step * 50;
+            let by_cursor = store
+                .rows(&page("t", 50, offset, "", Some(&hint), None))
+                .unwrap();
+            let by_offset = store.rows(&page("t", 50, offset, "", None, None)).unwrap();
+            assert_eq!(
+                by_cursor.rowids, by_offset.rowids,
+                "backwards page at offset {offset} differs"
+            );
+            hint = hint_for(&by_cursor, offset);
+        }
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// The same for a filtered grid, where a cursor step is the difference between
+    /// one index seek and re-walking every earlier match.
+    #[test]
+    fn cursor_paging_matches_offset_paging_under_a_filter() {
+        let (path, store) = fixture("cursor_filtered", 500);
+        let first = store.rows(&page("t", 20, 0, "kick", None, None)).unwrap();
+        assert_eq!(first.rows.len(), 20, "the filter must leave a full page");
+        let hint = hint_for(&first, 0);
+        let by_cursor = store
+            .rows(&page("t", 20, 20, "kick", Some(&hint), None))
+            .unwrap();
+        let by_offset = store.rows(&page("t", 20, 20, "kick", None, None)).unwrap();
+        assert_eq!(by_cursor.rowids, by_offset.rowids);
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// `G` reads the last page backwards from the end of the ordering. It must
+    /// hold the same rows as walking there with an offset — measured at 1 ms
+    /// against 9.6 s on a 6.5M-row filtered grid, so the two are never both run.
+    #[test]
+    fn the_last_page_read_backwards_matches_the_offset_route() {
+        let (path, store) = fixture("last", 250);
+        let total = store.count_exact("t", "").unwrap();
+        assert_eq!(total, 250);
+        // 250 rows in pages of 60 leaves a short final page, the case that gets
+        // the LIMIT wrong if `take` ignores the total.
+        let offset = ((total - 1) / 60) * 60;
+        let backwards = store
+            .rows(&page("t", 60, offset, "", None, Some(total)))
+            .unwrap();
+        let forwards = store.rows(&page("t", 60, offset, "", None, None)).unwrap();
+        assert_eq!(backwards.rowids, forwards.rowids, "last page differs");
+        assert_eq!(backwards.rows.len(), 10, "250 rows in 60s leaves 10");
+        assert!(backwards.total_exact);
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// A page reports what it can prove: a bound while more rows follow, the real
+    /// total once it has reached the end. Nothing here is allowed to cost a scan.
+    #[test]
+    fn a_page_reports_an_exact_total_only_when_it_has_seen_the_end() {
+        let (path, store) = fixture("totals", 30);
+        let mid = store.rows(&page("t", 10, 0, "", None, None)).unwrap();
+        assert!(!mid.total_exact, "rows follow, so the total is a bound");
+        assert_eq!(
+            mid.total, 11,
+            "the bound is what the extra probe row proves"
+        );
+
+        let end = store.rows(&page("t", 10, 20, "", None, None)).unwrap();
+        assert!(end.total_exact, "the page ended the table");
+        assert_eq!(end.total, 30);
+
+        // A counted total always wins over the bound.
+        let known = store.rows(&page("t", 10, 0, "", None, Some(30))).unwrap();
+        assert_eq!((known.total, known.total_exact), (30, true));
+        assert_eq!(known.rows.len(), 10, "the probe row is never displayed");
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// The parallel count is only useful if it agrees with the obvious one. The
+    /// table is wide enough in rowid span to be split, so this exercises the
+    /// range fan-out rather than the single-statement fallback.
+    #[test]
+    fn the_parallel_count_agrees_with_one_statement() {
+        let (path, store) = fixture("count", 2_000);
+        // Force the split: the fixture's span is far under the floor.
+        store
+            .conn
+            .execute("UPDATE t SET rowid = rowid + 5000000 WHERE n = 1999", [])
+            .unwrap();
+        store.cache.ranges.borrow_mut().clear();
+        assert!(
+            store.rowid_ranges("t").unwrap().is_some(),
+            "a span this wide must be split"
+        );
+        for filter in ["", "kick", "name:word", "kick nothing"] {
+            assert_eq!(
+                store.count_exact("t", filter).unwrap(),
+                store.count_filtered("t", filter).unwrap(),
+                "parallel and single-statement counts disagree for {filter:?}"
+            );
+        }
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// Every row must be counted exactly once, whatever the rowid gaps — an
+    /// off-by-one in the half-open ranges would double-count a boundary row.
+    #[test]
+    fn rowid_ranges_cover_every_row_exactly_once() {
+        let (path, store) = fixture("ranges", 400);
+        store
+            .conn
+            .execute("UPDATE t SET rowid = rowid * 100000", [])
+            .unwrap();
+        store.cache.ranges.borrow_mut().clear();
+        let ranges = store.rowid_ranges("t").unwrap().expect("wide span splits");
+        let mut seen = 0i64;
+        for &(lo, hi) in ranges.iter() {
+            assert!(lo < hi, "range ({lo}, {hi}] is empty or inverted");
+            seen += store
+                .conn
+                .query_row(
+                    "SELECT COUNT(*) FROM t WHERE rowid > ?1 AND rowid <= ?2",
+                    params![lo, hi],
+                    |r| r.get::<_, i64>(0),
+                )
+                .unwrap();
+        }
+        assert_eq!(seen, 400, "ranges must partition the table");
+        for pair in ranges.windows(2) {
+            assert_eq!(
+                pair[0].1, pair[1].0,
+                "ranges must not overlap or leave gaps"
+            );
+        }
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// A small table is counted by one statement: splitting it would cost more
+    /// than it saves.
+    #[test]
+    fn a_narrow_table_is_not_split() {
+        let (path, store) = fixture("small", 100);
+        assert!(store.rowid_ranges("t").unwrap().is_none());
+        assert_eq!(store.count_exact("t", "kick").unwrap(), 20);
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// A table whose virtual-table module is missing cannot be read by anyone, so
+    /// it is reported rather than left to fail when selected. This is Ableton's
+    /// `search_aggregation`, an FTS4 index built with a custom tokenizer.
+    #[test]
+    fn a_table_needing_a_missing_module_is_reported_unreadable() {
+        let (path, store) = fixture("module", 10);
+        drop(store);
+        // Writing the schema row directly is how such a table comes to exist for
+        // a binary that cannot create it: the module was present when it was made.
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "PRAGMA writable_schema = ON;
+             INSERT INTO sqlite_master (type, name, tbl_name, rootpage, sql)
+             VALUES ('table', 'weird', 'weird', 0,
+                     'CREATE VIRTUAL TABLE weird USING no_such_module(a)');
+             PRAGMA writable_schema = OFF;",
+        )
+        .unwrap();
+        drop(conn);
+        let store = SqliteStore::open(&path).unwrap();
+        assert!(
+            store.tables.iter().any(|t| t == "weird"),
+            "the table is listed: {:?}",
+            store.tables
+        );
+        let why = store
+            .unreadable_reason("weird")
+            .expect("a missing module must be reported");
+        assert!(why.contains("no such module"), "unexpected reason: {why}");
+        assert!(
+            store.unreadable_reason("t").is_none(),
+            "an ordinary table is readable"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// A search's ordinal decides which page it scrolls to, so the parallel path
+    /// has to agree with the plain count for both orderings.
+    #[test]
+    fn the_search_ordinal_is_the_rows_position_in_the_display_order() {
+        let (path, store) = fixture("ordinal", 2_000);
+        store
+            .conn
+            .execute("UPDATE t SET rowid = rowid + 5000000 WHERE n >= 1000", [])
+            .unwrap();
+        store.cache.ranges.borrow_mut().clear();
+        let view = store.rows(&page("t", 5, 0, "kick", None, None)).unwrap();
+        let third = view.rowids[2].unwrap();
+        assert_eq!(
+            store.rowid_ordinal("t", third, None, "kick").unwrap(),
+            3,
+            "the third listed match is at position 3"
+        );
+        let sort = Sort {
+            column: "n".into(),
+            desc: true,
+        };
+        let desc = store
+            .rows(&PageQuery {
+                sort: Some(&sort),
+                ..page("t", 5, 0, "kick", None, None)
+            })
+            .unwrap();
+        assert_eq!(
+            store
+                .rowid_ordinal("t", desc.rowids[0].unwrap(), Some(&sort), "kick")
+                .unwrap(),
+            1,
+            "the first row of a descending sort is at position 1"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// The schema cache must not outlive the schema, or an edit addresses a column
+    /// that has moved.
+    #[test]
+    fn invalidate_forgets_a_stale_column_list() {
+        let (path, mut store) = fixture("schema", 10);
+        assert_eq!(store.columns("t").unwrap(), vec!["name", "n"]);
+        store
+            .conn
+            .execute("ALTER TABLE t ADD COLUMN extra TEXT", [])
+            .unwrap();
+        assert_eq!(
+            store.columns("t").unwrap(),
+            vec!["name", "n"],
+            "the cache is what makes a page cheap, so it holds until told otherwise"
+        );
+        store.invalidate();
+        assert_eq!(store.columns("t").unwrap(), vec!["name", "n", "extra"]);
+        let _ = std::fs::remove_file(path);
+    }
 }

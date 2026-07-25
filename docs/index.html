@@ -92,7 +92,7 @@
             <span class="sep">/</span>
             <a href="https://github.com/MenkeTechnologies/zdbview/issues" target="_blank" rel="noopener noreferrer">Issues</a>
           </nav>
-          <p class="docs-build-line" id="zdbviewBuildLine">zdbview v0.9.0 · startup scan for shards and databases · ratatui + crossterm TUI · generic SQLite CRUD by rowid or primary key · any cell editable as bytes · 10 recognized rkyv cache formats with structural fallback · full rkyv CRUD write-back (atomic, byte-identical re-serialization) · whole-table search with per-column filters · the sqlite3 shell's dot-commands and output modes · <code>.dbinfo</code>/<code>.intck</code>/<code>.lint</code>/<code>.expert</code> reports · off-thread column statistics and frequency · foreign-key navigation · CSV import · <code>VACUUM INTO</code> backup · page-level <code>.recover</code> · live per-table write attribution and a WAL history walker · OSC 52 clipboard</p>
+          <p class="docs-build-line" id="zdbviewBuildLine">zdbview v0.9.0 · startup scan for shards and databases · ratatui + crossterm TUI · generic SQLite CRUD by rowid or primary key · any cell editable as bytes · 10 recognized rkyv cache formats with structural fallback · full rkyv CRUD write-back (atomic, byte-identical re-serialization) · whole-table search with per-column filters · the sqlite3 shell's dot-commands and output modes · <code>.dbinfo</code>/<code>.intck</code>/<code>.lint</code>/<code>.expert</code> reports · off-thread paging, counting and search with per-core row counts · off-thread column statistics and frequency · foreign-key navigation · CSV import · <code>VACUUM INTO</code> backup · page-level <code>.recover</code> · live per-table write attribution and a WAL history walker · OSC 52 clipboard</p>
         </div>
         <div class="tutorial-toolbar">
           <button type="button" class="btn btn-secondary" id="btnTheme" title="Toggle light/dark">Theme</button>
@@ -169,6 +169,23 @@ zdbview</pre>
           </tbody>
         </table>
         <p class="doc-note">Identifiers are double-quoted with internal quotes doubled, so table and column names containing spaces or keywords work. A <code>WITHOUT ROWID</code> table has no generic row handle, so its rows are listed read-only. Values display by type: integers and reals verbatim, text as UTF-8, <code>NULL</code> as <code>NULL</code>, blobs as <code>&lt;blob N bytes&gt;</code>.</p>
+      </section>
+
+      <section class="tutorial-section">
+        <h2>Large databases</h2>
+        <p>Nothing the grid does waits on a scan of the whole table. Measured on a 23 GB SQLite file with a 300 MB WAL, 6.5M rows in the table being browsed and a filter matching 270k of them — development build on both sides, so the ratios are what to read:</p>
+        <table class="doc-table">
+          <thead><tr><th>Operation</th><th>Before</th><th>Now</th></tr></thead>
+          <tbody>
+            <tr><td>Open, first page drawn</td><td>—</td><td>4 ms</td></tr>
+            <tr><td>First page under a filter</td><td>4.16 s</td><td>28 ms</td></tr>
+            <tr><td>Step to the next / previous page</td><td>grows with the page number</td><td>21 / 36 ms</td></tr>
+            <tr><td>Last page (<code>G</code>)</td><td>9.6 s</td><td>1 ms</td></tr>
+            <tr><td>Exact row count behind a filter</td><td>9.2 s, blocking</td><td>1.6 s, in the background</td></tr>
+          </tbody>
+        </table>
+        <p>Pages, exact counts and <code>n</code>/<code>N</code> searches each run on a worker with its own read-only connection, so a scan cannot block the display — and browsing a database another process is writing can never make zdbview checkpoint its WAL. Every request carries a generation, and each connection runs a progress handler that abandons its statement once that generation is stale, so typing a filter costs one query rather than one per keystroke.</p>
+        <p>The total is never scanned for: a page fetches one row more than it shows, which is all that is needed to know whether another page exists, and the title reads <code>501+</code> until the background count lands. Paging steps by cursor rather than by offset — <code>LIMIT n OFFSET k</code> makes SQLite walk and discard <em>k</em> matching rows, 6.2 s at offset 269000 against 26 ms at the start — and the last page is read backwards from the end. The exact count is taken on every core by cutting the table into rowid ranges; the cuts are arithmetic, because finding balanced ones means walking the whole index, which cost 5.8 s of cold reads on that file.</p>
       </section>
 
       <section class="tutorial-section">

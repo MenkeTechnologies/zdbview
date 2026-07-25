@@ -30,7 +30,7 @@ disasm = ["dep:fusevm", "dep:bincode"]
 [dependencies]
 ratatui = "0.30"
 crossterm = "0.29"
-rusqlite = { version = "0.40", features = ["bundled"] }
+rusqlite = { version = "0.40", features = ["bundled", "hooks"] }
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 # Pinned to match the rkyv version + features zshrs serializes its shards with,

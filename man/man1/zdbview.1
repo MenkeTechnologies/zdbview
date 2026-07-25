@@ -201,7 +201,9 @@ to open it, zdbview falls back to the binary inspector instead of failing.
 .SH SQLITE MODE
 The left pane lists tables and views from
 .BR sqlite_master ;
-the right pane shows one page of 500 rows for the selected table.
+the right pane shows one page of 500 rows for the selected table. A table whose
+virtual-table module this binary does not have \(em an FTS index built with a custom
+tokenizer, say \(em is marked in the list rather than left to fail when selected.
 .PP
 Rows are addressed by
 .BR rowid ,
@@ -744,16 +746,21 @@ home directory, as in
 .IR ~/.zshrs/scripts.rkyv " and " ~/.zshrs/compsys.db
 \(em followed by
 .BR $XDG_CACHE_HOME , $XDG_DATA_HOME ,
-the working directory, and the files directly in
-.BR $HOME .
+the working directory, the files directly in
+.BR $HOME ,
+and finally
+.IR "~/Library/Application Support" ,
+where a macOS application keeps its databases. That root is walked last because
+it is by far the largest, so the cheaper roots are never starved by it.
 Version-control, package-manager and toolchain caches, Chromium profile stores,
-and
+and the rest of
 .I ~/Library
 are skipped; pass
 .B \-\-scan
-to look there anyway. The walk descends at most five levels and stops after
-60000 directory entries, 500 hits or 20 seconds, whichever comes first, and is
-cancelled as soon as a file is chosen.
+to look there anyway. The walk descends at most five levels and stops after 20
+seconds, with a one-million-entry backstop for a pathological tree, and is
+cancelled as soon as a file is chosen. The number of hits is not capped \(em a
+cap there would cut the walk mid-root and lose every root after it.
 .PP
 A file is offered only when its contents say so: the SQLite header magic, a known
 rkyv shard magic, or a
@@ -850,6 +857,42 @@ sidecar is sampled with the database and its growth counted as the database's, s
 a busy database does not appear idle, and a checkpoint moving bytes from the log
 into the file is not counted twice. A rkyv shard rewritten by rename may shrink;
 that counts as activity but adds no bytes to the total.
+.SH LARGE DATABASES
+Nothing the row grid does waits on a scan of the whole table. Measured on a 23\ GB
+SQLite file with a 300\ MB WAL, 6.5M rows in the table being browsed and a filter
+matching 270k of them: the first page is drawn in 4\ ms, the first page under that
+filter in 28\ ms, a step to the next page in 21\ ms, and the last page in 1\ ms.
+The exact row count behind the filter takes 1.6\ s and runs in the background,
+against 9.2\ s blocking before. Every figure here is the development build, before
+and after alike, so the ratios are what to read.
+.PP
+A page, an exact count and an
+.BR n / N
+search each run on a thread of their own with a read-only connection, so a scan
+cannot block the display \(em and browsing a database another process is writing
+can never make zdbview checkpoint its WAL. Every request carries a generation and
+each connection runs a progress handler that abandons its statement once that
+generation is stale, so typing a filter costs one query rather than one per
+keystroke.
+.PP
+The total in the grid title is not scanned for. A page fetches one row more than it
+shows, which is all that is needed to know whether another page exists; until an
+exact total arrives the title reads
+.BR 501+ ,
+and
+.B G
+asks for the count and jumps when it lands rather than freezing, since only an exact
+total says which page the last one is. That count is taken on every core: the table
+is cut into rowid ranges and each is counted on its own connection.
+.PP
+Paging steps by cursor.
+.B LIMIT n OFFSET k
+makes SQLite walk and discard
+.I k
+matching rows, so on a filtered grid a page costs more the further in it is \(em
+6.2\ s at offset 269000 against 26\ ms at the start. Stepping to the neighbouring
+page asks for the rows after (or before) a known one, which is one index seek at any
+page number, and the last page is read backwards from the end of the ordering.
 .SH LARGE ARCHIVES
 Validating a large rkyv archive is slow \(em a 382\ MB heap image takes about
 twenty-five seconds \(em so anything over 4\ MB is decoded on a background

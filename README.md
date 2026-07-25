@@ -109,10 +109,17 @@ roots neither read nor write the cache since they are not the default set.
 **Where it looks** — the producers keep their stores in their own home directory
 (`~/.zshrs/scripts.rkyv`, `~/.zshrs/compsys.db`, `~/.pythonrs/scripts.rkyv`), so
 the default roots are the dot-directories of `$HOME` (most-recently-touched
-first), the XDG cache and data directories, the working directory, and `$HOME`'s
-own files. `~/Library`, VCS and package-manager caches, and Chromium profile
-stores are skipped — that is what keeps the list about your data. The walk is
-bounded (5 levels, 60k entries, 500 hits, 20 s) and stops as soon as you pick.
+first), the XDG cache and data directories, the working directory, `$HOME`'s own
+files, and finally `~/Library/Application Support` — where a macOS application
+keeps its databases (Ableton's `Live Database`, a browser profile, a plugin
+index). That last root is walked last because it is the largest, so the cheap
+roots are never starved by it. The rest of `~/Library`, VCS and package-manager
+caches, and Chromium profile stores are skipped — that is what keeps the list
+about your data; reach the rest with `--scan`. The walk is bounded by depth (5
+levels) and by a 20 s clock, with a 1M-entry backstop for a pathological tree,
+and stops as soon as you pick. Finding a file is never a reason to stop: the
+number of hits is not capped, since a cap there would cut the walk mid-root and
+lose every root after it.
 
 **What counts as a hit** — the SQLite header magic, or one of the rkyv shard
 magics, or a `.rkyv` name (the header-less hash-keyed shards carry no magic).
@@ -156,6 +163,60 @@ matched as text).
 Identifiers are double-quoted with internal quotes doubled, and edited values are
 bound as parameters, so schemas with spaces, keywords or quotes in their names
 work unmodified.
+
+A table whose virtual-table module this binary does not have is marked ` ⃰` in the
+list rather than left to fail when selected — an FTS index built with a custom
+tokenizer, for instance, cannot be read by any other program either.
+
+## Large databases
+
+Nothing the grid does waits on a scan of the whole table. Measured on Ableton's
+`Live-files` index — 23 GB, a 300 MB WAL, 6.5M rows in `files` and 88.8M in
+`ancestors`:
+
+| | before | now |
+|---|---|---|
+| open, first page drawn | — | **4 ms** |
+| first page under a filter | 4.16 s | **28 ms** |
+| step to the next / previous page | grows with the page number | **21 / 36 ms** |
+| last page (`G`) | 9.6 s | **1 ms** |
+| exact row count behind a filter | 9.2 s, blocking | **1.6 s**, in the background |
+
+Both columns are the development build on the same file, so the ratios are what to
+read; a release build is faster on both sides.
+
+Four things get it there.
+
+**Queries run on their own threads.** A page, an exact count and an `n`/`N` search
+each have a worker with its own read-only connection, so a scan the user cannot see
+never blocks the render thread. Read-only also means browsing a database another
+process is writing cannot make zdbview checkpoint its WAL.
+
+**Nothing is cancelled by waiting for it.** Every request carries a generation, and
+each connection runs a progress handler that abandons its statement as soon as its
+generation is stale. Typing a filter therefore costs one query, not one per key —
+no debounce interval to guess at.
+
+**Totals are never scanned for.** The count a page needs is "is there another
+page", which one extra row answers for free. Until an exact total arrives the title
+says `501+`; the exact figure is counted in the background and fills in. `G` waits
+for that count instead of freezing, since only an exact total says which page the
+last one is.
+
+**Paging steps by cursor, not by offset.** `LIMIT n OFFSET k` makes SQLite walk and
+discard `k` matching rows, so on a filtered grid the cost of a page grows with how
+far in it is — the first page of that 270k-match filter took 26 ms and
+`OFFSET 269000` took 6.2 s. A step to the neighbouring page asks for the rows after
+(or before) a known one instead, which is one index seek whatever the page number,
+and the last page is read backwards from the end.
+
+**The exact count uses every core.** One SQLite statement runs on one thread, so
+the table is cut into rowid ranges and each is counted on its own connection —
+6.1× faster than one statement on that 6.5M-row filter. The cuts are arithmetic:
+finding balanced ones means walking the whole index, which cost 5.8 s of cold reads
+on that file, more than the count it was meant to speed up. Since rowids are unique
+integers, cutting far finer than the worker count and taking ranges one at a time
+balances the work without reading anything.
 
 ## rkyv — auto-detected key/value CRUD + structural inspection
 
@@ -567,6 +628,11 @@ that decides which page to jump to counts only listed rows. Without that, a sear
 under an active filter lands on a hidden row and scrolls to the page it would have
 been on unfiltered.
 
+Both halves of that are full scans in the worst case — finding the match, then
+counting to it — so a grid search runs on a query thread and the title says
+`· searching` while it does. The ordinal is counted on every core, the same way the
+total is.
+
 ## Filtering
 
 `/` **filters** the current list as you type, the same model as `iftoprs`: only
@@ -582,8 +648,11 @@ text cursor.
 
 For SQLite the filter is a SQL `WHERE` across every column, so it covers the
 **whole table** — the row count and paging follow the filter, not just the loaded
-page. A term of the form `col:value` restricts that term to one column — DB
-Browser's filter row — and terms are ANDed:
+page. Such a filter cannot use an index, so it is a full scan by construction; what
+keeps it interactive is that the page is fetched without one and the count that does
+need one runs in the background (see [Large databases](#large-databases)). A term of
+the form `col:value` restricts that term to one column — DB Browser's filter row —
+and terms are ANDed:
 
 | Typed | Keeps |
 |-------|-------|

@@ -26,6 +26,10 @@ use crate::theme::{Theme, ThemeName};
 
 /// How many rows per SQLite page.
 const PAGE: i64 = 500;
+/// How long a page fetch may hold the render thread before it is left to finish
+/// in the background. Long enough that a page which is already fast arrives
+/// before the frame is drawn, short enough to be under one frame either way.
+const PAGE_GRACE: std::time::Duration = std::time::Duration::from_millis(30);
 /// Minimum length for an extracted rkyv string run.
 const MIN_STRING: usize = 4;
 /// How many values a column's frequency table shows.
@@ -382,6 +386,24 @@ pub struct App {
     /// Themed overlays (help / scheme chooser / palette editor / toast),
     /// shared with the recent-files picker.
     ov: Overlays,
+
+    /// Off-thread page and count queries, for a SQLite store. `None` for rkyv,
+    /// which holds its whole archive in memory and needs no query at all.
+    engine: Option<crate::query::Engine>,
+    /// Generation of the page request the grid is waiting for. A result tagged
+    /// with anything older describes a table, filter or page that has since been
+    /// replaced.
+    page_generation: u64,
+    /// `G` was pressed before the exact total was known, so the jump to the last
+    /// page is owed as soon as the count lands.
+    pending_bottom: bool,
+    /// Offset of the page actually loaded, which lags `page_offset` while a fetch
+    /// is in flight. Paging by cursor needs to know which page the rows on screen
+    /// are.
+    loaded_offset: i64,
+    /// `(table, filter, rows)` from the last exact count, kept while it still
+    /// describes the grid so the scan is not repeated for every page.
+    exact_total: Option<(String, String, i64)>,
 }
 
 impl App {
@@ -452,7 +474,17 @@ impl App {
             decoding: None,
             page_rows: 10,
             ov: Overlays::new(theme),
+            engine: None,
+            page_generation: 0,
+            pending_bottom: false,
+            loaded_offset: 0,
+            exact_total: None,
         };
+        // The grid's queries run on their own connections, so a scan the user
+        // cannot see never blocks the render thread.
+        if let Store::Sqlite(s) = &app.store {
+            app.engine = Some(crate::query::Engine::new(&s.path));
+        }
         app.init();
         app
     }
@@ -559,6 +591,7 @@ impl App {
         while !self.quit {
             self.poll_decode();
             self.poll_stats();
+            self.poll_query();
             if let Some(w) = self.top.as_mut() {
                 w.tick();
             }
@@ -948,14 +981,21 @@ impl App {
             Some(t) => t,
             None => return,
         };
-        let total = self.rows.as_ref().map(|r| r.total).unwrap_or(0);
-        let view = match self.sqlite().unwrap().rows(
-            &table,
-            total.max(1),
-            0,
-            self.sort.as_ref(),
-            &self.filter,
-        ) {
+        // Whatever the grid is showing, in the order and under the filter it is
+        // showing it: the counted total when there is one, else the page's bound.
+        let total = self
+            .known_total()
+            .or_else(|| self.rows.as_ref().map(|r| r.total))
+            .unwrap_or(0);
+        let view = match self.sqlite().unwrap().rows(&crate::sqlite::PageQuery {
+            table: &table,
+            limit: total.max(1),
+            offset: 0,
+            sort: self.sort.as_ref(),
+            filter: &self.filter,
+            hint: None,
+            known_total: None,
+        }) {
             Ok(v) => v,
             Err(e) => {
                 self.notify(format!("export failed: {}", e));
@@ -1822,22 +1862,153 @@ impl App {
         self.notify(format!("sorted by {} {}", columns[next], dir));
     }
 
+    /// Ask for the page the current position describes. Returns immediately; the
+    /// rows arrive through [`Self::poll_query`].
     fn load_table(&mut self) {
-        let (table, res) = match (self.current_table(), self.sqlite()) {
-            (Some(t), Some(s)) => {
-                let r = s.rows(&t, PAGE, self.page_offset, self.sort.as_ref(), &self.filter);
-                (t, r)
-            }
-            _ => return,
+        let Some(table) = self.current_table() else {
+            return;
         };
-        match res {
+        // The page on screen is what lets the fetch step by cursor instead of by
+        // offset — the difference between one index seek and re-walking every
+        // matching row that comes before this page. Its offset is
+        // `loaded_offset`, not `page_offset`: callers move `page_offset` to the
+        // page they want before asking for it.
+        let loaded_offset = self.loaded_offset;
+        let hint = self.rows.as_ref().and_then(|r| {
+            Some(crate::sqlite::PageHint {
+                offset: loaded_offset,
+                first: r.rowids.first().copied().flatten()?,
+                last: r.rowids.last().copied().flatten()?,
+                len: r.rows.len() as i64,
+            })
+        });
+        let page = crate::query::PageReq {
+            table: table.clone(),
+            limit: PAGE,
+            offset: self.page_offset,
+            sort: self.sort.clone(),
+            filter: self.filter.clone(),
+            hint,
+            known_total: self.known_total(),
+        };
+        // The exact total is only worth a scan once per table+filter; while it
+        // still describes the grid it is kept.
+        let count = match self.exact_total {
+            Some((ref t, ref f, _)) if *t == table && *f == self.filter => None,
+            _ => Some(crate::query::CountReq {
+                table,
+                filter: self.filter.clone(),
+            }),
+        };
+        if let Some(engine) = self.engine.as_mut() {
+            self.page_generation = engine.request(page, count);
+            // A cheap page — the common case now that the count is bounded and
+            // paging uses a cursor — arrives inside this grace period, so the
+            // grid is drawn once with its rows instead of blank and then filled.
+            if let Some(done) = engine.wait_page(PAGE_GRACE) {
+                self.install_page(done);
+            }
+        }
+    }
+
+    /// Put a finished page on screen.
+    fn install_page(&mut self, done: crate::query::PageDone) {
+        match done.result {
             Ok(v) => {
+                self.loaded_offset = self.page_offset;
                 self.rows = Some(v);
-                if self.row_idx >= self.rows.as_ref().map(|r| r.rows.len()).unwrap_or(0) {
-                    self.row_idx = 0;
+                let loaded = self.rows.as_ref().map(|r| r.rows.len()).unwrap_or(0);
+                if self.row_idx >= loaded {
+                    self.row_idx = loaded.saturating_sub(1);
+                }
+                // A total already counted for this table and filter is better
+                // than the page's bound.
+                if let (Some(n), Some(rows)) = (self.known_total(), self.rows.as_mut()) {
+                    rows.total = n;
+                    rows.total_exact = true;
                 }
             }
-            Err(e) => self.status = format!("load {}: {}", table, e),
+            // A cancelled query is the normal case while typing, and the
+            // generation check already dropped its result; what reaches here is a
+            // real failure.
+            Err(e) => self.status = format!("load: {e}"),
+        }
+    }
+
+    /// Install whatever the query threads have finished.
+    fn poll_query(&mut self) {
+        let Some(engine) = self.engine.as_mut() else {
+            return;
+        };
+        let page = engine.poll_page();
+        let count = engine.poll_count();
+        let found = engine.poll_search();
+        if let Some(done) = page {
+            self.install_page(done);
+        }
+        if let Some(done) = found {
+            self.install_search(done);
+        }
+        if let Some(done) = count {
+            if let Ok(n) = done.result {
+                self.exact_total = Some((done.table.clone(), done.filter.clone(), n));
+                // The count is what `G` was waiting for.
+                if self.pending_bottom {
+                    self.pending_bottom = false;
+                    self.goto_bottom_at(n);
+                }
+                if let Some(rows) = self.rows.as_mut() {
+                    rows.total = n;
+                    rows.total_exact = true;
+                }
+            }
+        }
+    }
+
+    /// The database changed shape, so every cached fact about it is suspect —
+    /// including the ones held by the query threads on their own connections,
+    /// which is why they are replaced rather than notified.
+    fn schema_changed(&mut self) {
+        let path = match &mut self.store {
+            Store::Sqlite(s) => {
+                s.invalidate();
+                Some(s.path.clone())
+            }
+            Store::Rkyv(_) => None,
+        };
+        if let Some(path) = path {
+            self.engine = Some(crate::query::Engine::new(&path));
+        }
+        self.exact_total = None;
+    }
+
+    /// Rows were added or removed, so a counted total no longer holds.
+    fn rows_changed(&mut self) {
+        self.exact_total = None;
+    }
+
+    /// An exact count is still running, so the total on screen is a lower bound.
+    fn counting(&self) -> bool {
+        self.engine.as_ref().is_some_and(|e| e.count_inflight())
+    }
+
+    /// A page fetch is still running, so the rows on screen are the previous
+    /// page.
+    fn loading(&self) -> bool {
+        self.engine.as_ref().is_some_and(|e| e.page_inflight())
+    }
+
+    /// A whole-table search is still scanning.
+    fn searching(&self) -> bool {
+        self.engine.as_ref().is_some_and(|e| e.searching())
+    }
+
+    /// The exact total for the table and filter on screen, if it has arrived.
+    fn known_total(&self) -> Option<i64> {
+        let table = self.current_table()?;
+        match &self.exact_total {
+            Some((t, f, n)) if *t == table && *f == self.filter => Some(*n),
+            _ => None,
         }
     }
 
@@ -2139,6 +2310,7 @@ impl App {
         match self.sqlite().unwrap().insert_blank(&table) {
             Ok(()) => {
                 self.notify(format!("inserted default row into {}", table));
+                self.rows_changed();
                 self.load_table();
             }
             Err(e) => self.status = format!("insert failed: {}", e),
@@ -2167,6 +2339,7 @@ impl App {
             Ok(_) => {
                 self.notify(format!("deleted {what} from {table}"));
                 self.row_idx = self.row_idx.saturating_sub(1);
+                self.rows_changed();
                 self.load_table();
             }
             Err(e) => self.status = format!("delete failed: {}", e),
@@ -2196,16 +2369,35 @@ impl App {
                     self.select_table(n - 1);
                 }
             }
-            Focus::Right => {
-                let total = self.rows.as_ref().map(|r| r.total).unwrap_or(0);
-                if total > 0 {
-                    self.page_offset = ((total - 1) / PAGE) * PAGE;
-                    self.load_table();
-                    let last = self.rows.as_ref().map(|r| r.rows.len()).unwrap_or(0);
-                    self.row_idx = last.saturating_sub(1);
+            Focus::Right => match self.known_total() {
+                Some(total) => self.goto_bottom_at(total),
+                // Only an exact count says which page the last one is, and that
+                // is a full scan on a filtered grid. Ask for it and jump when it
+                // lands, rather than freezing here.
+                None => {
+                    self.pending_bottom = true;
+                    if let (Some(table), Some(engine)) =
+                        (self.current_table(), self.engine.as_mut())
+                    {
+                        engine.request_count(crate::query::CountReq {
+                            table,
+                            filter: self.filter.clone(),
+                        });
+                    }
+                    self.status = "counting rows for the last page…".into();
                 }
-            }
+            },
         }
+    }
+
+    /// Jump to the last page of a grid known to hold `total` rows.
+    fn goto_bottom_at(&mut self, total: i64) {
+        if total <= 0 {
+            return;
+        }
+        self.page_offset = ((total - 1) / PAGE) * PAGE;
+        self.row_idx = ((total - 1) % PAGE) as usize;
+        self.load_table();
     }
 
     // ----- rkyv navigation --------------------------------------------------
@@ -2284,46 +2476,39 @@ impl App {
             (Some(t), Some(c)) => (t, c),
             _ => return,
         };
-        let outcome: Result<Option<(i64, i64)>, String> = {
-            let sort = self.sort.clone();
-            let s = self.sqlite().unwrap();
+        // A search scans until it matches and then counts to find out which page
+        // that is, so on a large table it is two full scans in the worst case —
+        // both on the query thread, from where it cannot freeze the grid.
+        let req = crate::query::SearchReq {
+            table,
+            columns,
+            term: self.search.clone(),
+            sort: self.sort.clone(),
+            filter: self.filter.clone(),
             // From the selected row, else from the edge the scan comes in from.
-            let query = crate::sqlite::RowQuery {
-                table: &table,
-                columns: &columns,
-                term: &self.search,
-                sort: sort.as_ref(),
-                filter: &self.filter,
-            };
-            let first = match self.current_rowid() {
-                Some(from) => s.find_row(&query, from, forward),
-                None => s.find_row_edge(&query, forward),
-            };
-            let rid = match first {
-                Err(e) => Err(e.to_string()),
-                Ok(Some(r)) => Ok(Some(r)),
-                // Nothing ahead: wrap to the first/last match in display order.
-                Ok(None) => s.find_row_edge(&query, forward).map_err(|e| e.to_string()),
-            };
-            match rid {
-                Err(e) => Err(e),
-                Ok(None) => Ok(None),
-                Ok(Some(r)) => Ok(Some((
-                    r,
-                    s.rowid_ordinal(&table, r, sort.as_ref(), &self.filter)
-                        .unwrap_or(1),
-                ))),
-            }
+            from: self.current_rowid(),
+            forward,
         };
+        let Some(engine) = self.engine.as_mut() else {
+            return;
+        };
+        engine.request_search(req);
+        self.status = format!("searching for {}…", self.search);
+    }
 
-        match outcome {
-            Ok(Some((_rid, ord))) => {
-                let idx0 = (ord - 1).max(0);
+    /// Move to what a finished search found.
+    fn install_search(&mut self, done: crate::query::SearchDone) {
+        match done.result {
+            Ok(Some((_rowid, ordinal))) => {
+                let idx0 = (ordinal - 1).max(0);
                 self.page_offset = (idx0 / PAGE) * PAGE;
                 self.load_table();
                 self.row_idx = (idx0 - self.page_offset) as usize;
-                let total = self.rows.as_ref().map(|r| r.total).unwrap_or(0);
-                self.notify(format!("/{}  (row {} of {})", self.search, ord, total));
+                let total = self
+                    .known_total()
+                    .or_else(|| self.rows.as_ref().map(|r| r.total))
+                    .unwrap_or(0);
+                self.notify(format!("/{}  (row {} of {})", self.search, ordinal, total));
             }
             Ok(None) => self.status = format!("not found: {}", self.search),
             Err(e) => self.status = format!("search error: {}", e),
@@ -3105,6 +3290,9 @@ impl App {
                 }
             }
             Ok(Outcome::Changed(n)) => {
+                // The statement may have been DDL, so the cached column lists and
+                // row counts no longer describe the database.
+                self.schema_changed();
                 // A write may have changed what the grid is showing.
                 self.load_table();
                 Entry::Changed(n)
@@ -3572,9 +3760,18 @@ impl App {
             .filter(|(_, t)| filter_passes(&self.filter, t))
             .map(|(i, _)| i)
             .collect();
+        // A table whose virtual-table module this binary does not have — an FTS
+        // index built with a custom tokenizer, say — cannot be read by anyone, so
+        // it is marked rather than left to fail on selection.
         let items: Vec<ListItem> = visible
             .iter()
-            .map(|&i| ListItem::new(s.tables[i].clone()))
+            .map(|&i| {
+                let name = &s.tables[i];
+                ListItem::new(match s.unreadable_reason(name) {
+                    Some(_) => format!("{name}  ⃰"),
+                    None => name.clone(),
+                })
+            })
             .collect();
         let mut lstate = ListState::default();
         lstate.select(
@@ -3612,18 +3809,37 @@ impl App {
         // Right: row grid.
         let title = match self.current_table() {
             Some(t) => {
-                let total = self.rows.as_ref().map(|r| r.total).unwrap_or(0);
+                let (total, exact) = self
+                    .rows
+                    .as_ref()
+                    .map(|r| (r.total, r.total_exact))
+                    .unwrap_or((0, true));
                 let sorted = match &self.sort {
                     Some(s) => format!(" — sorted {} {}", s.column, arrow(s.desc)),
                     None => String::new(),
                 };
+                // `500+` rather than a wrong number: counting the rest is a full
+                // scan, so it runs in the background and the title firms up when
+                // it lands. The trailing `…` says that scan is still running.
+                let of = match (exact, self.counting()) {
+                    (true, _) => total.to_string(),
+                    (false, true) => format!("{total}+ …"),
+                    (false, false) => format!("{total}+"),
+                };
+                // Work that outran its grace period is still coming.
+                let loading = match (self.loading(), self.searching()) {
+                    (_, true) => " · searching",
+                    (true, false) => " · loading",
+                    (false, false) => "",
+                };
                 format!(
-                    " {} — rows {}..{} of {}{} ",
+                    " {} — rows {}..{} of {}{}{} ",
                     t,
                     self.page_offset,
                     self.page_offset + self.rows.as_ref().map(|r| r.rows.len() as i64).unwrap_or(0),
-                    total,
-                    sorted
+                    of,
+                    sorted,
+                    loading
                 )
             }
             None => " (no table) ".into(),
@@ -5041,6 +5257,23 @@ mod tests {
         app.on_key(KeyEvent::from(KeyCode::Char(c)));
     }
 
+    /// Wait for the query threads to go idle, the way the event loop does on its
+    /// tick. Pages, counts and searches all arrive this way.
+    fn await_queries(app: &mut App) {
+        for _ in 0..5000 {
+            app.poll_query();
+            let busy = app
+                .engine
+                .as_ref()
+                .is_some_and(|e| e.page_inflight() || e.count_inflight() || e.searching());
+            if !busy {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        panic!("a query never finished");
+    }
+
     /// Wait for a background statistics pass, the way the event loop does.
     fn await_stats(app: &mut App) {
         for _ in 0..2000 {
@@ -5226,8 +5459,12 @@ mod tests {
             Store::Sqlite(SqliteStore::open(&path).unwrap()),
             Theme::from_name(ThemeName::NeonSprawl),
         );
+        // The monitor watches every file zdbview knows of, which on a real machine
+        // means whatever else is writing right now — this test is about the panes,
+        // so it watches only the database it just wrote.
         press(&mut app, 'w'); // the write monitor
         assert_eq!(app.screen, super::Screen::Top);
+        app.top = Some(crate::monitor::Monitor::new([(path.clone(), Kind::Sqlite)]));
         // Sample twice so the second tick has frames to attribute.
         if let Some(m) = app.top.as_mut() {
             m.watcher.interval = std::time::Duration::from_millis(0);
@@ -5405,7 +5642,7 @@ mod tests {
             "the value pane must show what was just written"
         );
         let store = SqliteStore::open(&path).unwrap();
-        let view = store.rows("t", 10, 0, None, "").unwrap();
+        let view = store.rows(&crate::sqlite::PageQuery::all("t", 10)).unwrap();
         assert_eq!(view.rows[0], vec!["one".to_string(), "TWO".to_string()]);
         let _ = std::fs::remove_file(path);
     }
@@ -5566,6 +5803,81 @@ mod tests {
             "keep_a",
             "and wraps inside the filtered list"
         );
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// `n` in the row grid scans the whole table and then counts to find out which
+    /// page the match is on — two full scans on a large table, so it runs on the
+    /// query thread and lands through the poll. Pressing it must still scroll to
+    /// the match and select it.
+    #[test]
+    fn n_scrolls_the_grid_to_a_match_on_another_page() {
+        let path = scratch("db");
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch("CREATE TABLE t (v TEXT)").unwrap();
+        {
+            let tx = conn.unchecked_transaction().unwrap();
+            let mut stmt = tx.prepare("INSERT INTO t (v) VALUES (?1)").unwrap();
+            // One needle, well past the first page of 500.
+            for i in 0..1200 {
+                stmt.execute(rusqlite::params![if i == 900 {
+                    "needle".to_string()
+                } else {
+                    format!("hay-{i}")
+                }])
+                .unwrap();
+            }
+            drop(stmt);
+            tx.commit().unwrap();
+        }
+        drop(conn);
+        let mut app = App::with_theme(
+            Store::Sqlite(SqliteStore::open(&path).unwrap()),
+            Theme::from_name(ThemeName::NeonSprawl),
+        );
+        app.on_key(KeyEvent::from(KeyCode::Tab)); // focus the row grid
+        await_queries(&mut app);
+        assert_eq!(app.page_offset, 0, "starts on the first page");
+
+        app.search = "needle".into();
+        app.search_next(true);
+        await_queries(&mut app);
+
+        // The needle is the 901st row, so it sits 400 rows into the page at 500.
+        assert_eq!(app.page_offset, 500, "the grid moved to the match's page");
+        assert_eq!(app.row_idx, 400, "and selected the match");
+        let row = &app.rows.as_ref().unwrap().rows[app.row_idx];
+        assert_eq!(row[0], "needle", "the selected row is the match");
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// A filter re-queries on every keystroke, so an intermediate result must
+    /// never be what ends up on screen.
+    #[test]
+    fn typing_a_filter_leaves_the_grid_showing_the_final_pattern() {
+        let path = scratch("db");
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE t (v TEXT);
+             INSERT INTO t VALUES ('alpha'), ('alpine'), ('beta'), ('gamma');",
+        )
+        .unwrap();
+        drop(conn);
+        let mut app = App::with_theme(
+            Store::Sqlite(SqliteStore::open(&path).unwrap()),
+            Theme::from_name(ThemeName::NeonSprawl),
+        );
+        app.on_key(KeyEvent::from(KeyCode::Tab));
+        await_queries(&mut app);
+
+        // Type `alpi` one key at a time, as the prompt does.
+        for pattern in ["a", "al", "alp", "alpi"] {
+            app.set_filter(pattern.to_string());
+        }
+        await_queries(&mut app);
+        let rows = &app.rows.as_ref().unwrap().rows;
+        assert_eq!(rows.len(), 1, "only `alpine` matches `alpi`: {rows:?}");
+        assert_eq!(rows[0][0], "alpine");
         let _ = std::fs::remove_file(path);
     }
 

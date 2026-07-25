@@ -23,6 +23,7 @@ mod monitor;
 mod mru;
 mod overlay;
 mod prefs;
+mod query;
 mod recover;
 mod rkyv_inspect;
 mod scan;
@@ -475,7 +476,7 @@ fn export_store(store: &Store, fmt: &str, only: Option<&str>) -> Result<String> 
             };
             let page = |t: &str| -> Result<crate::sqlite::RowsView> {
                 let total = s.count(t)?;
-                s.rows(t, total.max(1), 0, None, "")
+                s.rows(&crate::sqlite::PageQuery::all(t, total.max(1)))
             };
             match fmt {
                 "csv" => {

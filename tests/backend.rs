@@ -44,6 +44,26 @@ use rkyv_inspect::RkyvStore;
 use sqlite::{Sort, SqliteStore};
 use store::{detect, Kind};
 
+/// A page request over `table`: the shape every row fetch below wants, with no
+/// cursor hint and no counted total.
+fn pq<'a>(
+    table: &'a str,
+    limit: i64,
+    offset: i64,
+    sort: Option<&'a Sort>,
+    filter: &'a str,
+) -> sqlite::PageQuery<'a> {
+    sqlite::PageQuery {
+        table,
+        limit,
+        offset,
+        sort,
+        filter,
+        hint: None,
+        known_total: None,
+    }
+}
+
 fn tmp(name: &str) -> std::path::PathBuf {
     let mut p = std::env::temp_dir();
     p.push(format!("zdbview_test_{}_{}", std::process::id(), name));
@@ -70,7 +90,7 @@ fn sqlite_full_crud_roundtrip() {
     assert_eq!(store.count("items").unwrap(), 2);
     assert_eq!(store.columns("items").unwrap(), vec!["name", "qty"]);
 
-    let view = store.rows("items", 100, 0, None, "").unwrap();
+    let view = store.rows(&pq("items", 100, 0, None, "")).unwrap();
     assert_eq!(view.total, 2);
     assert_eq!(view.rows.len(), 2);
     assert_eq!(view.rows[0], vec!["a".to_string(), "1".to_string()]);
@@ -80,7 +100,7 @@ fn sqlite_full_crud_roundtrip() {
     store
         .update_cell_keyed("items", &sqlite::RowKey::Rowid(rowid_a), "qty", "42")
         .unwrap();
-    let view = store.rows("items", 100, 0, None, "").unwrap();
+    let view = store.rows(&pq("items", 100, 0, None, "")).unwrap();
     assert_eq!(view.rows[0], vec!["a".to_string(), "42".to_string()]);
 
     // INSERT (default values)
@@ -92,7 +112,7 @@ fn sqlite_full_crud_roundtrip() {
         .delete_row_keyed("items", &sqlite::RowKey::Rowid(rowid_a))
         .unwrap();
     assert_eq!(store.count("items").unwrap(), 2);
-    let view = store.rows("items", 100, 0, None, "").unwrap();
+    let view = store.rows(&pq("items", 100, 0, None, "")).unwrap();
     assert!(view.rows.iter().all(|r| r[0] != "a"));
 
     // raw exec
@@ -244,21 +264,21 @@ fn rows_sort_ascending_descending_and_natural_order() {
     let (path, store) = sortable_db("sort.db");
 
     // No sort: insertion (rowid) order.
-    let v = store.rows("t", 100, 0, None, "").unwrap();
+    let v = store.rows(&pq("t", 100, 0, None, "")).unwrap();
     assert_eq!(col(&v, 0), ["pear", "apple", "fig", "date"]);
 
     let asc = Sort {
         column: "name".into(),
         desc: false,
     };
-    let v = store.rows("t", 100, 0, Some(&asc), "").unwrap();
+    let v = store.rows(&pq("t", 100, 0, Some(&asc), "")).unwrap();
     assert_eq!(col(&v, 0), ["apple", "date", "fig", "pear"]);
 
     let desc = Sort {
         column: "name".into(),
         desc: true,
     };
-    let v = store.rows("t", 100, 0, Some(&desc), "").unwrap();
+    let v = store.rows(&pq("t", 100, 0, Some(&desc), "")).unwrap();
     assert_eq!(col(&v, 0), ["pear", "fig", "date", "apple"]);
 
     // Numeric column must sort numerically, not lexically (10 after 7).
@@ -266,7 +286,7 @@ fn rows_sort_ascending_descending_and_natural_order() {
         column: "qty".into(),
         desc: false,
     };
-    let v = store.rows("t", 100, 0, Some(&qty), "").unwrap();
+    let v = store.rows(&pq("t", 100, 0, Some(&qty), "")).unwrap();
     assert_eq!(col(&v, 1), ["3", "3", "7", "10"]);
 
     // An unknown column falls back to rowid order instead of failing the query.
@@ -274,7 +294,7 @@ fn rows_sort_ascending_descending_and_natural_order() {
         column: "nope".into(),
         desc: false,
     };
-    let v = store.rows("t", 100, 0, Some(&bogus), "").unwrap();
+    let v = store.rows(&pq("t", 100, 0, Some(&bogus), "")).unwrap();
     assert_eq!(col(&v, 0), ["pear", "apple", "fig", "date"]);
 
     let _ = std::fs::remove_file(&path);
@@ -292,11 +312,11 @@ fn sorted_paging_is_stable_across_duplicate_keys() {
 
     let mut seen = Vec::new();
     for offset in [0, 2] {
-        let page = store.rows("t", 2, offset, Some(&qty), "").unwrap();
+        let page = store.rows(&pq("t", 2, offset, Some(&qty), "")).unwrap();
         assert_eq!(page.rows.len(), 2);
         seen.extend(col(&page, 0));
     }
-    let full = col(&store.rows("t", 100, 0, Some(&qty), "").unwrap(), 0);
+    let full = col(&store.rows(&pq("t", 100, 0, Some(&qty), "")).unwrap(), 0);
     assert_eq!(seen, full, "pages must concatenate into the full order");
     let _ = std::fs::remove_file(&path);
 }
@@ -313,7 +333,7 @@ fn search_and_ordinals_follow_the_sorted_order() {
     };
 
     // Sorted ascending: apple(2) date(4) fig(3) pear(1) by rowid.
-    let sorted = store.rows("t", 100, 0, Some(&asc), "").unwrap();
+    let sorted = store.rows(&pq("t", 100, 0, Some(&asc), "")).unwrap();
     let rowid_of = |n: &str| -> i64 {
         let i = sorted.rows.iter().position(|r| r[0] == n).unwrap();
         sorted.rowids[i].unwrap()
@@ -413,7 +433,7 @@ fn sort_column_names_are_escaped() {
         column: cols[0].clone(),
         desc: false,
     };
-    let v = store.rows("t", 100, 0, Some(&sort), "").unwrap();
+    let v = store.rows(&pq("t", 100, 0, Some(&sort), "")).unwrap();
     assert_eq!(col(&v, 0), ["a", "b"]);
     assert_eq!(store.rowid_ordinal("t", 2, Some(&sort), "").unwrap(), 1);
     let _ = std::fs::remove_file(&path);
@@ -693,7 +713,7 @@ fn backup_writes_a_second_readable_database() {
     assert!(matches!(detect(&out, false, false).unwrap(), Kind::Sqlite));
     let copy = SqliteStore::open(&out).unwrap();
     assert_eq!(copy.tables, store.tables);
-    let rows = copy.rows("child", 10, 0, None, "").unwrap();
+    let rows = copy.rows(&pq("child", 10, 0, None, "")).unwrap();
     assert_eq!(rows.rows.len(), 2);
 
     // VACUUM INTO refuses to overwrite, which is what keeps a backup from
@@ -901,7 +921,7 @@ fn import_maps_columns_by_header_and_rolls_back_a_bad_file() {
         vec!["8".to_string(), "grace".to_string()],
     ];
     assert_eq!(store.import_rows("p", &header, &rows).unwrap(), 2);
-    let view = store.rows("p", 10, 0, None, "").unwrap();
+    let view = store.rows(&pq("p", 10, 0, None, "")).unwrap();
     assert_eq!(view.rows[0][1], "ada");
     assert_eq!(view.rows[0][2], "9.5", "the value went to the named column");
 
@@ -948,7 +968,7 @@ fn search_and_ordinals_stay_inside_the_filter() {
     let store = SqliteStore::open(&path).unwrap();
     let cols = store.columns("t").unwrap();
     let name_of = |rid: i64| -> String {
-        let v = store.rows("t", 10, 0, None, "").unwrap();
+        let v = store.rows(&pq("t", 10, 0, None, "")).unwrap();
         let i = v.rowids.iter().position(|r| *r == Some(rid)).unwrap();
         v.rows[i][0].clone()
     };
@@ -1026,7 +1046,7 @@ fn a_filter_can_target_one_column() {
     let store = SqliteStore::open(&path).unwrap();
     let lines = |filter: &str| -> Vec<String> {
         store
-            .rows("t", 50, 0, None, filter)
+            .rows(&pq("t", 50, 0, None, filter))
             .unwrap()
             .rows
             .iter()
@@ -1057,7 +1077,7 @@ fn a_filter_can_target_one_column() {
         filter: "cwd:zshrs",
     };
     let hit = store.find_row_edge(&q, true).unwrap().unwrap();
-    let view = store.rows("t", 50, 0, None, "").unwrap();
+    let view = store.rows(&pq("t", 50, 0, None, "")).unwrap();
     let i = view.rowids.iter().position(|r| *r == Some(hit)).unwrap();
     assert_eq!(view.rows[i][1], "echo one");
     let _ = std::fs::remove_file(&path);
@@ -1417,7 +1437,7 @@ fn a_table_without_rowid_is_edited_by_its_primary_key() {
     let store = SqliteStore::open(&path).unwrap();
 
     // The view reports the key columns in key order, and no rowids.
-    let view = store.rows("kv", 10, 0, None, "").unwrap();
+    let view = store.rows(&pq("kv", 10, 0, None, "")).unwrap();
     assert_eq!(view.primary_key, ["ns", "k"]);
     assert!(
         view.rowids.iter().all(Option::is_none),
@@ -1436,7 +1456,7 @@ fn a_table_without_rowid_is_edited_by_its_primary_key() {
         "exactly one row matches a full key"
     );
     let v = |ns: &str, k: &str| -> String {
-        let view = store.rows("kv", 10, 0, None, "").unwrap();
+        let view = store.rows(&pq("kv", 10, 0, None, "")).unwrap();
         let i = view
             .rows
             .iter()
@@ -1477,7 +1497,7 @@ fn a_table_without_rowid_is_edited_by_its_primary_key() {
         .unwrap();
     drop(conn);
     let store = SqliteStore::open(&path).unwrap();
-    let view = store.rows("plain", 10, 0, None, "").unwrap();
+    let view = store.rows(&pq("plain", 10, 0, None, "")).unwrap();
     assert!(
         view.primary_key.is_empty(),
         "the rowid is the better handle"
