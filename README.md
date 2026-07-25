@@ -176,8 +176,14 @@ back to a raw structural view.
 | awkrs script cache | `AWKR` | magic | script path |
 | vimlrs script cache | `VIML` | magic | script path |
 | elisprs heap-image cache | `ELSP` | magic | script path |
+| zshrs canonical shard | `ZSHS` | magic | `section/key`, `section[i]` |
 | pythonrs bytecode cache | *(none)* | validated try-decode | source path |
 | rubylang / arb script cache | *(none)* | validated try-decode | u64 content hash |
+
+The canonical shard is the shell's whole captured state for one source root —
+aliases, functions, options, bindings, paths — so its records address a section
+and a key (`aliases/ll`, `path[0]`, `extras/<sub>/<key>`) rather than one flat
+entry map; renames apply to the map sections, lists being positional.
 
 Magic-bearing formats are matched by their header; the header-less hash-keyed
 shards (pythonrs, rubylang, arb) are attempted last and gated by rkyv
