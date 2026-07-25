@@ -187,6 +187,155 @@ pub fn read_tail(db: &Path, window: usize) -> Option<WalTail> {
     })
 }
 
+/// Frames written since frame `after`, for a caller tailing a log it has already
+/// read part of. Reading only the new frame headers is what keeps attribution cheap
+/// on a log with tens of thousands of frames: the alternative walks all of them
+/// every sample.
+///
+/// A salt change means the log was checkpointed and restarted, so the caller's
+/// `after` no longer refers to anything. That is reported rather than papered over
+/// — `restarted` is the signal to start counting from zero again.
+pub struct NewFrames {
+    pub page_size: u32,
+    pub salt1: u32,
+    pub salt2: u32,
+    /// The log was reset since the caller last looked.
+    pub restarted: bool,
+    /// Frames after the caller's mark, oldest first.
+    pub frames: Vec<Frame>,
+    /// Frames present in the file now.
+    pub total_frames: u32,
+}
+
+pub fn read_frames_after(db: &Path, after: u32, salts: Option<(u32, u32)>) -> Option<NewFrames> {
+    let path = wal_path(db);
+    let size = std::fs::metadata(&path).ok()?.len();
+    if size < WAL_HEADER as u64 {
+        return None;
+    }
+    let mut f = std::fs::File::open(&path).ok()?;
+    let mut head = [0u8; WAL_HEADER];
+    f.read_exact(&mut head).ok()?;
+    let magic = be32(&head[0..4]);
+    if magic != MAGIC_LE && magic != MAGIC_BE {
+        return None;
+    }
+    let page_size = be32(&head[8..12]);
+    if !(512..=65536).contains(&page_size) || !page_size.is_power_of_two() {
+        return None;
+    }
+    let (salt1, salt2) = (be32(&head[16..20]), be32(&head[20..24]));
+    let restarted = salts.is_some_and(|(s1, s2)| s1 != salt1 || s2 != salt2);
+    let start = if restarted { 0 } else { after };
+
+    let stride = FRAME_HEADER as u64 + page_size as u64;
+    let total_frames = ((size - WAL_HEADER as u64) / stride) as u32;
+    let mut frames = Vec::new();
+    let mut buf = [0u8; FRAME_HEADER];
+    for i in start..total_frames {
+        let at = WAL_HEADER as u64 + i as u64 * stride;
+        if f.seek(SeekFrom::Start(at)).is_err() || f.read_exact(&mut buf).is_err() {
+            break;
+        }
+        let db_size = be32(&buf[4..8]);
+        frames.push(Frame {
+            index: i + 1,
+            page: be32(&buf[0..4]),
+            db_size,
+            commit: db_size != 0,
+            live: be32(&buf[8..12]) == salt1 && be32(&buf[12..16]) == salt2,
+        });
+    }
+    Some(NewFrames {
+        page_size,
+        salt1,
+        salt2,
+        restarted,
+        frames,
+        total_frames,
+    })
+}
+
+/// The newest image of every page the live log holds, with the database size the
+/// last commit recorded.
+///
+/// In WAL mode this *is* the current state of those pages: the database file still
+/// holds the pre-write version until a checkpoint. Anything reading the file
+/// directly — the page map behind write attribution, a recovery pass — has to
+/// apply this on top or it is reading the past.
+///
+/// Only the newest image of each page is kept, so the cost is bounded by the
+/// database's page count rather than by the log's length.
+pub fn latest_pages(db: &Path) -> Option<(u32, std::collections::HashMap<u32, Vec<u8>>, u32)> {
+    let path = wal_path(db);
+    let size = std::fs::metadata(&path).ok()?.len();
+    if size < WAL_HEADER as u64 {
+        return None;
+    }
+    let mut f = std::fs::File::open(&path).ok()?;
+    let mut head = [0u8; WAL_HEADER];
+    f.read_exact(&mut head).ok()?;
+    let magic = be32(&head[0..4]);
+    if magic != MAGIC_LE && magic != MAGIC_BE {
+        return None;
+    }
+    let page_size = be32(&head[8..12]);
+    if !(512..=65536).contains(&page_size) || !page_size.is_power_of_two() {
+        return None;
+    }
+    let (salt1, salt2) = (be32(&head[16..20]), be32(&head[20..24]));
+    let stride = FRAME_HEADER as u64 + page_size as u64;
+    let total = ((size - WAL_HEADER as u64) / stride) as u32;
+
+    let mut pages: std::collections::HashMap<u32, Vec<u8>> = std::collections::HashMap::new();
+    let mut db_size = 0u32;
+    let mut fh = [0u8; FRAME_HEADER];
+    let mut image = vec![0u8; page_size as usize];
+    for i in 0..total {
+        let at = WAL_HEADER as u64 + i as u64 * stride;
+        if f.seek(SeekFrom::Start(at)).is_err() || f.read_exact(&mut fh).is_err() {
+            break;
+        }
+        // A frame from an older log is not part of the current state.
+        if be32(&fh[8..12]) != salt1 || be32(&fh[12..16]) != salt2 {
+            break;
+        }
+        if f.read_exact(&mut image).is_err() {
+            break;
+        }
+        let page = be32(&fh[0..4]);
+        let after = be32(&fh[4..8]);
+        if after != 0 {
+            db_size = after;
+        }
+        // A later frame for the same page supersedes an earlier one.
+        pages.insert(page, image.clone());
+    }
+    Some((page_size, pages, db_size))
+}
+
+/// The page image a frame carries, which is the state of that page as of that
+/// write. This is the only place in zdbview that reads a frame's payload rather
+/// than its header.
+pub fn frame_page(db: &Path, index: u32) -> Option<(u32, Vec<u8>)> {
+    let path = wal_path(db);
+    let mut f = std::fs::File::open(&path).ok()?;
+    let mut head = [0u8; WAL_HEADER];
+    f.read_exact(&mut head).ok()?;
+    let page_size = be32(&head[8..12]);
+    if !(512..=65536).contains(&page_size) || !page_size.is_power_of_two() || index == 0 {
+        return None;
+    }
+    let stride = FRAME_HEADER as u64 + page_size as u64;
+    let at = WAL_HEADER as u64 + (index as u64 - 1) * stride;
+    f.seek(SeekFrom::Start(at)).ok()?;
+    let mut fh = [0u8; FRAME_HEADER];
+    f.read_exact(&mut fh).ok()?;
+    let mut page = vec![0u8; page_size as usize];
+    f.read_exact(&mut page).ok()?;
+    Some((be32(&fh[0..4]), page))
+}
+
 /// WAL integers are big-endian regardless of the host.
 fn be32(b: &[u8]) -> u32 {
     u32::from_be_bytes([b[0], b[1], b[2], b[3]])

@@ -230,7 +230,7 @@ zdbview</pre>
             <tr><td>v</td><td>Cycle how a value renders on the detail screen: auto / hex / text / disasm</td></tr>
             <tr><td>y</td><td>Copy the cell, value or record key to the clipboard (OSC 52 — works over SSH)</td></tr>
             <tr><td>x</td><td>Export the current table as CSV, or all records as JSON, to a file</td></tr>
-            <tr><td>w</td><td>Write monitor — live writes to every known shard and database, with the selected database's WAL tail in a second frame (also from the picker)</td></tr>
+            <tr><td>w</td><td>Write monitor — live writes to every known shard and database, with the selected database's WAL tail in a second frame (also from the picker); <code>t</code> swaps that frame for bytes written per table, <code>F</code> walks the log</td></tr>
             <tr><td>o</td><td>Back to the file list — open another file without restarting</td></tr>
             <tr><td>c</td><td>Color-scheme chooser — live preview, <code>Enter</code> saves, <code>Esc</code> restores</td></tr>
             <tr><td>C</td><td>Palette editor for the six base colors</td></tr>
@@ -276,6 +276,19 @@ zdbview cache.rkyv --export json            # decoded records; each value blob a
         <p class="doc-note">CSV and JSON are emitted by a dependency-free writer in <code>export.rs</code> — quoting and escaping are covered by unit tests. <code>--export</code> never starts the TUI, so it is safe in a pipeline.</p>
         <p><code>--export sql</code> is <code>.dump</code>, and it reads values from the database rather than from the grid, so a blob comes out as <code>x'…'</code> and a real keeps its decimal point. Virtual tables are the case that makes a naive dump unreplayable: <code>CREATE VIRTUAL TABLE</code> runs the module's constructor and builds the shadow tables, which the dump would then create a second time. zdbview does what the shell does — writes the <code>sqlite_schema</code> row directly under <code>PRAGMA writable_schema=ON</code> and emits the shadow tables with <code>CREATE TABLE IF NOT EXISTS</code> — so an FTS5 index survives the round trip and still answers <code>MATCH</code>. Checked line-for-line against <code>sqlite3 .dump</code>: identical content, differing only in the order <code>sqlite_master</code> is walked.</p>
         <p><code>--backup FILE</code> copies a database with <code>VACUUM INTO</code> (the shell's <code>.backup</code>), the one consistent way to copy a file that may have writers. An existing target is an error, not an overwrite.</p>
+      </section>
+
+      <section class="tutorial-section">
+        <h2>Which table is being written, live</h2>
+        <p>In the write monitor, <code>t</code> swaps the bottom frame for a per-table breakdown of the bytes written since it opened. This is the thing no other SQLite tool shows: <strong>not how big a table is, but which one is being written to right now.</strong></p>
+        <p>It works because a WAL frame header carries the page number it rewrote, and a page can be traced to the b-tree that owns it. Every table's and index's root page is walked straight out of the file to build a page&nbsp;→&nbsp;owner map. The file alone is the <em>past</em> in WAL mode — a table created but not yet checkpointed is not even in its schema — so the log's newest image of each page is applied over the file before the walk; without that, every page reads as unmapped. Each sample reads only the frame headers written since the last one, so the cost does not grow with the log's length, and the map is re-read when a checkpoint restarts the log or a frame names a page it does not cover.</p>
+        <p class="doc-note">Indexes are named as indexes, and a page the map cannot place is shown as <code>page N (unmapped)</code> rather than being charged to a table it might not belong to. A database in rollback-journal mode gets no breakdown: a journal records the pages it is <em>about to</em> change, not the ones it did.</p>
+      </section>
+
+      <section class="tutorial-section">
+        <h2>Walking the log</h2>
+        <p><code>F</code> in the monitor opens the log as a history. A frame does not merely say that a page changed — it carries the whole page image, so the rows that write put there are decoded and shown beside the frame list, labelled with the table's column names. <code>j</code>/<code>k</code> step one frame (down is <em>back</em> in time), <code>[</code> and <code>]</code> jump a whole transaction, <code>g</code>/<code>G</code> reach the newest and oldest frame.</p>
+        <p class="doc-note">A value that continues onto an overflow page says so rather than showing a truncated string — the rest is in a different frame — and a page that is not a table leaf (interior node, index page, overflow) is named as what it is instead of pretending to hold rows. This is the only view that reads frame <em>payloads</em>, so it decodes one frame at a time on a keypress: a 190&nbsp;MB log holds tens of thousands of frames and each payload is a whole page.</p>
       </section>
 
       <section class="tutorial-section">

@@ -614,6 +614,8 @@ screen shared by both, so the keys and columns are identical.
 | `p` | pause and resume sampling |
 | `+` / `-` | sample faster / slower (100 ms … 5 s, 500 ms default) |
 | `Enter` | open the selected file |
+| `t` | swap the bottom frame: the log's frames ↔ **bytes written per table** |
+| `F` | **walk the log**: every frame, and the rows each one wrote |
 | `j` `k`, `PgUp` `PgDn`, `g` `G` | move |
 | `w` / `Esc` | back |
 
@@ -652,6 +654,7 @@ pages it is about to become.
 |--------|---------|
 | `frame` | position in the log |
 | `page` | which database page this frame carries |
+| `table` | which table or index owns that page (see below) |
 | `commit` | `commit` ends a transaction; `stale` means a checkpoint has since rolled the salts, so the frame belongs to a log that is already folded away |
 | `db pages` | database size in pages after a commit frame |
 
@@ -662,6 +665,70 @@ bytes and a seek each — so tailing a 190 MB log costs what tailing an empty on
 does. Selecting an rkyv archive, or a database in `journal_mode=delete`, says so
 in the frame rather than sitting blank. Below 12 rows of terminal the frame is
 dropped so the table stays readable.
+
+### Which table is being written (`t`)
+
+`t` swaps the bottom frame for a per-table breakdown:
+
+```
+┌ tables — 1.1 M across 3 objects of history.db · t for frames ─────────────────┐
+│table                        written    share                                   │
+│history                      724 K       64%  ########################          │
+│index history_ts_idx         352 K       31%  ###########                       │
+│sqlite_schema                 12 K        1%                                    │
+└────────────────────────────────────────────────────────────────────────────────┘
+```
+
+This is the thing no other SQLite tool shows: **not how big a table is, but which
+one is being written to right now.** It works because a WAL frame header carries
+the page number it rewrote, and a page can be traced to the b-tree that owns it:
+
+1. Every table's and index's b-tree is walked from its root page, straight out of
+   the file, giving a page → owner map (`recover::page_owners`).
+2. The database file alone is the *past* in WAL mode — a table created but not yet
+   checkpointed is not in its schema at all — so the log's newest image of each
+   page is applied over the file before walking. Without that, every page reads as
+   unmapped.
+3. Each sample reads only the frame headers written since the last one, so the cost
+   does not grow with the log's length.
+4. The map is re-read when the log restarts (a checkpoint moves pages) or when a
+   frame names a page the map does not cover (the file grew).
+
+Indexes are named as indexes, and a page the map cannot place is shown as
+`page N (unmapped)` rather than being folded into a table it might not belong to.
+A database in rollback-journal mode gets no breakdown: a journal records the pages
+it is *about to* change, not the ones it did.
+
+### Walking the log (`F`)
+
+`F` opens the log itself. A frame does not merely say that a page changed — it
+carries the whole page image, so the rows that write put there can be decoded and
+shown:
+
+```
+┌ 412 frames · 37 commits ────┐┌ what this frame wrote — j/k step · [ ] commits ──┐
+│frame  page   what           ││page 6  table leaf  history                       │
+│412    2      commit         ││commit — the database was 41 pages after this write│
+│411    6      history        ││                                                  │
+│410    9      index hist…    ││rowid 118                                         │
+│409    6      history        ││              line  git push --force-with-lease    │
+│…                            ││             ts_ns  1784952602119000000            │
+└─────────────────────────────┘└──────────────────────────────────────────────────┘
+```
+
+`j`/`k` step one frame (down is *back* in time), `[` and `]` jump a whole
+transaction, `g`/`G` go to the newest and oldest frame. Frames belonging to a log a
+checkpoint has already folded away are marked `stale`.
+
+The right pane decodes that one page image with the same record reader the recovery
+pass uses, labelling values with the table's column names. A value that continues
+onto an overflow page says so rather than showing a truncated string — the rest of
+it is in a different frame. Pages that are not table leaves (interior nodes,
+index pages, overflow) are named as such instead of pretending to hold rows.
+
+This is the only place in zdbview that reads frame *payloads*, so it is on a
+keypress and decodes one frame at a time: a 190 MB log holds tens of thousands of
+frames and each payload is a whole page.
 
 ## Large archives
 

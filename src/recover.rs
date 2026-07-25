@@ -120,6 +120,36 @@ struct Db {
 }
 
 impl Db {
+    /// The file as it stands, with its write-ahead log applied on top.
+    ///
+    /// In WAL mode the database file holds the pre-write version of every page the
+    /// log has since rewritten, and a table created but not yet checkpointed is not
+    /// in the file's schema at all. Reading the file alone therefore reads the past,
+    /// which is wrong for both a page map and a recovery.
+    fn open_with_wal(path: &Path) -> Result<Self> {
+        let mut db = Db::open(path)?;
+        let Some((page_size, pages, db_size)) = crate::wal::latest_pages(path) else {
+            return Ok(db);
+        };
+        if page_size as usize != db.page_size {
+            // A log for a different page size cannot belong to this file.
+            return Ok(db);
+        }
+        let needed =
+            (db_size.max(pages.keys().copied().max().unwrap_or(0)) as usize) * db.page_size;
+        if needed > db.bytes.len() {
+            db.bytes.resize(needed, 0);
+        }
+        for (page, image) in pages {
+            let start = (page as usize - 1) * db.page_size;
+            if start + db.page_size <= db.bytes.len() {
+                db.bytes[start..start + db.page_size].copy_from_slice(&image);
+            }
+        }
+        db.pages = (db.bytes.len() / db.page_size) as u32;
+        Ok(db)
+    }
+
     fn open(path: &Path) -> Result<Self> {
         let bytes = std::fs::read(path).with_context(|| format!("read {}", path.display()))?;
         if bytes.len() < 100 {
@@ -217,6 +247,28 @@ impl Db {
         Some((rowid, decode_record(&payload)))
     }
 
+    /// `(type, name, rootpage)` for every object the schema table holds, read from
+    /// the b-tree rooted at page 1 rather than from a query.
+    fn schema_objects(&self) -> Vec<(String, String, u32)> {
+        let mut out = Vec::new();
+        for page in self.walk(1) {
+            for (_, values) in self.leaf_cells(page).unwrap_or_default() {
+                let text = |i: usize| match values.get(i) {
+                    Some(Value::Text(t)) => Some(t.clone()),
+                    _ => None,
+                };
+                let rootpage = match values.get(3) {
+                    Some(Value::Int(i)) => *i as u32,
+                    _ => 0,
+                };
+                if let (Some(kind), Some(name)) = (text(0), text(1)) {
+                    out.push((kind, name, rootpage));
+                }
+            }
+        }
+        out
+    }
+
     /// Every page reachable from `root` as a table b-tree, leaves included.
     fn walk(&self, root: u32) -> Vec<u32> {
         let mut seen = Vec::new();
@@ -253,10 +305,133 @@ impl Db {
     }
 }
 
+/// The rows a single page image holds, for a caller that has one page and no file
+/// — reading a WAL frame's payload, which is a page as of one write.
+#[derive(Debug, Default)]
+pub struct PageRows {
+    pub rows: Vec<(i64, Vec<Value>)>,
+    /// A cell's payload continued onto an overflow page. Those pages are separate
+    /// frames, so the value here stops where the page does and is reported rather
+    /// than silently truncated.
+    pub overflowed: bool,
+    /// What kind of page it is, for a caller to explain an empty result.
+    pub kind: PageKind,
+}
+
+#[derive(Debug, Default, PartialEq, Eq, Clone, Copy)]
+pub enum PageKind {
+    TableLeaf,
+    TableInterior,
+    IndexLeaf,
+    IndexInterior,
+    /// An overflow page, a freelist page, or anything else with no cell array.
+    #[default]
+    Other,
+}
+
+impl PageKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            PageKind::TableLeaf => "table leaf",
+            PageKind::TableInterior => "table interior",
+            PageKind::IndexLeaf => "index leaf",
+            PageKind::IndexInterior => "index interior",
+            PageKind::Other => "overflow / freelist",
+        }
+    }
+}
+
+/// Decode one page image. `page_no` matters only because page 1 carries the
+/// 100-byte file header before its b-tree header.
+pub fn decode_page_image(image: &[u8], page_no: u32) -> PageRows {
+    let base = if page_no == 1 { 100 } else { 0 };
+    let kind = match image.get(base) {
+        Some(0x0d) => PageKind::TableLeaf,
+        Some(0x05) => PageKind::TableInterior,
+        Some(0x0a) => PageKind::IndexLeaf,
+        Some(0x02) => PageKind::IndexInterior,
+        _ => PageKind::Other,
+    };
+    let mut out = PageRows {
+        kind,
+        ..Default::default()
+    };
+    if kind != PageKind::TableLeaf {
+        return out;
+    }
+    // Payload sizing uses the usable size; a page image carries no reserved-bytes
+    // field, so the whole page is assumed usable — which is true unless the
+    // database was built with a reserved trailer.
+    let usable = image.len();
+    let max_local = usable.saturating_sub(35);
+    let min_local = ((usable.saturating_sub(12)) * 32 / 255).saturating_sub(23);
+    let ncells = be16(image, base + 3) as usize;
+    for i in 0..ncells {
+        let off = be16(image, base + 8 + i * 2) as usize;
+        if off == 0 || off >= image.len() {
+            continue;
+        }
+        let Some((payload_len, n1)) = varint(image, off) else {
+            continue;
+        };
+        let Some((rowid, n2)) = varint(image, off + n1) else {
+            continue;
+        };
+        let head = off + n1 + n2;
+        let payload_len = payload_len as usize;
+        let local = if payload_len <= max_local {
+            payload_len
+        } else {
+            out.overflowed = true;
+            let candidate = min_local + (payload_len - min_local) % usable.saturating_sub(4);
+            if candidate > max_local {
+                min_local
+            } else {
+                candidate
+            }
+        };
+        let Some(payload) = image.get(head..(head + local).min(image.len())) else {
+            continue;
+        };
+        out.rows.push((rowid, decode_record(payload)));
+    }
+    out
+}
+
+/// Which table owns each page of the database, read straight from the file: every
+/// table's b-tree walked from its root. Indexes are named too, prefixed so a
+/// caller can tell them apart from the tables they serve.
+///
+/// This is what lets a write be attributed to a table without asking SQLite: a WAL
+/// frame carries a page number, and this says whose page that is. It is a snapshot
+/// — pages move as a database grows, so a caller watching writes has to refresh it.
+pub fn page_owners(path: &Path) -> Result<HashMap<u32, String>> {
+    let db = Db::open_with_wal(path)?;
+    let mut out = HashMap::new();
+    // Page 1 is the schema itself, whatever else it holds.
+    out.insert(1, "sqlite_schema".to_string());
+    for (kind, name, rootpage) in db.schema_objects() {
+        if rootpage == 0 {
+            continue;
+        }
+        let label = if kind == "index" {
+            format!("index {name}")
+        } else {
+            name
+        };
+        for page in db.walk(rootpage) {
+            // The first claim wins: a page cannot belong to two b-trees, and if a
+            // corrupt root says otherwise the earlier object is the better guess.
+            out.entry(page).or_insert_with(|| label.clone());
+        }
+    }
+    Ok(out)
+}
+
 /// Recover what a file still holds. Never opens the database, so a file SQLite
 /// refuses is still readable here.
 pub fn recover(path: &Path) -> Result<Recovered> {
-    let db = Db::open(path)?;
+    let db = Db::open_with_wal(path)?;
     let mut out = Recovered::default();
     if db.bytes.len() % db.page_size != 0 {
         out.notes.push(format!(

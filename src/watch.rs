@@ -147,6 +147,19 @@ pub struct Target {
     pub history: VecDeque<u64>,
     /// `false` once the file goes away (deleted or renamed over).
     pub present: bool,
+    /// Bytes written per table, attributed through the WAL: every frame carries
+    /// the page it rewrote, and the page map says whose page that is. Empty for a
+    /// rkyv shard, and for a database in rollback-journal mode.
+    pub by_table: Vec<(String, u64)>,
+    /// Frames already accounted for, so a frame is counted once.
+    seen_frames: u32,
+    /// The log's salts when it was last read; a change means it restarted.
+    salts: Option<(u32, u32)>,
+    /// Page → owner, read from the database file. Refreshed when the log restarts
+    /// (a checkpoint moves pages) or when a page is seen that it does not know.
+    owners: std::collections::HashMap<u32, String>,
+    /// Whether the map has been read at all yet.
+    mapped: bool,
 }
 
 impl Target {
@@ -162,7 +175,63 @@ impl Target {
             last_write: None,
             history: VecDeque::new(),
             present,
+            by_table: Vec::new(),
+            seen_frames: 0,
+            salts: None,
+            owners: std::collections::HashMap::new(),
+            mapped: false,
         }
+    }
+
+    /// Attribute the frames written since the last sample to the tables that own
+    /// their pages. Only for SQLite in WAL mode: a rollback journal says nothing
+    /// about which page it is about to change.
+    fn attribute_wal(&mut self) {
+        if self.kind != Kind::Sqlite {
+            return;
+        }
+        let new = match crate::wal::read_frames_after(&self.path, self.seen_frames, self.salts) {
+            Some(n) => n,
+            None => return,
+        };
+        if new.restarted {
+            // A checkpoint folded the log back and moved pages, so both the mark
+            // and the map are stale.
+            self.seen_frames = 0;
+            self.mapped = false;
+        }
+        self.salts = Some((new.salt1, new.salt2));
+        if new.frames.is_empty() {
+            self.seen_frames = new.total_frames;
+            return;
+        }
+        // Read the page map lazily: on the first attribution, after a restart, or
+        // when a frame names a page the map does not cover (the file grew).
+        let unknown = new
+            .frames
+            .iter()
+            .any(|f| f.live && !self.owners.contains_key(&f.page));
+        if !self.mapped || unknown {
+            if let Ok(map) = crate::recover::page_owners(&self.path) {
+                self.owners = map;
+                self.mapped = true;
+            }
+        }
+        let mut acc: std::collections::HashMap<String, u64> =
+            self.by_table.iter().cloned().collect();
+        for f in new.frames.iter().filter(|f| f.live) {
+            let owner = self
+                .owners
+                .get(&f.page)
+                .cloned()
+                .unwrap_or_else(|| format!("page {} (unmapped)", f.page));
+            *acc.entry(owner).or_insert(0) += new.page_size as u64;
+        }
+        self.seen_frames = new.total_frames;
+        let mut out: Vec<(String, u64)> = acc.into_iter().collect();
+        // Busiest first, name breaking ties so the order never wobbles.
+        out.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        self.by_table = out;
     }
 
     /// Bytes per second over the samples still inside `window`.
@@ -180,6 +249,11 @@ impl Target {
     /// Was this file written within `window`?
     pub fn active(&self, window: Duration) -> bool {
         self.last_write.is_some_and(|t| t.elapsed() < window)
+    }
+
+    /// A copy of the page map, for a view that wants to label pages by owner.
+    pub fn owners_snapshot(&self) -> std::collections::HashMap<u32, String> {
+        self.owners.clone()
     }
 
     /// The name shown in the monitor.
@@ -280,6 +354,8 @@ impl Watcher {
             if t.history.len() > HISTORY {
                 t.history.pop_front();
             }
+            // Which tables those bytes belonged to, when the log can say.
+            t.attribute_wal();
         }
         true
     }
@@ -363,6 +439,117 @@ pub fn spark(sample: u64, peak: u64) -> char {
     // Ceil so any non-zero sample shows at least the lowest bar.
     let level = ((sample as f64 / peak as f64) * BARS.len() as f64).ceil() as usize;
     BARS[level.clamp(1, BARS.len()) - 1]
+}
+
+#[cfg(test)]
+mod attribution_tests {
+    use super::*;
+
+    fn scratch(name: &str) -> PathBuf {
+        static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let seq = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let p =
+            std::env::temp_dir().join(format!("zdbview_attr_{}_{seq}_{name}", std::process::id()));
+        for suffix in ["", "-wal", "-shm"] {
+            let mut n = p.as_os_str().to_os_string();
+            n.push(suffix);
+            let _ = std::fs::remove_file(PathBuf::from(n));
+        }
+        p
+    }
+
+    /// Writes to one table have to be attributed to that table and not to the
+    /// other one — this is the claim the whole per-table view rests on.
+    #[test]
+    fn writes_are_attributed_to_the_table_whose_pages_changed() {
+        let path = scratch("attr.db");
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.pragma_update(None, "journal_mode", "WAL").unwrap();
+        // No autocheckpoint: the log has to survive for the frames to be read.
+        conn.pragma_update(None, "wal_autocheckpoint", 0).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE busy (id INTEGER PRIMARY KEY, v TEXT);
+             CREATE TABLE quiet (id INTEGER PRIMARY KEY, v TEXT);
+             INSERT INTO quiet (v) VALUES ('one');",
+        )
+        .unwrap();
+
+        let mut w = Watcher::new([(path.clone(), Kind::Sqlite)]);
+        w.interval = Duration::from_millis(0);
+        // First sample establishes the baseline, including the frames written by
+        // the schema itself.
+        assert!(w.tick());
+        w.targets[0].by_table.clear();
+
+        // Now write a lot to one table only.
+        for i in 0..300 {
+            conn.execute(
+                "INSERT INTO busy (v) VALUES (?1)",
+                [format!("row {i} padded out so pages fill up quickly")],
+            )
+            .unwrap();
+        }
+        assert!(w.tick());
+
+        let by: Vec<(String, u64)> = w.targets[0].by_table.clone();
+        assert!(!by.is_empty(), "the log must attribute something");
+        let bytes_for =
+            |name: &str| -> u64 { by.iter().filter(|(n, _)| n == name).map(|(_, b)| *b).sum() };
+        assert!(
+            bytes_for("busy") > 0,
+            "the table that was written must appear: {by:?}"
+        );
+        assert_eq!(
+            bytes_for("quiet"),
+            0,
+            "the table that was not written must not: {by:?}"
+        );
+        assert!(
+            bytes_for("busy") > bytes_for("sqlite_schema"),
+            "the data pages outweigh the schema page: {by:?}"
+        );
+        // Busiest first, which is what the pane relies on.
+        assert_eq!(by[0].0, "busy", "{by:?}");
+
+        // An index on the busy table is attributed separately, labelled as one.
+        conn.execute_batch("CREATE INDEX busy_v ON busy(v)")
+            .unwrap();
+        for i in 0..200 {
+            conn.execute("INSERT INTO busy (v) VALUES (?1)", [format!("more {i}")])
+                .unwrap();
+        }
+        assert!(w.tick());
+        let by = w.targets[0].by_table.clone();
+        assert!(
+            by.iter().any(|(n, b)| n == "index busy_v" && *b > 0),
+            "index pages are named as indexes: {by:?}"
+        );
+        drop(conn);
+        for suffix in ["", "-wal", "-shm"] {
+            let mut n = path.as_os_str().to_os_string();
+            n.push(suffix);
+            let _ = std::fs::remove_file(PathBuf::from(n));
+        }
+    }
+
+    /// A rkyv shard has no log and no pages, so it must produce no attribution
+    /// rather than a wrong one.
+    #[test]
+    fn an_archive_is_not_attributed() {
+        let path = scratch("shard.rkyv");
+        std::fs::write(&path, b"not a database at all").unwrap();
+        let mut w = Watcher::new([(path.clone(), Kind::Rkyv)]);
+        w.interval = Duration::from_millis(0);
+        assert!(w.tick());
+        std::fs::write(&path, b"grown, but still not a database").unwrap();
+        assert!(w.tick());
+        assert!(w.targets[0].written > 0, "the growth is still counted");
+        assert!(
+            w.targets[0].by_table.is_empty(),
+            "but nothing is attributed to a table"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
 }
 
 #[cfg(test)]

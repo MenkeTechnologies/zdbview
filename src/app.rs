@@ -225,6 +225,8 @@ enum Screen {
     /// table (VisiData's `describe` and frequency sheet, sqlite-utils'
     /// `analyze-tables`).
     Stats,
+    /// The write-ahead log, frame by frame, with the rows each frame wrote.
+    Frames,
     /// SQLite schema (CREATE statements) view.
     Schema,
 }
@@ -316,6 +318,8 @@ pub struct App {
     top_area: Rect,
     /// The SQL editor, while `screen` is `Screen::Sql`.
     sql: Option<crate::sqledit::SqlEdit>,
+    /// The log walker, while `screen` is `Screen::Frames`.
+    walk: Option<crate::frames::FrameView>,
     /// Which screen the hex editor was opened from, so closing it goes back there
     /// rather than always to the grid.
     hex_from: Screen,
@@ -419,6 +423,7 @@ impl App {
             top: None,
             top_area: Rect::ZERO,
             sql: None,
+            walk: None,
             hex_from: Screen::Main,
             hex_target: HexTarget::Record,
             stats_pending: None,
@@ -488,6 +493,9 @@ impl App {
         }
         if self.screen == Screen::Stats {
             return HelpCtx::Stats;
+        }
+        if self.screen == Screen::Frames {
+            return HelpCtx::Frames;
         }
         match &self.store {
             Store::Sqlite(_) => HelpCtx::Sqlite,
@@ -669,6 +677,7 @@ impl App {
             Screen::Sql => return self.key_sql(key),
             Screen::DbInfo => return self.key_dbinfo(code),
             Screen::Stats => return self.key_stats(code),
+            Screen::Frames => return self.key_frames(code),
             Screen::Detail => return self.key_detail(code),
             Screen::Schema => return self.key_schema(code),
             Screen::Main => {}
@@ -2299,6 +2308,12 @@ impl App {
             }
             Screen::DbInfo => self.render_dbinfo(f, outer[0]),
             Screen::Stats => self.render_stats(f, outer[0]),
+            Screen::Frames => {
+                let t = self.ov.theme;
+                if let Some(w) = self.walk.as_mut() {
+                    w.render(f, outer[0], &t);
+                }
+            }
             Screen::Schema => self.render_schema(f, outer[0]),
             Screen::Main => match &self.store {
                 Store::Sqlite(_) => self.render_sqlite(f, outer[0]),
@@ -3340,6 +3355,49 @@ impl App {
                 self.open_next = Some(path);
                 self.back_to_files();
             }
+            crate::monitor::Action::Frames(path) => self.open_frames(&path),
+        }
+    }
+
+    /// Open the log walker for `path`. Column names come from the open database
+    /// when it is the same file, so a decoded row can be labelled.
+    fn open_frames(&mut self, path: &std::path::Path) {
+        let columns: std::collections::HashMap<String, Vec<String>> = match self.sqlite() {
+            Some(s) if s.path == path => s.schema_names().into_iter().collect(),
+            _ => match crate::sqlite::SqliteStore::open(path) {
+                Ok(s) => s.schema_names().into_iter().collect(),
+                Err(_) => Default::default(),
+            },
+        };
+        match crate::frames::FrameView::open(path, columns) {
+            Some(view) => {
+                let n = view.frames.len();
+                self.walk = Some(view);
+                self.screen = Screen::Frames;
+                self.status =
+                    format!("{n} frames · j/k step · [ ] commits · Esc back to the monitor");
+            }
+            None => self.notify("no write-ahead log to walk (journal_mode is not WAL)"),
+        }
+    }
+
+    fn key_frames(&mut self, code: KeyCode) {
+        let page = self.page_rows.max(1);
+        let action = match self.walk.as_mut() {
+            Some(w) => w.on_key(code, page),
+            None => {
+                self.screen = Screen::Top;
+                return;
+            }
+        };
+        match action {
+            crate::frames::Action::None => {}
+            crate::frames::Action::Back => {
+                self.walk = None;
+                // Back to the monitor it was opened from, which is still there.
+                self.screen = Screen::Top;
+            }
+            crate::frames::Action::Quit => self.quit = true,
         }
     }
 
@@ -4026,6 +4084,18 @@ pub fn pick_mru(terminal: &mut DefaultTerminal, mut p: Picker<'_>) -> Result<Opt
                         crate::monitor::Action::Back => monitor = None,
                         crate::monitor::Action::Quit => return Ok(None),
                         crate::monitor::Action::Open(path) => {
+                            if let Some(sc) = &scan {
+                                sc.cancel();
+                            }
+                            return Ok(Some(Picked {
+                                path,
+                                theme: ov.theme,
+                            }));
+                        }
+                        // The log walker lives on a file that is open, so from the
+                        // picker `F` opens the database and lands in the monitor
+                        // there instead of walking from nowhere.
+                        crate::monitor::Action::Frames(path) => {
                             if let Some(sc) = &scan {
                                 sc.cancel();
                             }
@@ -4975,6 +5045,75 @@ mod tests {
         );
         for f in [path, out, csv, script] {
             let _ = std::fs::remove_file(f);
+        }
+    }
+
+    /// The monitor's two novel views, driven end to end: `t` swaps to the per-table
+    /// breakdown, and `F` opens the log walker on the selected database.
+    #[test]
+    fn the_monitor_opens_the_table_pane_and_the_log_walker() {
+        let path = scratch("db");
+        for suffix in ["-wal", "-shm"] {
+            let mut n = path.as_os_str().to_os_string();
+            n.push(suffix);
+            let _ = std::fs::remove_file(std::path::PathBuf::from(n));
+        }
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.pragma_update(None, "journal_mode", "WAL").unwrap();
+        conn.pragma_update(None, "wal_autocheckpoint", 0).unwrap();
+        conn.execute_batch("CREATE TABLE t (v TEXT)").unwrap();
+        for i in 0..120 {
+            conn.execute("INSERT INTO t VALUES (?1)", [format!("row {i} padded out")])
+                .unwrap();
+        }
+
+        let mut app = App::with_theme(
+            Store::Sqlite(SqliteStore::open(&path).unwrap()),
+            Theme::from_name(ThemeName::NeonSprawl),
+        );
+        press(&mut app, 'w'); // the write monitor
+        assert_eq!(app.screen, super::Screen::Top);
+        // Sample twice so the second tick has frames to attribute.
+        if let Some(m) = app.top.as_mut() {
+            m.watcher.interval = std::time::Duration::from_millis(0);
+            m.tick();
+            m.tick();
+        }
+        press(&mut app, 't');
+        assert_eq!(
+            app.top.as_ref().unwrap().pane,
+            crate::monitor::Pane::Tables,
+            "t swaps the bottom pane"
+        );
+        let rows = frame_rows(&mut app, 120, 30);
+        assert!(contains(&rows, "tables —"), "{:?}", rows.last());
+        assert!(
+            contains(&rows, " t ") || contains(&rows, "sqlite_schema"),
+            "the pane names what was written: {rows:?}"
+        );
+
+        // `F` walks the log: frames on the left, the selected frame's rows right.
+        press(&mut app, 'F');
+        assert_eq!(app.screen, super::Screen::Frames);
+        let walk = app.walk.as_ref().expect("a log walker");
+        assert!(!walk.frames.is_empty());
+        assert_eq!(app.help_ctx(), HelpCtx::Frames);
+        let rows = frame_rows(&mut app, 120, 30);
+        assert!(contains(&rows, "what this frame wrote"), "{:?}", rows[0]);
+        assert!(
+            contains(&rows, "commits"),
+            "the frame list is titled with its commit count"
+        );
+
+        // Esc returns to the monitor rather than to the grid.
+        app.on_key(KeyEvent::from(KeyCode::Esc));
+        assert_eq!(app.screen, super::Screen::Top);
+        assert!(app.walk.is_none());
+        drop(conn);
+        for suffix in ["", "-wal", "-shm"] {
+            let mut n = path.as_os_str().to_os_string();
+            n.push(suffix);
+            let _ = std::fs::remove_file(std::path::PathBuf::from(n));
         }
     }
 

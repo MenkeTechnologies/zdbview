@@ -64,6 +64,8 @@ pub enum HelpCtx {
     DbInfo,
     /// The per-column statistics screen.
     Stats,
+    /// The write-ahead log walker.
+    Frames,
 }
 
 /// The overlay layer: active scheme plus help / chooser / editor / toast state.
@@ -732,6 +734,7 @@ impl HelpCtx {
             HelpCtx::Sql => "SQL editor",
             HelpCtx::DbInfo => "database",
             HelpCtx::Stats => "column statistics",
+            HelpCtx::Frames => "write-ahead log",
         }
     }
 }
@@ -791,6 +794,34 @@ fn help_sections(ctx: HelpCtx) -> Vec<HelpSection> {
             },
         ];
     }
+    if ctx == HelpCtx::Frames {
+        return vec![
+            HelpSection {
+                title: "LOG",
+                keys: &[
+                    ("j/k ↑↓", "Step one frame"),
+                    ("] / [", "Older / newer commit"),
+                    ("g / G", "Newest / oldest"),
+                    ("PgUp/PgDn", "Page"),
+                    ("Esc / F", "Back to the monitor"),
+                ],
+            },
+            HelpSection {
+                title: "READING",
+                keys: &[
+                    ("frame", "Position in the log"),
+                    ("page", "Which page it rewrote"),
+                    ("commit", "Ends a transaction"),
+                    ("stale", "Belongs to a folded log"),
+                    ("rows", "What that page held"),
+                ],
+            },
+            HelpSection {
+                title: "DISPLAY",
+                keys: DISPLAY_KEYS,
+            },
+        ];
+    }
     if ctx == HelpCtx::Stats {
         return vec![
             HelpSection {
@@ -846,6 +877,8 @@ fn help_sections(ctx: HelpCtx) -> Vec<HelpSection> {
                 keys: &[
                     ("< / >", "Sort column (F6)"),
                     ("I", "Invert the sort"),
+                    ("t", "Frames / tables pane"),
+                    ("F", "Walk the log"),
                     ("click", "Sort by that header"),
                     ("/", "Filter by path"),
                     ("p", "Pause / resume"),

@@ -767,9 +767,41 @@ pauses and resumes,
 .BR + / \-
 halve and double the sampling interval between 100\ ms and five seconds,
 .B Enter
-opens the selected file, and
+opens the selected file,
+.B t
+swaps the bottom frame between the log's frames and the bytes written per table,
+.B F
+walks the log frame by frame, and
 .BR w " or " Esc
 returns.
+.PP
+The per-table breakdown answers which table is being written to now, rather than
+which is big. A WAL frame header carries the page it rewrote, and every table's and
+index's b\-tree is walked from its root page to give a page-to-owner map, so each
+frame's bytes are charged to the object that owns its page. The database file alone
+is the past in WAL mode \(em a table created but not yet checkpointed is not even in
+its schema \(em so the log's newest image of each page is applied over the file
+before the walk. The map is re-read when a checkpoint restarts the log or when a
+frame names a page it does not cover, and only frame headers written since the last
+sample are read, so the cost does not grow with the log's length. Indexes are named
+as indexes; a page that cannot be placed is shown as unmapped rather than charged
+to a table it might not belong to. A database in rollback-journal mode gets no
+breakdown, because a journal records the pages it is about to change rather than
+the ones it did.
+.PP
+.B F
+opens the log as a history. A frame carries a whole page image, not just the fact
+that a page changed, so the rows that write put on that page are decoded and shown
+beside the frame list \(em labelled with the table's column names, with a value that
+continues onto an overflow page reported rather than truncated, and a page that is
+not a table leaf named as what it is.
+.BR j / k
+step one frame (down is back in time),
+.BR [ " and " ]
+jump a whole transaction, and
+.BR g / G
+go to the newest and oldest frame. This is the only view that reads frame payloads,
+so it decodes one frame at a time on a keypress rather than while sampling.
 .PP
 Activity is detected by polling
 .BR stat (2)

@@ -29,6 +29,8 @@ pub enum Action {
     Quit,
     /// Open this file.
     Open(PathBuf),
+    /// Walk this database's log, frame by frame.
+    Frames(PathBuf),
 }
 
 /// Column widths, in display order. The click-to-sort hit test and the header
@@ -46,6 +48,19 @@ pub struct Monitor {
     pub typing: bool,
     /// A one-off message for the host to surface as a toast.
     pub note: Option<String>,
+    /// What the bottom frame shows: the log's frames, or the tables those frames
+    /// belong to.
+    pub pane: Pane,
+}
+
+/// The bottom frame's two views.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Pane {
+    /// The log's frames, newest first.
+    #[default]
+    Frames,
+    /// Bytes written per table, attributed through the frames' page numbers.
+    Tables,
 }
 
 impl Monitor {
@@ -57,6 +72,7 @@ impl Monitor {
             filter: String::new(),
             typing: false,
             note: None,
+            pane: Pane::default(),
         }
     }
 
@@ -149,6 +165,32 @@ impl Monitor {
                 self.typing = true;
                 self.filter.clear();
                 self.sel = 0;
+            }
+            // `F` opens the log itself: every frame, and the rows each one wrote.
+            KeyCode::Char('F') => {
+                let picked = self.rows().get(self.sel).map(|&i| {
+                    (
+                        self.watcher.targets[i].path.clone(),
+                        self.watcher.targets[i].kind,
+                    )
+                });
+                if let Some((path, kind)) = picked {
+                    if kind == Kind::Sqlite {
+                        return Action::Frames(path);
+                    }
+                    self.note = Some(format!(
+                        "{} is an rkyv archive — no log to walk",
+                        crate::app::truncate(name_of(&path), 24)
+                    ));
+                }
+            }
+            // `t` swaps the bottom frame between the raw log and what the log says
+            // about tables.
+            KeyCode::Char('t') => {
+                self.pane = match self.pane {
+                    Pane::Frames => Pane::Tables,
+                    Pane::Tables => Pane::Frames,
+                }
             }
             // Sorting by column, as htop does it: `<` / `>` (and F6) pick the
             // column, `I` inverts, and picking the sorted column inverts too.
@@ -384,8 +426,101 @@ impl Monitor {
         if let Some(bottom) = bottom {
             let selected = rows.get(self.sel.min(rows.len().saturating_sub(1)));
             let picked = selected.map(|&i| &w.targets[i]);
-            self.render_wal(f, bottom, t, picked.map(|tg| (tg.path.as_path(), tg.kind)));
+            match self.pane {
+                Pane::Frames => {
+                    self.render_wal(f, bottom, t, picked.map(|tg| (tg.path.as_path(), tg.kind)))
+                }
+                Pane::Tables => self.render_tables(f, bottom, t, picked),
+            }
         }
+    }
+
+    /// Bytes written per table, which no other SQLite tool shows live: a WAL frame
+    /// carries the page it rewrote, and the page map read from the database file
+    /// says which table's b-tree that page belongs to. Totals are since the monitor
+    /// opened, so they answer "what is being written right now", not "what is big".
+    fn render_tables(
+        &self,
+        f: &mut Frame,
+        area: Rect,
+        t: &Theme,
+        sel: Option<&crate::watch::Target>,
+    ) {
+        let block = |title: String| {
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(t.alt))
+                .title(title)
+        };
+        let Some(target) = sel else {
+            f.render_widget(block(" tables — nothing selected ".into()), area);
+            return;
+        };
+        if target.kind != Kind::Sqlite {
+            f.render_widget(
+                block(format!(
+                    " tables — {} is an rkyv archive, no page map ",
+                    truncate(target.name(), 28)
+                )),
+                area,
+            );
+            return;
+        }
+        if target.by_table.is_empty() {
+            f.render_widget(
+                block(format!(
+                    " tables — no writes attributed yet for {} (needs journal_mode=WAL) ",
+                    truncate(target.name(), 28)
+                )),
+                area,
+            );
+            return;
+        }
+
+        let total: u64 = target.by_table.iter().map(|(_, b)| *b).sum();
+        let header = Row::new(vec![
+            Cell::from("table"),
+            Cell::from("written"),
+            Cell::from("share"),
+            Cell::from(""),
+        ])
+        .style(Style::default().fg(t.label).add_modifier(Modifier::BOLD));
+        let width = (area.width as usize).saturating_sub(40).clamp(4, 40);
+        let body = target.by_table.iter().map(|(name, bytes)| {
+            let share = if total == 0 {
+                0.0
+            } else {
+                *bytes as f64 / total as f64
+            };
+            let bar = "#".repeat((share * width as f64).round() as usize);
+            Row::new(vec![
+                Cell::from(truncate(name, 28)),
+                Cell::from(human_size(*bytes)),
+                Cell::from(format!("{:>4.0}%", share * 100.0)),
+                Cell::from(bar),
+            ])
+            .style(Style::default().fg(t.primary))
+        });
+        f.render_widget(
+            Table::new(
+                body,
+                [
+                    Constraint::Length(28),
+                    Constraint::Length(10),
+                    Constraint::Length(6),
+                    Constraint::Min(4),
+                ],
+            )
+            .header(header)
+            .block(block(format!(
+                " tables — {} across {} object{} of {} · t for frames ",
+                human_size(total),
+                target.by_table.len(),
+                if target.by_table.len() == 1 { "" } else { "s" },
+                truncate(target.name(), 24),
+            ))),
+            area,
+        );
     }
 
     /// The WAL frame: the tail of the selected database's `-wal`, newest last.
@@ -430,10 +565,20 @@ impl Monitor {
         let header = Row::new(vec![
             Cell::from("frame"),
             Cell::from("page"),
+            Cell::from("table"),
             Cell::from("commit"),
             Cell::from("db pages"),
         ])
         .style(Style::default().fg(t.label).add_modifier(Modifier::BOLD));
+        // Which table each rewritten page belongs to, from the map the watcher
+        // already built for this target.
+        let owners = self
+            .watcher
+            .targets
+            .iter()
+            .find(|tg| tg.path == path)
+            .map(|tg| tg.owners_snapshot())
+            .unwrap_or_default();
 
         let body = tail.frames.iter().rev().map(|fr| {
             let style = if !fr.live {
@@ -446,6 +591,10 @@ impl Monitor {
             Row::new(vec![
                 Cell::from(fr.index.to_string()),
                 Cell::from(fr.page.to_string()),
+                Cell::from(truncate(
+                    owners.get(&fr.page).map(String::as_str).unwrap_or("—"),
+                    20,
+                )),
                 Cell::from(if !fr.live {
                     "stale".to_string()
                 } else if fr.commit {
@@ -488,7 +637,8 @@ impl Monitor {
                 body,
                 [
                     Constraint::Length(8),
-                    Constraint::Length(10),
+                    Constraint::Length(8),
+                    Constraint::Length(20),
                     Constraint::Length(8),
                     Constraint::Min(8),
                 ],

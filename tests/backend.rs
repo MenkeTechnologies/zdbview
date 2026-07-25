@@ -34,6 +34,11 @@ mod store;
 #[allow(dead_code)]
 #[path = "../src/theme.rs"]
 mod theme;
+// `recover` applies a database's write-ahead log before reading its pages, so the
+// WAL parser comes along.
+#[allow(dead_code)]
+#[path = "../src/wal.rs"]
+mod wal;
 
 use rkyv_inspect::RkyvStore;
 use sqlite::{Sort, SqliteStore};

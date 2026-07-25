@@ -16,6 +16,7 @@ mod clipboard;
 mod disasm;
 mod export;
 mod formats;
+mod frames;
 mod hexedit;
 mod import;
 mod monitor;
