@@ -26,6 +26,11 @@ const VIMLRS_MAGIC: u32 = 0x5649_4D4C; // "VIML"
 const AUTOLOAD_MAGIC: u32 = 0x5A52_414C;
 /// elisprs heap-image cache magic ("ELSP").
 const ELISP_MAGIC: u32 = 0x454C_5350;
+/// zshrs canonical-state shard magic ("ZSHS") — the daemon's per-source images
+/// under `~/.zshrs/images/`, one per zinit plugin/snippet plus the system shard.
+/// These are the most numerous archives the shell writes, and unlike the script
+/// caches their root is not one flat map but ~20 sections (see [`CanonicalShard`]).
+const CANONICAL_MAGIC: u32 = 0x5A53_4853;
 
 // ---- faithful copies of the zshrs shard archive types ----------------------
 
@@ -123,6 +128,55 @@ struct ElispShard {
     entries: HashMap<String, ElispEntry>,
 }
 
+// ---- Family D: the zshrs canonical shard (ZSHS) -----------------------------
+// Faithful copy of `zshrs/daemon/shard.rs`'s `ShardHeader` + `CanonicalShard`,
+// which the daemon writes with `rkyv::to_bytes::<_, 4096>` under the same rkyv
+// 0.7 + `archive_le` + `size_32` pins this crate uses. Field ORDER and types
+// must track that file; a drift shows up as failed validation, never as a
+// silently wrong decode.
+//
+// This is the shell's whole captured state for one source root — aliases,
+// functions, options, bindings, paths — so it is many small sections rather than
+// one entry map, which is why it gets its own record projection below.
+
+#[derive(Archive, Serialize, Deserialize)]
+#[archive(check_bytes)]
+struct CanonicalHeader {
+    magic: u32,
+    format_version: u32,
+    generation: u64,
+    built_at_ns: u64,
+    slug: String,
+    source_root: String,
+    entry_count: u32,
+}
+
+#[derive(Archive, Serialize, Deserialize)]
+#[archive(check_bytes)]
+struct CanonicalShard {
+    header: CanonicalHeader,
+    aliases: HashMap<String, String>,
+    global_aliases: HashMap<String, String>,
+    suffix_aliases: HashMap<String, String>,
+    functions: HashMap<String, String>,
+    autoload_functions: HashMap<String, String>,
+    setopts: Vec<String>,
+    unsetopts: Vec<String>,
+    bindkeys: HashMap<String, String>,
+    named_dirs: HashMap<String, String>,
+    compdef: HashMap<String, String>,
+    zstyle: Vec<(String, String)>,
+    zmodload: Vec<String>,
+    env_exports: HashMap<String, String>,
+    params: HashMap<String, String>,
+    path: Vec<String>,
+    fpath: Vec<String>,
+    manpath: Vec<String>,
+    plugins: Vec<(String, String)>,
+    sourced_files: Vec<String>,
+    extras: HashMap<String, HashMap<String, String>>,
+}
+
 // ---- Family C: header-less, hash-keyed shards (no magic) --------------------
 // pythonrs keeps a source path + a verify hash; rubylang and arb share an
 // identical minimal (key, blob) layout and cannot be told apart structurally.
@@ -178,6 +232,7 @@ pub struct KvRecord {
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum FormatKind {
     Script,
+    Canonical,
     Stryke,
     Autoload,
     Elisp,
@@ -206,6 +261,7 @@ const MAGICS: &[(u32, &str)] = &[
     (STRYKE_MAGIC, "strykelang script cache (STRY)"),
     (AUTOLOAD_MAGIC, "zshrs autoload cache (ZRAL)"),
     (ELISP_MAGIC, "elisprs heap-image cache (ELSP)"),
+    (CANONICAL_MAGIC, "zshrs canonical shard (ZSHS)"),
 ];
 
 /// Display name for a known magic.
@@ -269,6 +325,15 @@ pub fn try_decode(bytes: &[u8]) -> Option<Decoded> {
         if let Ok(s) = rkyv::check_archived_root::<AutoloadShard>(bytes) {
             if u32::from(s.header.magic) == AUTOLOAD_MAGIC {
                 return Some(decode_autoload(s));
+            }
+        }
+    }
+
+    // Family D — the zshrs canonical shard: many sections, not one entry map.
+    if contains_u32_le(bytes, CANONICAL_MAGIC) {
+        if let Ok(s) = rkyv::check_archived_root::<CanonicalShard>(bytes) {
+            if u32::from(s.header.magic) == CANONICAL_MAGIC {
+                return Some(decode_canonical(s));
             }
         }
     }
@@ -554,6 +619,7 @@ where
 /// when several share a display key.
 pub fn delete_record(bytes: &[u8], kind: FormatKind, del_key: &str) -> Result<Vec<u8>, String> {
     match kind {
+        FormatKind::Canonical => canonical_edit(bytes, del_key, CanonicalOp::Delete),
         FormatKind::Script => edit_shard::<ScriptShard, _>(bytes, |s| {
             s.entries.remove(del_key);
         }),
@@ -605,6 +671,9 @@ pub fn set_value(
     value: Vec<u8>,
 ) -> Result<Vec<u8>, String> {
     match kind {
+        FormatKind::Canonical => {
+            canonical_edit(bytes, del_key, CanonicalOp::Set(canonical_text(value)?))
+        }
         FormatKind::Script => edit_shard::<ScriptShard, _>(bytes, |s| {
             if let Some(e) = s.entries.get_mut(del_key) {
                 e.chunk_blob = value;
@@ -654,6 +723,16 @@ pub fn add_record(
     value: Vec<u8>,
 ) -> Result<Vec<u8>, String> {
     match kind {
+        // A canonical address names its slot, so an add is "create this slot",
+        // then set it when a value came with it.
+        FormatKind::Canonical => {
+            let created = canonical_edit(bytes, key, CanonicalOp::Add)?;
+            if value.is_empty() {
+                Ok(created)
+            } else {
+                canonical_edit(&created, key, CanonicalOp::Set(canonical_text(value)?))
+            }
+        }
         FormatKind::Script => edit_shard::<ScriptShard, _>(bytes, |s| {
             s.entries.insert(
                 key.to_string(),
@@ -735,6 +814,7 @@ pub fn rename_record(
 ) -> Result<Vec<u8>, String> {
     let new_key = new_key.to_string();
     match kind {
+        FormatKind::Canonical => canonical_edit(bytes, del_key, CanonicalOp::Rename(new_key)),
         FormatKind::Script => edit_shard::<ScriptShard, _>(bytes, move |s| {
             if let Some(v) = s.entries.remove(del_key) {
                 s.entries.insert(new_key, v);
@@ -1010,5 +1090,393 @@ mod tests {
     fn garbage_is_not_recognized() {
         assert!(try_decode(&[0u8; 64]).is_none());
         assert!(try_decode(b"not an archive at all, just plain text bytes").is_none());
+    }
+}
+
+/// Project a canonical shard into `section/key` records.
+///
+/// The shard is ~20 sections of three shapes, and each becomes records the same
+/// way so one flat list can carry all of them:
+///
+///   * maps (`aliases`, `functions`, `params`, …) → `section/<key>`
+///   * lists (`path`, `setopts`, `sourced_files`, …) → `section[<index>]`
+///   * pair lists (`zstyle`, `plugins`) → `section[<index>]` with the pair joined
+///   * `extras` (map of maps) → `extras/<subsystem>/<key>`
+///
+/// The record's `del_key` is that same address, which is what the edit path
+/// parses back into (section, key-or-index) — see [`canonical_edit`].
+fn decode_canonical(s: &ArchivedCanonicalShard) -> Decoded {
+    let mut records: Vec<KvRecord> = Vec::new();
+
+    let mut push = |key: String, text: &str, kind: &str| {
+        records.push(KvRecord {
+            key: key.clone(),
+            del_key: key,
+            value: text.as_bytes().to_vec(),
+            fields: vec![
+                ("section".into(), kind.to_string()),
+                ("len".into(), text.len().to_string()),
+            ],
+        });
+    };
+
+    macro_rules! map_section {
+        ($field:ident) => {
+            for (k, v) in s.$field.iter() {
+                push(
+                    format!("{}/{}", stringify!($field), k.as_str()),
+                    v.as_str(),
+                    stringify!($field),
+                );
+            }
+        };
+    }
+    macro_rules! list_section {
+        ($field:ident) => {
+            for (i, v) in s.$field.iter().enumerate() {
+                push(
+                    format!("{}[{i}]", stringify!($field)),
+                    v.as_str(),
+                    stringify!($field),
+                );
+            }
+        };
+    }
+    macro_rules! pair_section {
+        ($field:ident) => {
+            for (i, pair) in s.$field.iter().enumerate() {
+                push(
+                    format!("{}[{i}]", stringify!($field)),
+                    &format!("{} {}", pair.0.as_str(), pair.1.as_str()),
+                    stringify!($field),
+                );
+            }
+        };
+    }
+
+    map_section!(aliases);
+    map_section!(global_aliases);
+    map_section!(suffix_aliases);
+    map_section!(functions);
+    map_section!(autoload_functions);
+    map_section!(bindkeys);
+    map_section!(named_dirs);
+    map_section!(compdef);
+    map_section!(env_exports);
+    map_section!(params);
+    list_section!(setopts);
+    list_section!(unsetopts);
+    list_section!(zmodload);
+    list_section!(path);
+    list_section!(fpath);
+    list_section!(manpath);
+    list_section!(sourced_files);
+    pair_section!(zstyle);
+    pair_section!(plugins);
+    for (sub, entries) in s.extras.iter() {
+        for (k, v) in entries.iter() {
+            push(
+                format!("extras/{}/{}", sub.as_str(), k.as_str()),
+                v.as_str(),
+                "extras",
+            );
+        }
+    }
+
+    records.sort_by(|a, b| a.key.cmp(&b.key));
+    Decoded {
+        format: "zshrs canonical shard (ZSHS)".into(),
+        kind: FormatKind::Canonical,
+        header: vec![
+            ("magic".into(), format!("{:#010x}", u32::from(s.header.magic))),
+            (
+                "format_version".into(),
+                u32::from(s.header.format_version).to_string(),
+            ),
+            ("generation".into(), u64::from(s.header.generation).to_string()),
+            ("built_at_ns".into(), u64::from(s.header.built_at_ns).to_string()),
+            ("slug".into(), s.header.slug.as_str().to_string()),
+            ("source_root".into(), s.header.source_root.as_str().to_string()),
+            (
+                "entry_count".into(),
+                u32::from(s.header.entry_count).to_string(),
+            ),
+        ],
+        records,
+    }
+}
+
+/// What a canonical-shard edit does to the addressed slot.
+enum CanonicalOp {
+    Set(String),
+    Delete,
+    /// Re-key a map entry (lists are positional, so they refuse this).
+    Rename(String),
+    /// Insert a new empty slot at the address.
+    Add,
+}
+
+/// Apply `op` to the slot named by `addr` in a canonical shard.
+///
+/// Addresses are exactly what [`decode_canonical`] emits: `section/<key>` for the
+/// maps, `section[<index>]` for the lists and pair-lists, `extras/<sub>/<key>`
+/// for the nested map. An address naming a section that does not exist, or an
+/// index past the end, is refused rather than silently creating something the
+/// shell would not recognize.
+fn canonical_edit(bytes: &[u8], addr: &str, op: CanonicalOp) -> Result<Vec<u8>, String> {
+    // `extras/<sub>/<key>` has two separators, so it is matched before the
+    // one-separator map form.
+    if let Some(rest) = addr.strip_prefix("extras/") {
+        let (sub, key) = rest.split_once('/').ok_or("extras address needs <sub>/<key>")?;
+        let (sub, key) = (sub.to_string(), key.to_string());
+        return edit_shard::<CanonicalShard, _>(bytes, move |s| match op {
+            CanonicalOp::Set(v) => {
+                s.extras.entry(sub).or_default().insert(key, v);
+            }
+            CanonicalOp::Add => {
+                s.extras.entry(sub).or_default().entry(key).or_default();
+            }
+            CanonicalOp::Delete => {
+                if let Some(m) = s.extras.get_mut(&sub) {
+                    m.remove(&key);
+                }
+            }
+            CanonicalOp::Rename(new) => {
+                // The new name may be typed bare or as a full address; anything
+                // naming a different subsystem is refused rather than moved.
+                let prefix = format!("extras/{sub}/");
+                let new = new.strip_prefix(prefix.as_str()).unwrap_or(new.as_str()).to_string();
+                if new.contains('/') {
+                    return;
+                }
+                if let Some(m) = s.extras.get_mut(&sub) {
+                    if let Some(v) = m.remove(&key) {
+                        m.insert(new, v);
+                    }
+                }
+            }
+        });
+    }
+
+    if let Some((section, key)) = addr.split_once('/') {
+        let (section, key) = (section.to_string(), key.to_string());
+        return edit_shard::<CanonicalShard, _>(bytes, move |s| {
+            let map = match section.as_str() {
+                "aliases" => &mut s.aliases,
+                "global_aliases" => &mut s.global_aliases,
+                "suffix_aliases" => &mut s.suffix_aliases,
+                "functions" => &mut s.functions,
+                "autoload_functions" => &mut s.autoload_functions,
+                "bindkeys" => &mut s.bindkeys,
+                "named_dirs" => &mut s.named_dirs,
+                "compdef" => &mut s.compdef,
+                "env_exports" => &mut s.env_exports,
+                "params" => &mut s.params,
+                _ => return,
+            };
+            match op {
+                CanonicalOp::Set(v) => {
+                    map.insert(key, v);
+                }
+                CanonicalOp::Add => {
+                    map.entry(key).or_default();
+                }
+                CanonicalOp::Delete => {
+                    map.remove(&key);
+                }
+                CanonicalOp::Rename(new) => {
+                    // Accept `newkey` or `section/newkey`; a different section is
+                    // refused, since moving an entry across sections would change
+                    // what the shell does with it.
+                    let prefix = format!("{section}/");
+                    let new = new.strip_prefix(prefix.as_str()).unwrap_or(new.as_str()).to_string();
+                    if new.contains('/') {
+                        return;
+                    }
+                    if let Some(v) = map.remove(&key) {
+                        map.insert(new, v);
+                    }
+                }
+            }
+        });
+    }
+
+    // `section[index]`
+    let (section, idx) = addr
+        .strip_suffix(']')
+        .and_then(|a| a.split_once('['))
+        .ok_or_else(|| format!("unknown canonical address: {addr}"))?;
+    let idx: usize = idx.parse().map_err(|_| format!("bad index in {addr}"))?;
+    let section = section.to_string();
+    edit_shard::<CanonicalShard, _>(bytes, move |s| {
+        // Pair lists carry two strings per row; the record renders them
+        // space-joined, so a Set splits on the first space.
+        if let Some(pairs) = match section.as_str() {
+            "zstyle" => Some(&mut s.zstyle),
+            "plugins" => Some(&mut s.plugins),
+            _ => None,
+        } {
+            match op {
+                CanonicalOp::Set(v) => {
+                    if let Some(slot) = pairs.get_mut(idx) {
+                        let (a, b) = v.split_once(' ').unwrap_or((v.as_str(), ""));
+                        *slot = (a.to_string(), b.to_string());
+                    }
+                }
+                CanonicalOp::Add => pairs.push((String::new(), String::new())),
+                CanonicalOp::Delete => {
+                    if idx < pairs.len() {
+                        pairs.remove(idx);
+                    }
+                }
+                CanonicalOp::Rename(_) => {}
+            }
+            return;
+        }
+        let list = match section.as_str() {
+            "setopts" => &mut s.setopts,
+            "unsetopts" => &mut s.unsetopts,
+            "zmodload" => &mut s.zmodload,
+            "path" => &mut s.path,
+            "fpath" => &mut s.fpath,
+            "manpath" => &mut s.manpath,
+            "sourced_files" => &mut s.sourced_files,
+            _ => return,
+        };
+        match op {
+            CanonicalOp::Set(v) => {
+                if let Some(slot) = list.get_mut(idx) {
+                    *slot = v;
+                }
+            }
+            CanonicalOp::Add => list.push(String::new()),
+            CanonicalOp::Delete => {
+                if idx < list.len() {
+                    list.remove(idx);
+                }
+            }
+            CanonicalOp::Rename(_) => {}
+        }
+    })
+}
+
+/// A canonical shard's values are text, so an edit arrives as UTF-8 (the hex
+/// entry form still works — it is decoded to bytes before this point).
+fn canonical_text(value: Vec<u8>) -> Result<String, String> {
+    String::from_utf8(value).map_err(|_| "canonical shard values are text, not binary".to_string())
+}
+
+#[cfg(test)]
+mod canonical_tests {
+    use super::*;
+
+    /// A shard shaped like the daemon's: one entry in each of the three section
+    /// kinds plus a nested extras subsystem.
+    fn shard() -> CanonicalShard {
+        let mut aliases = HashMap::new();
+        aliases.insert("ll".to_string(), "ls -la".to_string());
+        let mut extras = HashMap::new();
+        let mut sub = HashMap::new();
+        sub.insert("_git".to_string(), "#compdef git".to_string());
+        extras.insert("autoload_completion".to_string(), sub);
+        CanonicalShard {
+            header: CanonicalHeader {
+                magic: CANONICAL_MAGIC,
+                format_version: 1,
+                generation: 7,
+                built_at_ns: 42,
+                slug: "zinit-plugin-example".into(),
+                source_root: "/tmp/example".into(),
+                entry_count: 3,
+            },
+            aliases,
+            global_aliases: HashMap::new(),
+            suffix_aliases: HashMap::new(),
+            functions: HashMap::new(),
+            autoload_functions: HashMap::new(),
+            setopts: vec!["extended_glob".into()],
+            unsetopts: Vec::new(),
+            bindkeys: HashMap::new(),
+            named_dirs: HashMap::new(),
+            compdef: HashMap::new(),
+            zstyle: vec![(":completion:*".into(), "menu select".into())],
+            zmodload: Vec::new(),
+            env_exports: HashMap::new(),
+            params: HashMap::new(),
+            path: vec!["/usr/bin".into()],
+            fpath: Vec::new(),
+            manpath: Vec::new(),
+            plugins: Vec::new(),
+            sourced_files: Vec::new(),
+            extras,
+        }
+    }
+
+    fn bytes() -> Vec<u8> {
+        rkyv::to_bytes::<_, 4096>(&shard()).expect("serialize").into_vec()
+    }
+
+    #[test]
+    fn the_zshs_magic_is_recognized_and_projected_into_records() {
+        let d = try_decode(&bytes()).expect("recognized");
+        assert_eq!(d.format, "zshrs canonical shard (ZSHS)");
+        assert!(matches!(d.kind, FormatKind::Canonical));
+
+        let keys: Vec<&str> = d.records.iter().map(|r| r.key.as_str()).collect();
+        assert!(keys.contains(&"aliases/ll"), "map entries are section/key: {keys:?}");
+        assert!(keys.contains(&"path[0]"), "list entries are section[index]: {keys:?}");
+        assert!(keys.contains(&"zstyle[0]"), "pair lists are indexed too: {keys:?}");
+        assert!(
+            keys.contains(&"extras/autoload_completion/_git"),
+            "extras nest one level deeper: {keys:?}"
+        );
+
+        let alias = d.records.iter().find(|r| r.key == "aliases/ll").unwrap();
+        assert_eq!(alias.value, b"ls -la");
+        assert!(d.header.iter().any(|(k, v)| k == "slug" && v == "zinit-plugin-example"));
+    }
+
+    #[test]
+    fn a_map_entry_round_trips_through_edit_and_delete() {
+        let edited = set_value(&bytes(), FormatKind::Canonical, "aliases/ll", b"ls -A".to_vec())
+            .expect("set");
+        let d = try_decode(&edited).expect("still valid");
+        let alias = d.records.iter().find(|r| r.key == "aliases/ll").unwrap();
+        assert_eq!(alias.value, b"ls -A", "the shell reads the new value");
+
+        let renamed =
+            rename_record(&edited, FormatKind::Canonical, "aliases/ll", "aliases/l").expect("rename");
+        let d = try_decode(&renamed).expect("valid");
+        assert!(d.records.iter().any(|r| r.key == "aliases/l"));
+        assert!(!d.records.iter().any(|r| r.key == "aliases/ll"));
+
+        let deleted = delete_record(&renamed, FormatKind::Canonical, "aliases/l").expect("delete");
+        let d = try_decode(&deleted).expect("valid");
+        assert!(!d.records.iter().any(|r| r.key.starts_with("aliases/")));
+    }
+
+    #[test]
+    fn a_list_slot_is_addressed_by_index() {
+        let edited = set_value(&bytes(), FormatKind::Canonical, "path[0]", b"/opt/bin".to_vec())
+            .expect("set");
+        let d = try_decode(&edited).expect("valid");
+        let row = d.records.iter().find(|r| r.key == "path[0]").unwrap();
+        assert_eq!(row.value, b"/opt/bin");
+
+        let deleted = delete_record(&edited, FormatKind::Canonical, "path[0]").expect("delete");
+        let d = try_decode(&deleted).expect("valid");
+        assert!(!d.records.iter().any(|r| r.key.starts_with("path[")), "the row is gone");
+    }
+
+    #[test]
+    fn an_unknown_section_is_refused_rather_than_inventing_state() {
+        let before = bytes();
+        let after = set_value(&before, FormatKind::Canonical, "nosuch/key", b"x".to_vec())
+            .expect("re-serializes");
+        let d = try_decode(&after).expect("valid");
+        assert!(
+            !d.records.iter().any(|r| r.key.starts_with("nosuch")),
+            "an address the shell has no section for must not create one"
+        );
     }
 }
