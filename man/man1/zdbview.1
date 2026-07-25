@@ -47,18 +47,61 @@ Force treating the file as a rkyv archive / raw binary. Mutually exclusive with
 Non-interactively dump the file's contents to standard output and exit, without
 starting the TUI.
 .I FORMAT
-is
-.B json
-or
-.BR csv .
+is one of
+.BR json ", " csv ", " tsv ", " markdown ", " insert ", " line " or " sql ,
+the sqlite3 shell's output modes plus
+.B sql
+for
+.BR .dump .
 For SQLite,
 .B json
 emits an object of
 .RI { table :\  [ rows ]}
-for every table and
-.B csv
-emits the first table. For a recognized rkyv archive, records are emitted as
-JSON with the value blob as a hex string.
+for every table,
+.BR csv ", " tsv ", " markdown " and " line
+emit one table (the first unless
+.B \-\-table
+names another),
+.B insert
+emits one
+.B INSERT
+per row, and
+.B sql
+emits every
+.B CREATE
+followed by its rows, wrapped in
+.BR "PRAGMA foreign_keys=OFF" / BEGIN / COMMIT ,
+reading values from the database rather than from the grid so a blob keeps its
+bytes as a
+.B x\(aq...\(aq
+literal.
+A virtual table is registered by writing its
+.B sqlite_schema
+row under
+.BR "PRAGMA writable_schema=ON" ,
+and its shadow tables are emitted with
+.BR "CREATE TABLE IF NOT EXISTS" ,
+because
+.B CREATE VIRTUAL TABLE
+would build them a second time and the script would not replay. For a recognized
+rkyv archive, records are emitted as JSON with the value blob as a hex string.
+.TP
+.BI \-\-table " TABLE"
+Restrict
+.B \-\-export
+to one table. An unknown name is an error.
+.TP
+.BI \-\-backup " FILE"
+Copy the database to
+.I FILE
+with
+.BR "VACUUM INTO" ,
+the shell's
+.BR .backup ,
+and exit. This is the only way to copy a database that may have writers without
+stopping them. An existing
+.I FILE
+is an error rather than an overwrite.
 .TP
 .BI \-\-theme " NAME"
 Use color scheme
@@ -163,9 +206,22 @@ the transcript, and the readline chords move and kill as elsewhere.
 .B Esc
 returns to the data with the transcript intact.
 .PP
+.B Alt\-e
+(or
+.BR F5 ,
+for terminals that swallow Meta) shows the statement's query plan instead of
+running it, drawn as the shell's
+.B .eqp
+draws it: a
+.B QUERY PLAN
+header over an ASCII tree built from each step's id and parent.
+.PP
 A statement that returns columns is shown as a grid with a row count, capped at
 five hundred rows and saying so when the cap bites; anything else reports the rows
-it changed and reloads the grid; a refusal shows SQLite's own message.
+it changed and reloads the grid; a refusal shows SQLite's own message. Every
+statement is timed, as the shell's
+.B .timer
+reports it.
 .SH RKYV MODE
 The rkyv format stores no field names and no type tags, so a generic reader
 cannot recover the schema of an arbitrary archive without the originating Rust
@@ -374,6 +430,29 @@ are its own motions and digits there rather than the help and scheme keys.
 .TP
 .B S
 Show the SQLite schema (CREATE statements for tables, views, and indexes).
+.TP
+.B D
+Open the database report: the pragmas the shell's
+.B .dbinfo
+prints (page size and count, freelist, encoding, journal mode, synchronous,
+auto-vacuum, schema and user version, application id, foreign keys, the derived
+data size) plus counts of tables, indexes, views and triggers. Inside it,
+.B i
+runs
+.BR "PRAGMA integrity_check" ,
+.B Q
+the cheaper
+.BR "PRAGMA quick_check" ,
+and
+.B f
+reports foreign keys with no index to serve them \(em the shell's
+.BR ".lint fkey\-indexes" .
+Those three run on a keypress rather than on open because each walks the whole
+file.
+.B Esc
+or
+.B D
+returns to the data.
 .TP
 .B s
 Sort the row grid by the column under the cursor: ascending, descending on a
@@ -639,6 +718,18 @@ Pick from the files opened recently:
 .PP
 .RS 4
 .B zdbview
+.RE
+.PP
+Dump one table as replayable SQL:
+.PP
+.RS 4
+.B zdbview data.db \-\-export sql \-\-table users
+.RE
+.PP
+Copy a live database consistently:
+.PP
+.RS 4
+.B zdbview ~/.zshrs/history.db \-\-backup /tmp/history\-copy.db
 .RE
 .SH SEE ALSO
 .BR zdbviewall (1),

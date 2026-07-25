@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="dark light">
-  <meta name="description" content="zdbview — terminal inspector and CRUD editor for rkyv archives and SQLite databases. One binary: generic SQLite CRUD by rowid, key/value decoding for 10 recognized rkyv cache formats with structural fallback, whole-table search, detail view, CSV/JSON export, OSC 52 clipboard, recent-files picker.">
+  <meta name="description" content="zdbview — terminal inspector and CRUD editor for rkyv archives and SQLite databases. One binary: generic SQLite CRUD by rowid, key/value decoding for 10 recognized rkyv cache formats with structural fallback, whole-table search, detail view, output in the sqlite3 shell's modes plus a replayable .dump, database report with integrity check and foreign-key lint, VACUUM INTO backup, OSC 52 clipboard, recent-files picker.">
   <title>zdbview — Documentation</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -92,7 +92,7 @@
             <span class="sep">/</span>
             <a href="https://github.com/MenkeTechnologies/zdbview/issues" target="_blank" rel="noopener noreferrer">Issues</a>
           </nav>
-          <p class="docs-build-line" id="zdbviewBuildLine">zdbview v0.6.0 · startup scan for shards and databases · ratatui + crossterm TUI · generic SQLite CRUD by rowid · 10 recognized rkyv cache formats with structural fallback · full rkyv CRUD write-back (atomic, byte-identical re-serialization) · whole-table search · CSV/JSON export · OSC 52 clipboard</p>
+          <p class="docs-build-line" id="zdbviewBuildLine">zdbview v0.6.0 · startup scan for shards and databases · ratatui + crossterm TUI · generic SQLite CRUD by rowid · 10 recognized rkyv cache formats with structural fallback · full rkyv CRUD write-back (atomic, byte-identical re-serialization) · whole-table search · output in every sqlite3 shell mode plus <code>.dump</code> · <code>.dbinfo</code>/<code>.intck</code>/<code>.lint</code> report · <code>VACUUM INTO</code> backup · OSC 52 clipboard</p>
         </div>
         <div class="tutorial-toolbar">
           <button type="button" class="btn btn-secondary" id="btnTheme" title="Toggle light/dark">Theme</button>
@@ -215,10 +215,11 @@ zdbview</pre>
             <tr><td>/</td><td>Filter the list as you type — <code>Enter</code> keeps it, <code>Esc</code> clears it</td></tr>
             <tr><td>n / N</td><td>Next / previous match — in the displayed order, so sorting is respected</td></tr>
             <tr><td>e a d</td><td>Edit cell / insert row / delete row (SQLite)</td></tr>
-            <tr><td>:</td><td>SQL editor — multi-line, Tab completion, transcript, history (SQLite)</td></tr>
+            <tr><td>:</td><td>SQL editor — multi-line, Tab completion, transcript, history, per-statement timing, <code>Alt-e</code>/<code>F5</code> for the query plan (SQLite)</td></tr>
             <tr><td>s</td><td>Sort by the column under the cursor: ascending &rarr; descending &rarr; off (SQLite)</td></tr>
             <tr><td>&lt; / &gt;</td><td>Move the sort to the previous / next column, keeping the direction</td></tr>
             <tr><td>S</td><td>Schema view for the selected table (SQLite)</td></tr>
+            <tr><td>D</td><td>Database report — <code>.dbinfo</code> pragmas and object counts, then <code>i</code> integrity check, <code>Q</code> quick check, <code>f</code> foreign-key lint (SQLite)</td></tr>
             <tr><td>0 1 2 3</td><td>Records / Info / Strings / Hex (rkyv — <code>0</code> only when the format was recognized)</td></tr>
             <tr><td>a e r d</td><td>Create / hex-edit value / rename key / delete record (rkyv Records)</td></tr>
             <tr><td>i Tab o x ^s</td><td>Inside the hex editor: EDIT mode / hex&harr;ascii column / insert / delete / save</td></tr>
@@ -259,11 +260,19 @@ zdbview</pre>
 
       <section class="tutorial-section">
         <h2>Export</h2>
-        <p>Interactive <code>x</code> writes the current table (CSV) or all decoded records (JSON) to a file in the working directory. The same rendering is available non-interactively, which is what makes zdbview scriptable:</p>
-<pre>zdbview data.db --export json      # { table: [ {col: val, …}, … ] } for every table
-zdbview data.db --export csv       # the first table as RFC-4180 CSV
-zdbview cache.rkyv --export json   # decoded records; each value blob as lowercase hex</pre>
+        <p>Interactive <code>x</code> writes the current table (CSV) or all decoded records (JSON) to a file in the working directory. Non-interactively, <code>--export</code> takes the sqlite3 shell's output modes and <code>--table</code> restricts it to one table, which is what makes zdbview scriptable:</p>
+<pre>zdbview data.db --export json               # { table: [ {col: val, …}, … ] } for every table
+zdbview data.db --export csv                # the first table as RFC-4180 CSV
+zdbview data.db --export tsv                # .mode tabs — tabs and newlines escaped, never raw
+zdbview data.db --export markdown           # .mode markdown — padded GitHub table
+zdbview data.db --export line               # .mode line — one column per line
+zdbview data.db --export insert             # .mode insert — one INSERT per row
+zdbview data.db --export sql                # .dump — schema plus data, replayable
+zdbview data.db --export csv --table users  # just that table
+zdbview cache.rkyv --export json            # decoded records; each value blob as lowercase hex</pre>
         <p class="doc-note">CSV and JSON are emitted by a dependency-free writer in <code>export.rs</code> — quoting and escaping are covered by unit tests. <code>--export</code> never starts the TUI, so it is safe in a pipeline.</p>
+        <p><code>--export sql</code> is <code>.dump</code>, and it reads values from the database rather than from the grid, so a blob comes out as <code>x'…'</code> and a real keeps its decimal point. Virtual tables are the case that makes a naive dump unreplayable: <code>CREATE VIRTUAL TABLE</code> runs the module's constructor and builds the shadow tables, which the dump would then create a second time. zdbview does what the shell does — writes the <code>sqlite_schema</code> row directly under <code>PRAGMA writable_schema=ON</code> and emits the shadow tables with <code>CREATE TABLE IF NOT EXISTS</code> — so an FTS5 index survives the round trip and still answers <code>MATCH</code>. Checked line-for-line against <code>sqlite3 .dump</code>: identical content, differing only in the order <code>sqlite_master</code> is walked.</p>
+        <p><code>--backup FILE</code> copies a database with <code>VACUUM INTO</code> (the shell's <code>.backup</code>), the one consistent way to copy a file that may have writers. An existing target is an error, not an overwrite.</p>
       </section>
 
       <section class="tutorial-section">
@@ -284,7 +293,9 @@ zdbview cache.rkyv --export json   # decoded records; each value blob as lowerca
             <tr><td>[FILE]</td><td>File to open; with none, the recent-files picker opens</td></tr>
             <tr><td>&nbsp;&nbsp;&nbsp;&nbsp;--sqlite</td><td>Force the SQLite backend</td></tr>
             <tr><td>&nbsp;&nbsp;&nbsp;&nbsp;--rkyv</td><td>Force the rkyv / binary inspector (conflicts with <code>--sqlite</code>)</td></tr>
-            <tr><td>&nbsp;&nbsp;&nbsp;&nbsp;--export FORMAT</td><td>Dump the file to stdout and exit — <code>json</code> or <code>csv</code>; requires a file argument</td></tr>
+            <tr><td>&nbsp;&nbsp;&nbsp;&nbsp;--export FORMAT</td><td>Dump the file to stdout and exit — <code>json</code>, <code>csv</code>, <code>tsv</code>, <code>markdown</code>, <code>insert</code>, <code>line</code> or <code>sql</code>; requires a file argument</td></tr>
+            <tr><td>&nbsp;&nbsp;&nbsp;&nbsp;--table TABLE</td><td>Restrict <code>--export</code> to one table</td></tr>
+            <tr><td>&nbsp;&nbsp;&nbsp;&nbsp;--backup FILE</td><td>Copy the database with <code>VACUUM INTO</code> and exit</td></tr>
             <tr><td>-h, --help</td><td>Print usage</td></tr>
             <tr><td>-V, --version</td><td>Print the version</td></tr>
           </tbody>

@@ -444,6 +444,268 @@ impl SqliteStore {
         })
     }
 
+    /// The facts the sqlite3 shell prints for `.dbinfo`, plus the journal mode and
+    /// the two user-visible versions. Each is a pragma, so this is cheap.
+    pub fn db_info(&self) -> Vec<(String, String)> {
+        let scalar = |sql: &str| -> String {
+            self.conn
+                .query_row(sql, [], |r| r.get::<_, rusqlite::types::Value>(0))
+                .map(|v| match v {
+                    rusqlite::types::Value::Integer(i) => i.to_string(),
+                    rusqlite::types::Value::Text(t) => t,
+                    rusqlite::types::Value::Real(f) => f.to_string(),
+                    rusqlite::types::Value::Null => "—".into(),
+                    rusqlite::types::Value::Blob(b) => format!("<{} bytes>", b.len()),
+                })
+                .unwrap_or_else(|e| format!("? ({e})"))
+        };
+        let mut out = vec![
+            ("page size".into(), scalar("PRAGMA page_size")),
+            ("page count".into(), scalar("PRAGMA page_count")),
+            ("freelist pages".into(), scalar("PRAGMA freelist_count")),
+            ("encoding".into(), scalar("PRAGMA encoding")),
+            ("journal mode".into(), scalar("PRAGMA journal_mode")),
+            ("synchronous".into(), scalar("PRAGMA synchronous")),
+            ("auto vacuum".into(), scalar("PRAGMA auto_vacuum")),
+            ("schema version".into(), scalar("PRAGMA schema_version")),
+            ("user version".into(), scalar("PRAGMA user_version")),
+            ("application id".into(), scalar("PRAGMA application_id")),
+            ("foreign keys".into(), scalar("PRAGMA foreign_keys")),
+        ];
+        // Sizes the shell derives rather than reads.
+        if let (Ok(ps), Ok(pc)) = (
+            scalar("PRAGMA page_size").parse::<u64>(),
+            scalar("PRAGMA page_count").parse::<u64>(),
+        ) {
+            out.push(("data size".into(), format!("{} bytes", ps * pc)));
+        }
+        let counts = |what: &str, sql: &str| -> (String, String) {
+            (
+                what.into(),
+                self.conn
+                    .query_row(sql, [], |r| r.get::<_, i64>(0))
+                    .map(|n| n.to_string())
+                    .unwrap_or_else(|_| "?".into()),
+            )
+        };
+        out.push(counts(
+            "tables",
+            "SELECT count(*) FROM sqlite_master WHERE type='table'",
+        ));
+        out.push(counts(
+            "indexes",
+            "SELECT count(*) FROM sqlite_master WHERE type='index'",
+        ));
+        out.push(counts(
+            "views",
+            "SELECT count(*) FROM sqlite_master WHERE type='view'",
+        ));
+        out.push(counts(
+            "triggers",
+            "SELECT count(*) FROM sqlite_master WHERE type='trigger'",
+        ));
+        out
+    }
+
+    /// `PRAGMA integrity_check` (or the cheaper `quick_check`), as the shell's
+    /// `.intck` runs it. `Ok` reports the lines SQLite returned; a healthy database
+    /// answers with the single line `ok`.
+    pub fn integrity_check(&self, quick: bool) -> Result<Vec<String>> {
+        let sql = if quick {
+            "PRAGMA quick_check"
+        } else {
+            "PRAGMA integrity_check"
+        };
+        let mut stmt = self.conn.prepare(sql)?;
+        let rows = stmt
+            .query_map([], |r| r.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Foreign keys with no index to serve them, which is what the shell's
+    /// `.lint fkey-indexes` reports: without one, every parent-row change scans
+    /// the child table.
+    pub fn missing_fk_indexes(&self) -> Result<Vec<String>> {
+        let mut out = Vec::new();
+        for table in &self.tables {
+            let mut fks = self
+                .conn
+                .prepare(&format!("PRAGMA foreign_key_list(\"{}\")", esc(table)))?;
+            let keys: Vec<(String, String)> = fks
+                .query_map([], |r| Ok((r.get::<_, String>(2)?, r.get::<_, String>(3)?)))?
+                .filter_map(|r| r.ok())
+                .collect();
+            if keys.is_empty() {
+                continue;
+            }
+            // Every index on the child table, with its first column.
+            let mut idx = self
+                .conn
+                .prepare(&format!("PRAGMA index_list(\"{}\")", esc(table)))?;
+            let indexes: Vec<String> = idx
+                .query_map([], |r| r.get::<_, String>(1))?
+                .filter_map(|r| r.ok())
+                .collect();
+            let mut first_cols: Vec<String> = Vec::new();
+            for i in &indexes {
+                let mut info = self
+                    .conn
+                    .prepare(&format!("PRAGMA index_info(\"{}\")", esc(i)))?;
+                let cols: Vec<Option<String>> = info
+                    .query_map([], |r| r.get::<_, Option<String>>(2))?
+                    .filter_map(|r| r.ok())
+                    .collect();
+                if let Some(Some(c)) = cols.into_iter().next() {
+                    first_cols.push(c);
+                }
+            }
+            for (parent, child_col) in keys {
+                if !first_cols
+                    .iter()
+                    .any(|c| c.eq_ignore_ascii_case(&child_col))
+                {
+                    out.push(format!(
+                        "{table}.{child_col} -> {parent}: no index on the child column"
+                    ));
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// The query plan for `sql`, drawn as the shell's `.eqp` draws it: a
+    /// `QUERY PLAN` header over an ASCII tree built from each step's id/parent.
+    pub fn explain_plan(&self, sql: &str) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}"))?;
+        // id, parent, detail — the shell ignores the third column.
+        let steps: Vec<(i64, i64, String)> = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(3)?)))?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(plan_tree(&steps))
+    }
+
+    /// Every object's `CREATE` plus its rows as `INSERT`s: the shell's `.dump`.
+    /// `table` restricts it to one table.
+    ///
+    /// Two details decide whether the output can actually be replayed, and both
+    /// were learned by diffing against `sqlite3 .dump`:
+    ///
+    /// * A **virtual table** must not be created with `CREATE VIRTUAL TABLE`,
+    ///   because that runs the module's constructor and builds its shadow tables,
+    ///   which the dump then tries to create again. The shell instead registers it
+    ///   by inserting the row straight into `sqlite_schema` under
+    ///   `PRAGMA writable_schema=ON`, and emits the shadow tables itself with
+    ///   `CREATE TABLE IF NOT EXISTS`.
+    /// * Values must be written as SQL **literals**, not as the display strings the
+    ///   grid shows: a blob has to come out as `x'…'` or the data is lost.
+    pub fn dump(&self, table: Option<&str>) -> Result<String> {
+        let filter = match table {
+            Some(t) => format!(" AND tbl_name = '{}'", t.replace('\'', "''")),
+            None => String::new(),
+        };
+        let sql = format!(
+            "SELECT type, name, sql FROM sqlite_master \
+             WHERE sql IS NOT NULL AND name NOT LIKE 'sqlite_%'{filter} \
+             ORDER BY CASE type WHEN 'table' THEN 0 WHEN 'index' THEN 1 ELSE 2 END, name"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let objects: Vec<(String, String, String)> = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        let virtuals: Vec<&String> = objects
+            .iter()
+            .filter(|(_, _, sql)| {
+                sql.trim_start()
+                    .to_uppercase()
+                    .starts_with("CREATE VIRTUAL")
+            })
+            .map(|(_, name, _)| name)
+            .collect();
+        let is_shadow = |name: &str| {
+            virtuals
+                .iter()
+                .any(|v| name.len() > v.len() + 1 && name.starts_with(&format!("{v}_")))
+        };
+
+        let mut out = String::from("PRAGMA foreign_keys=OFF;\nBEGIN TRANSACTION;\n");
+        if !virtuals.is_empty() {
+            out.push_str("PRAGMA writable_schema=ON;\n");
+        }
+        for (kind, name, create) in &objects {
+            if kind != "table" {
+                out.push_str(create.trim_end_matches(';'));
+                out.push_str(";\n");
+                continue;
+            }
+            if virtuals.contains(&name) {
+                // Register the virtual table without running its constructor.
+                out.push_str(&format!(
+                    "INSERT INTO sqlite_schema(type,name,tbl_name,rootpage,sql)VALUES('table','{}','{}',0,'{}');\n",
+                    name.replace('\'', "''"),
+                    name.replace('\'', "''"),
+                    create.trim_end_matches(';').replace('\'', "''")
+                ));
+                // Its data lives in the shadow tables, which follow.
+                continue;
+            }
+            if is_shadow(name) {
+                // The shadow table may already exist once the module sees its
+                // schema row, so create it only if absent.
+                let create = create.trim_end_matches(';');
+                let created = create.replacen("CREATE TABLE ", "CREATE TABLE IF NOT EXISTS ", 1);
+                out.push_str(&created);
+                out.push_str(";\n");
+            } else {
+                out.push_str(create.trim_end_matches(';'));
+                out.push_str(";\n");
+            }
+            for row in self.literal_rows(name)? {
+                out.push_str(&format!(
+                    "INSERT INTO {} VALUES({});\n",
+                    quoted_name(name),
+                    row.join(",")
+                ));
+            }
+        }
+        if !virtuals.is_empty() {
+            out.push_str("PRAGMA writable_schema=OFF;\n");
+        }
+        out.push_str("COMMIT;\n");
+        Ok(out)
+    }
+
+    /// Every row of `table` as SQL literals — the form a dump needs, where a blob
+    /// is `x'…'` rather than a description of itself.
+    fn literal_rows(&self, table: &str) -> Result<Vec<Vec<String>>> {
+        let mut stmt = self
+            .conn
+            .prepare(&format!("SELECT * FROM {}", quoted_name(table)))?;
+        let ncols = stmt.column_count();
+        let mut out = Vec::new();
+        let mut q = stmt.query([])?;
+        while let Some(row) = q.next()? {
+            let mut cells = Vec::with_capacity(ncols);
+            for i in 0..ncols {
+                cells.push(value_to_literal(row, i));
+            }
+            out.push(cells);
+        }
+        Ok(out)
+    }
+
+    /// `VACUUM INTO` — the shell's `.backup` in one statement, and the only way to
+    /// copy a live database consistently without stopping writers.
+    pub fn backup_to(&self, path: &std::path::Path) -> Result<()> {
+        let target = path.to_string_lossy().replace('\'', "''");
+        self.conn
+            .execute_batch(&format!("VACUUM INTO '{target}'"))?;
+        Ok(())
+    }
+
     /// Table and view names with their columns, for the SQL editor's completion.
     pub fn schema_names(&self) -> Vec<(String, Vec<String>)> {
         self.tables
@@ -465,6 +727,77 @@ pub enum Outcome {
     },
     /// Rows changed by a statement that returns nothing.
     Changed(usize),
+}
+
+/// Render an `EXPLAIN QUERY PLAN` result the way the sqlite3 shell does: each
+/// step under its parent, `|--` while siblings follow and `` `-- `` for the last
+/// one, with `|  ` carried down for every ancestor that still has siblings.
+fn plan_tree(steps: &[(i64, i64, String)]) -> Vec<String> {
+    if steps.is_empty() {
+        return Vec::new();
+    }
+    let mut out = vec!["QUERY PLAN".to_string()];
+    fn walk(steps: &[(i64, i64, String)], parent: i64, prefix: &str, out: &mut Vec<String>) {
+        let kids: Vec<&(i64, i64, String)> =
+            steps.iter().filter(|(_, p, _)| *p == parent).collect();
+        for (i, (id, _, detail)) in kids.iter().enumerate() {
+            let last = i + 1 == kids.len();
+            out.push(format!(
+                "{prefix}{}{detail}",
+                if last { "`--" } else { "|--" }
+            ));
+            walk(
+                steps,
+                *id,
+                &format!("{prefix}{}", if last { "   " } else { "|  " }),
+                out,
+            );
+        }
+    }
+    walk(steps, 0, "", &mut out);
+    out
+}
+
+/// A name as SQL: quoted only when it needs to be, which is how the shell writes
+/// it (`INSERT INTO history …`, but `CREATE TABLE 'history_fts_data'`).
+fn quoted_name(name: &str) -> String {
+    if !name.is_empty()
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        && !name.chars().next().unwrap().is_ascii_digit()
+    {
+        name.to_string()
+    } else {
+        format!("\"{}\"", name.replace('"', "\"\""))
+    }
+}
+
+/// One cell as a SQL literal, for a dump: `NULL`, a bare number, a quoted string,
+/// or `x'…'` for a blob.
+fn value_to_literal(row: &rusqlite::Row, idx: usize) -> String {
+    match row.get_ref(idx) {
+        Ok(ValueRef::Null) => "NULL".into(),
+        Ok(ValueRef::Integer(i)) => i.to_string(),
+        Ok(ValueRef::Real(f)) => {
+            // A float has to round-trip, and needs a decimal point to stay a float.
+            let s = format!("{f:?}");
+            if s.contains(['.', 'e', 'E', 'n']) {
+                s
+            } else {
+                format!("{s}.0")
+            }
+        }
+        Ok(ValueRef::Text(t)) => format!("'{}'", String::from_utf8_lossy(t).replace('\'', "''")),
+        Ok(ValueRef::Blob(b)) => {
+            let mut out = String::with_capacity(b.len() * 2 + 3);
+            out.push_str("x'");
+            for byte in b {
+                out.push_str(&format!("{byte:02x}"));
+            }
+            out.push('\'');
+            out
+        }
+        Err(_) => "NULL".into(),
+    }
 }
 
 fn value_to_string(row: &rusqlite::Row, idx: usize) -> String {

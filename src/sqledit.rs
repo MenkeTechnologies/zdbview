@@ -270,6 +270,9 @@ pub enum Action {
     Close,
     /// Run this statement and report back with [`SqlEdit::push`].
     Execute(String),
+    /// Show this statement's query plan instead of running it (Alt-e / F5, the
+    /// shell's `.eqp`).
+    Explain(String),
 }
 
 /// One transcript entry.
@@ -285,6 +288,10 @@ pub enum Entry {
     },
     /// Rows changed by a statement that returns none.
     Changed(usize),
+    /// How long the last statement took, as the shell's `.timer` reports it.
+    Timing(std::time::Duration),
+    /// A query plan, one step per line.
+    Plan(Vec<String>),
     /// The message SQLite refused with.
     Error(String),
 }
@@ -437,6 +444,19 @@ impl SqlEdit {
 
     /// Offer completions for the word before the cursor, or advance through the
     /// ones already offered.
+    /// Ask for the current statement's query plan. Nothing typed, nothing to
+    /// explain.
+    fn explain(&mut self) -> Action {
+        let sql = self.text().trim().to_string();
+        if sql.is_empty() {
+            return Action::None;
+        }
+        self.transcript
+            .push(Entry::Sql(format!("EXPLAIN QUERY PLAN {sql}")));
+        self.follow = true;
+        Action::Explain(sql)
+    }
+
     fn complete(&mut self, back: bool) {
         if let Some(c) = self.completion.as_mut() {
             let n = c.items.len();
@@ -736,6 +756,10 @@ impl SqlEdit {
             }
             KeyCode::Tab => self.complete(false),
             KeyCode::BackTab => self.complete(true),
+            // Alt-e (or F5, for terminals that eat Meta) asks for the plan
+            // instead of the result. `^e` stays readline's end-of-line.
+            KeyCode::Char('e') if alt => return self.explain(),
+            KeyCode::F(5) => return self.explain(),
             // Alt-Enter is zmax's newline; Ctrl-j is the one every terminal sends.
             KeyCode::Enter if alt => self.insert_char('\n'),
             KeyCode::Char('j') if ctrl => self.insert_char('\n'),
@@ -818,6 +842,18 @@ impl SqlEdit {
                     format!("     {} row{} changed", n, if *n == 1 { "" } else { "s" }),
                     Style::default().fg(t.label),
                 ))),
+                Entry::Timing(d) => out.push(Line::from(Span::styled(
+                    format!("     {:.3?}", d),
+                    Style::default().fg(t.dim),
+                ))),
+                Entry::Plan(steps) => {
+                    for s in steps {
+                        out.push(Line::from(Span::styled(
+                            format!("     {s}"),
+                            Style::default().fg(t.label),
+                        )));
+                    }
+                }
                 Entry::Error(msg) => {
                     for l in msg.lines() {
                         out.push(Line::from(Span::styled(

@@ -154,9 +154,23 @@ struct Cli {
         long,
         value_name = "FORMAT",
         help_heading = H_OUTPUT,
-        help = "\x1b[32m//\x1b[0m Dump contents to stdout and exit: json | csv"
+        help = "\x1b[32m//\x1b[0m Dump to stdout and exit: json csv tsv markdown insert line sql"
     )]
     export: Option<String>,
+    #[arg(
+        long,
+        value_name = "TABLE",
+        help_heading = H_OUTPUT,
+        help = "\x1b[32m//\x1b[0m Restrict --export to one table"
+    )]
+    table: Option<String>,
+    #[arg(
+        long,
+        value_name = "FILE",
+        help_heading = H_OUTPUT,
+        help = "\x1b[32m//\x1b[0m Copy the database with VACUUM INTO and exit"
+    )]
+    backup: Option<PathBuf>,
     #[arg(
         long,
         value_name = "NAME",
@@ -220,6 +234,11 @@ fn main() -> Result<()> {
     // `--export` is non-interactive: dump to stdout without touching the TUI.
     if let Some(fmt) = &cli.export {
         return run_export(&cli, fmt);
+    }
+    // `--backup` copies the database with VACUUM INTO, the one consistent way to
+    // copy a file that may have writers.
+    if let Some(dest) = &cli.backup {
+        return run_backup(&cli, dest);
     }
 
     // Resolve --theme before touching the terminal so a typo prints plainly
@@ -302,8 +321,14 @@ fn parse_theme(token: &str) -> Result<theme::ThemeName> {
 
 fn run_export(cli: &Cli, fmt: &str) -> Result<()> {
     let fmt = fmt.to_lowercase();
-    if fmt != "json" && fmt != "csv" {
-        return Err(anyhow!("--export expects 'json' or 'csv', got '{}'", fmt));
+    // The names are the sqlite3 shell's output modes, plus `sql` for `.dump`.
+    const FORMATS: &[&str] = &["json", "csv", "tsv", "markdown", "insert", "line", "sql"];
+    if !FORMATS.contains(&fmt.as_str()) {
+        return Err(anyhow!(
+            "--export expects one of {}, got '{}'",
+            FORMATS.join(" "),
+            fmt
+        ));
     }
     let file = cli
         .file
@@ -311,38 +336,103 @@ fn run_export(cli: &Cli, fmt: &str) -> Result<()> {
         .ok_or_else(|| anyhow!("--export requires a file argument"))?;
     let kind = store::detect(&file, cli.sqlite, cli.rkyv)?;
     let (store, _) = store::Store::open(&file, kind)?;
-    print!("{}", export_store(&store, &fmt)?);
+    print!("{}", export_store(&store, &fmt, cli.table.as_deref())?);
     Ok(())
 }
 
-fn export_store(store: &Store, fmt: &str) -> Result<String> {
+/// `--backup`: copy the database with `VACUUM INTO`, the shell's `.backup`.
+fn run_backup(cli: &Cli, dest: &std::path::Path) -> Result<()> {
+    let file = cli
+        .file
+        .clone()
+        .ok_or_else(|| anyhow!("--backup requires a file argument"))?;
+    let kind = store::detect(&file, cli.sqlite, cli.rkyv)?;
+    if kind != store::Kind::Sqlite {
+        return Err(anyhow!("--backup only applies to a SQLite database"));
+    }
+    if dest.exists() {
+        return Err(anyhow!("{} already exists", dest.display()));
+    }
+    let (store, _) = store::Store::open(&file, kind)?;
+    match &store {
+        Store::Sqlite(s) => s.backup_to(dest)?,
+        _ => return Err(anyhow!("not a SQLite database")),
+    }
+    let size = std::fs::metadata(dest).map(|m| m.len()).unwrap_or(0);
+    println!("wrote {} ({} bytes)", dest.display(), size);
+    Ok(())
+}
+
+fn export_store(store: &Store, fmt: &str, only: Option<&str>) -> Result<String> {
     match store {
         Store::Sqlite(s) => {
-            if fmt == "csv" {
-                let table = s
+            // `sql` is the shell's `.dump`: schema and data for the whole database
+            // or one table.
+            if fmt == "sql" {
+                return s.dump(only);
+            }
+            // Which tables to write: the named one, else the first for the
+            // row-oriented modes, else all of them for JSON.
+            let tables: Vec<String> = match only {
+                Some(t) => {
+                    if !s.tables.iter().any(|x| x == t) {
+                        return Err(anyhow!("no such table: {t}"));
+                    }
+                    vec![t.to_string()]
+                }
+                None if fmt == "json" => s.tables.clone(),
+                None => s
                     .tables
                     .first()
                     .cloned()
-                    .ok_or_else(|| anyhow!("no tables to export"))?;
-                let total = s.count(&table)?;
-                let v = s.rows(&table, total.max(1), 0, None, "")?;
-                Ok(export::rows_to_csv(&v.columns, &v.rows))
-            } else {
-                // JSON: object of { table_name: [rows...] } for every table.
-                let mut out = String::from("{");
-                for (i, t) in s.tables.iter().enumerate() {
-                    if i > 0 {
-                        out.push(',');
-                    }
-                    let total = s.count(t)?;
-                    let v = s.rows(t, total.max(1), 0, None, "")?;
-                    out.push_str(&export::json_escape(t));
-                    out.push(':');
-                    out.push_str(&export::rows_to_json(&v.columns, &v.rows));
+                    .map(|t| vec![t])
+                    .ok_or_else(|| anyhow!("no tables to export"))?,
+            };
+            let page = |t: &str| -> Result<crate::sqlite::RowsView> {
+                let total = s.count(t)?;
+                s.rows(t, total.max(1), 0, None, "")
+            };
+            match fmt {
+                "csv" => {
+                    let v = page(&tables[0])?;
+                    Ok(export::rows_to_csv(&v.columns, &v.rows))
                 }
-                out.push('}');
-                out.push('\n');
-                Ok(out)
+                "tsv" => {
+                    let v = page(&tables[0])?;
+                    Ok(export::rows_to_tsv(&v.columns, &v.rows))
+                }
+                "markdown" => {
+                    let v = page(&tables[0])?;
+                    Ok(export::rows_to_markdown(&v.columns, &v.rows))
+                }
+                "line" => {
+                    let v = page(&tables[0])?;
+                    Ok(export::rows_to_lines(&v.columns, &v.rows))
+                }
+                "insert" => {
+                    let mut out = String::new();
+                    for t in &tables {
+                        let v = page(t)?;
+                        out.push_str(&export::rows_to_inserts(t, &v.columns, &v.rows));
+                    }
+                    Ok(out)
+                }
+                // JSON: object of { table_name: [rows...] }.
+                _ => {
+                    let mut out = String::from("{");
+                    for (i, t) in tables.iter().enumerate() {
+                        if i > 0 {
+                            out.push(',');
+                        }
+                        let v = page(t)?;
+                        out.push_str(&export::json_escape(t));
+                        out.push(':');
+                        out.push_str(&export::rows_to_json(&v.columns, &v.rows));
+                    }
+                    out.push('}');
+                    out.push('\n');
+                    Ok(out)
+                }
             }
         }
         Store::Rkyv(r) => {

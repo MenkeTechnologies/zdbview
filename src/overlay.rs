@@ -60,6 +60,8 @@ pub enum HelpCtx {
     Top,
     /// The SQL editor.
     Sql,
+    /// The database-info screen.
+    DbInfo,
 }
 
 /// The overlay layer: active scheme plus help / chooser / editor / toast state.
@@ -726,6 +728,7 @@ impl HelpCtx {
             HelpCtx::HexEdit => "hex editor",
             HelpCtx::Top => "write monitor",
             HelpCtx::Sql => "SQL editor",
+            HelpCtx::DbInfo => "database",
         }
     }
 }
@@ -762,6 +765,7 @@ fn help_sections(ctx: HelpCtx) -> Vec<HelpSection> {
                     ("Enter", "Run the statement"),
                     ("^j", "Newline (Alt-Enter)"),
                     ("Tab", "Complete the word"),
+                    ("Alt-e / F5", "Query plan"),
                     ("^g", "Clear the input"),
                     ("^l", "Clear the transcript"),
                     ("Esc", "Back to the data"),
@@ -780,6 +784,25 @@ fn help_sections(ctx: HelpCtx) -> Vec<HelpSection> {
                     ("^u / ^k", "Kill to start/end"),
                     ("PgUp/PgDn", "Scroll transcript"),
                 ],
+            },
+        ];
+    }
+    if ctx == HelpCtx::DbInfo {
+        return vec![
+            HelpSection {
+                title: "DATABASE",
+                keys: &[
+                    ("i", "Integrity check"),
+                    ("Q", "Quick check"),
+                    ("f", "Foreign-key lint"),
+                    ("j/k ↑↓", "Scroll"),
+                    ("PgUp/PgDn", "Page"),
+                    ("D / Esc", "Back to the data"),
+                ],
+            },
+            HelpSection {
+                title: "DISPLAY",
+                keys: DISPLAY_KEYS,
             },
         ];
     }
@@ -896,6 +919,7 @@ fn help_sections(ctx: HelpCtx) -> Vec<HelpSection> {
                 ("d", "Delete row"),
                 (":", "Raw SQL"),
                 ("S", "Schema view"),
+                ("D", "Database info"),
                 ("s", "Sort column"),
                 ("< / >", "Sort prev/next col"),
             ],

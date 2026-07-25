@@ -385,3 +385,291 @@ fn sort_column_names_are_escaped() {
     assert_eq!(store.rowid_ordinal("t", 2, Some(&sort)).unwrap(), 1);
     let _ = std::fs::remove_file(&path);
 }
+
+// ----- the sqlite3 shell's own reports (.dbinfo, .intck, .lint, .eqp, .dump) ---
+
+/// A database with one of everything the shell's reports care about: a parent and
+/// a child joined by a foreign key, an index, a view, a trigger, and a row whose
+/// values cover every storage class including a blob and an embedded quote.
+fn reported_db(name: &str) -> (std::path::PathBuf, SqliteStore) {
+    let path = tmp(name);
+    let _ = std::fs::remove_file(&path);
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE parent (id INTEGER PRIMARY KEY, name TEXT);
+         CREATE TABLE child (
+            id INTEGER PRIMARY KEY,
+            parent_id INTEGER REFERENCES parent(id),
+            note TEXT,
+            weight REAL,
+            raw BLOB
+         );
+         CREATE INDEX parent_name_idx ON parent(name);
+         CREATE VIEW child_names AS SELECT c.id, p.name FROM child c JOIN parent p ON p.id = c.parent_id;
+         CREATE TRIGGER child_ins AFTER INSERT ON child BEGIN
+            UPDATE parent SET name = name WHERE id = new.parent_id;
+         END;
+         INSERT INTO parent (id, name) VALUES (1, 'it''s here');
+         INSERT INTO child (id, parent_id, note, weight, raw)
+            VALUES (1, 1, 'plain', 1.5, x'00ff10'), (2, 1, NULL, 2.0, NULL);",
+    )
+    .unwrap();
+    drop(conn);
+    let store = SqliteStore::open(&path).unwrap();
+    (path, store)
+}
+
+fn pairs_get<'a>(info: &'a [(String, String)], key: &str) -> &'a str {
+    info.iter()
+        .find(|(k, _)| k == key)
+        .map(|(_, v)| v.as_str())
+        .unwrap_or_else(|| panic!("no {key:?} in {info:?}"))
+}
+
+#[test]
+fn db_info_reports_pragmas_and_object_counts() {
+    let (path, store) = reported_db("dbinfo.db");
+    let info = store.db_info();
+
+    // Pragmas, straight from the file.
+    let page_size: u64 = pairs_get(&info, "page size").parse().unwrap();
+    let page_count: u64 = pairs_get(&info, "page count").parse().unwrap();
+    assert!(
+        page_size.is_power_of_two() && page_size >= 512,
+        "{page_size}"
+    );
+    assert!(page_count > 0);
+    assert_eq!(pairs_get(&info, "encoding"), "UTF-8");
+    assert_eq!(pairs_get(&info, "journal mode"), "delete");
+    assert_eq!(
+        pairs_get(&info, "data size"),
+        format!("{} bytes", page_size * page_count),
+        "data size is derived from the two pragmas above"
+    );
+
+    // Object counts, from sqlite_master.
+    assert_eq!(pairs_get(&info, "tables"), "2");
+    assert_eq!(pairs_get(&info, "indexes"), "1");
+    assert_eq!(pairs_get(&info, "views"), "1");
+    assert_eq!(pairs_get(&info, "triggers"), "1");
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn integrity_and_quick_check_pass_on_a_sound_file() {
+    let (path, store) = reported_db("intck.db");
+    assert_eq!(
+        store.integrity_check(false).unwrap(),
+        vec!["ok".to_string()]
+    );
+    assert_eq!(store.integrity_check(true).unwrap(), vec!["ok".to_string()]);
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn foreign_key_lint_flags_only_unindexed_child_columns() {
+    let (path, store) = reported_db("fklint.db");
+
+    // `child.parent_id` has no index, so every parent-row change scans `child`.
+    let lint = store.missing_fk_indexes().unwrap();
+    assert_eq!(lint.len(), 1, "one unindexed foreign key: {lint:?}");
+    assert!(
+        lint[0].starts_with("child.parent_id -> parent"),
+        "got {:?}",
+        lint[0]
+    );
+
+    // Indexing that column silences the lint; an index on some other column of
+    // the same table must not.
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute_batch("CREATE INDEX child_note_idx ON child(note)")
+        .unwrap();
+    let store2 = SqliteStore::open(&path).unwrap();
+    assert_eq!(
+        store2.missing_fk_indexes().unwrap().len(),
+        1,
+        "an index on an unrelated column does not serve the key"
+    );
+    conn.execute_batch("CREATE INDEX child_parent_idx ON child(parent_id)")
+        .unwrap();
+    drop(conn);
+    let store3 = SqliteStore::open(&path).unwrap();
+    assert!(
+        store3.missing_fk_indexes().unwrap().is_empty(),
+        "the key now has an index"
+    );
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn query_plan_is_drawn_as_the_shell_draws_it() {
+    let (path, store) = reported_db("eqp.db");
+
+    // A plain scan: header plus one leaf.
+    let plan = store.explain_plan("SELECT * FROM child").unwrap();
+    assert_eq!(plan[0], "QUERY PLAN");
+    assert_eq!(plan.len(), 2, "{plan:?}");
+    assert!(plan[1].starts_with("`--SCAN child"), "{:?}", plan[1]);
+
+    // A join with an ORDER BY has siblings, so all but the last get `|--`, and
+    // the index the planner picks is named.
+    let plan = store
+        .explain_plan(
+            "SELECT p.name FROM parent p JOIN child c ON c.parent_id = p.id ORDER BY p.name",
+        )
+        .unwrap();
+    assert!(plan.len() >= 3, "{plan:?}");
+    assert!(
+        plan[1..plan.len() - 1].iter().all(|l| l.starts_with("|--")),
+        "every step but the last has a sibling: {plan:?}"
+    );
+    assert!(
+        plan.last().unwrap().starts_with("`--"),
+        "the last step closes the tree: {:?}",
+        plan.last()
+    );
+    // Bad SQL is an error, not an empty plan.
+    assert!(store.explain_plan("SELECT * FROM nope").is_err());
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn dump_replays_into_an_empty_database() {
+    let (path, store) = reported_db("dump.db");
+    let sql = store.dump(None).unwrap();
+
+    // The frame the shell writes.
+    assert!(
+        sql.starts_with("PRAGMA foreign_keys=OFF;\nBEGIN TRANSACTION;\n"),
+        "{sql}"
+    );
+    assert!(sql.ends_with("COMMIT;\n"), "{sql}");
+    // Values are literals, not the strings the grid shows: the blob comes out as
+    // hex and the embedded quote is doubled.
+    assert!(sql.contains("x'00ff10'"), "blob must survive as hex: {sql}");
+    assert!(
+        !sql.contains("<blob"),
+        "no display strings in a dump: {sql}"
+    );
+    assert!(sql.contains("'it''s here'"), "{sql}");
+    assert!(
+        sql.contains(",NULL,"),
+        "NULL is a keyword, not a string: {sql}"
+    );
+
+    // Replaying it rebuilds the database, values included.
+    let replay = tmp("dump_replay.db");
+    let _ = std::fs::remove_file(&replay);
+    let conn = rusqlite::Connection::open(&replay).unwrap();
+    conn.execute_batch(&sql).unwrap();
+    let (note, weight, raw): (Option<String>, f64, Option<Vec<u8>>) = conn
+        .query_row(
+            "SELECT note, weight, raw FROM child WHERE id = 1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(note.as_deref(), Some("plain"));
+    assert_eq!(weight, 1.5, "a real must not be truncated to an integer");
+    assert_eq!(raw, Some(vec![0x00, 0xff, 0x10]));
+    let objects: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(objects, 5, "2 tables, 1 index, 1 view, 1 trigger");
+
+    // One table only, on request.
+    let one = store.dump(Some("parent")).unwrap();
+    assert!(one.contains("CREATE TABLE parent"), "{one}");
+    assert!(!one.contains("CREATE TABLE child"), "{one}");
+    for p in [path, replay] {
+        let _ = std::fs::remove_file(p);
+    }
+}
+
+/// A virtual table cannot be dumped as `CREATE VIRTUAL TABLE`: that runs the
+/// module's constructor, which builds the shadow tables the dump then tries to
+/// create again. This is the case that made a naive dump unreplayable.
+#[test]
+fn dump_of_a_virtual_table_replays() {
+    let path = tmp("dump_fts.db");
+    let _ = std::fs::remove_file(&path);
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE docs (id INTEGER PRIMARY KEY, body TEXT);
+         CREATE VIRTUAL TABLE docs_fts USING fts5(body);
+         INSERT INTO docs (body) VALUES ('the quick brown fox'), ('lazy dog');
+         INSERT INTO docs_fts (rowid, body) SELECT id, body FROM docs;",
+    )
+    .unwrap();
+    drop(conn);
+    let store = SqliteStore::open(&path).unwrap();
+    let sql = store.dump(None).unwrap();
+
+    assert!(
+        sql.contains("PRAGMA writable_schema=ON;") && sql.contains("PRAGMA writable_schema=OFF;"),
+        "the schema row is written directly, as the shell does it: {sql}"
+    );
+    assert!(
+        sql.contains("INSERT INTO sqlite_schema(type,name,tbl_name,rootpage,sql)"),
+        "{sql}"
+    );
+    assert!(
+        !sql.lines().any(|l| l.starts_with("CREATE VIRTUAL")),
+        "running the create would build the shadow tables twice — the statement \
+         may appear only as the text inserted into sqlite_schema: {sql}"
+    );
+    assert!(
+        sql.contains("CREATE TABLE IF NOT EXISTS 'docs_fts_data'"),
+        "shadow tables are created only if absent: {sql}"
+    );
+
+    let replay = tmp("dump_fts_replay.db");
+    let _ = std::fs::remove_file(&replay);
+    let conn = rusqlite::Connection::open(&replay).unwrap();
+    conn.execute_batch(&sql).expect("the dump must replay");
+    // A schema row written under `writable_schema` is invisible to the connection
+    // that wrote it until the schema is re-read, exactly as with the shell — so
+    // reopen, then check the rebuilt index answers queries, which is the only
+    // proof the shadow tables came across intact.
+    drop(conn);
+    let conn = rusqlite::Connection::open(&replay).unwrap();
+    let hit: String = conn
+        .query_row(
+            "SELECT body FROM docs_fts WHERE docs_fts MATCH 'brown'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(hit, "the quick brown fox");
+    for p in [path, replay] {
+        let _ = std::fs::remove_file(p);
+    }
+}
+
+#[test]
+fn backup_writes_a_second_readable_database() {
+    let (path, store) = reported_db("backup_src.db");
+    let out = tmp("backup_dst.db");
+    let _ = std::fs::remove_file(&out);
+    store.backup_to(&out).unwrap();
+
+    assert!(matches!(detect(&out, false, false).unwrap(), Kind::Sqlite));
+    let copy = SqliteStore::open(&out).unwrap();
+    assert_eq!(copy.tables, store.tables);
+    let rows = copy.rows("child", 10, 0, None, "").unwrap();
+    assert_eq!(rows.rows.len(), 2);
+
+    // VACUUM INTO refuses to overwrite, which is what keeps a backup from
+    // clobbering a live database.
+    assert!(
+        store.backup_to(&out).is_err(),
+        "an existing target is an error"
+    );
+    for p in [path, out] {
+        let _ = std::fs::remove_file(p);
+    }
+}

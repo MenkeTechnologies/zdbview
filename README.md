@@ -142,6 +142,7 @@ SQLite files are self-describing, so every operation works on any database:
 - `a` — insert a row using column defaults.
 - `d` — delete the selected row (confirm with `y`).
 - `:` — open the **SQL editor** (see below).
+- `D` — the **database report** (see below).
 
 Rows are addressed by `rowid`; `WITHOUT ROWID` tables are listed read-only.
 Identifiers are double-quoted with internal quotes doubled, and edited values are
@@ -241,6 +242,7 @@ is published on crates.io); disable with `--no-default-features`.
 | `<` / `>` | move the sort to the previous / next column |
 | `a` `e` `r` `d` | create / hex-edit value / rename / delete record (rkyv) |
 | `S` | schema view (SQLite) |
+| `D` | database report: pragmas, integrity check, foreign-key lint (SQLite) |
 | `0` `1` `2` `3` | Records / Info / Strings / Hex (rkyv) |
 | `v` | cycle value render (auto / hex / text / disasm) — detail screen |
 | `y` | copy cell / value / key to clipboard (OSC 52) |
@@ -357,6 +359,7 @@ affected-row count, so a `SELECT` looked like it had done nothing.
 | `Enter` | run the statement |
 | `Ctrl-j` (or `Alt-Enter`) | insert a newline — statements may span lines |
 | `Tab` / `Shift-Tab` | complete the word before the cursor; walk the candidates |
+| `Alt-e` / `F5` | query plan instead of the result (`EXPLAIN QUERY PLAN`) |
 | `↑` `↓` / `Ctrl-p` `Ctrl-n` | browse history, with the in-progress line stashed |
 | `Ctrl-g` | clear the input; `Ctrl-l` clears the transcript |
 | `Ctrl-a` `Ctrl-e` `Ctrl-b` `Ctrl-f` `Ctrl-w` `Ctrl-u` `Ctrl-k` | readline motions and kills |
@@ -366,7 +369,17 @@ affected-row count, so a `SELECT` looked like it had done nothing.
 A `SELECT` (or `PRAGMA`, `EXPLAIN`, a CTE) comes back as a grid of rows with a
 count; anything else reports what it changed and reloads the grid behind it; a
 refusal shows SQLite's own message. Results are capped at 500 rows per statement,
-and the cap is stated when it bites.
+and the cap is stated when it bites. Every statement is timed, like the shell's
+`.timer`, and `Alt-e` (or `F5`, where the terminal eats Meta) shows the plan
+instead of running the query — the shell's `.eqp`, drawn as the same tree:
+
+```
+sql> select p.name from parent p join child c on c.parent_id = p.id order by p.name
+     QUERY PLAN
+     |--SCAN c
+     |--SEARCH p USING INTEGER PRIMARY KEY (rowid=?)
+     `--USE TEMP B-TREE FOR ORDER BY
+```
 
 Completion has no LSP to ask, so it reads the statement instead: what SQL allows at
 the cursor is what it offers. Measured against `~/.zshrs/compsys.db`:
@@ -390,6 +403,24 @@ candidate is taken without a menu.
 History persists to `$XDG_CACHE_HOME/zdbview/sql_history` (200 statements, newlines
 escaped so one statement stays one line), written temp-plus-rename like the other
 appdata.
+
+## Database report (`D`)
+
+`D` opens what `sqlite3` prints across four dot-commands. The pragmas are read
+when the screen opens; the two checks and the lint run on a keypress, because both
+walk the whole file:
+
+| Key | Runs | Shell equivalent |
+|-----|------|------------------|
+| *(open)* | page size/count, freelist, encoding, journal mode, synchronous, auto-vacuum, schema/user version, application id, foreign keys, derived data size, object counts | `.dbinfo` |
+| `i` | `PRAGMA integrity_check` | `.intck` |
+| `Q` | `PRAGMA quick_check` | `.intck` (cheap) |
+| `f` | foreign keys with no index to serve them | `.lint fkey-indexes` |
+
+The lint reads `foreign_key_list`, `index_list` and `index_info` per table and
+reports a key only when no index *starts* with the child column, which is the
+condition that makes every parent-row change scan the child table. An index on
+some other column of the same table does not count.
 
 ## Sorting
 
@@ -523,12 +554,43 @@ cell or record value that's too wide for the grid.
 ## Export
 
 Interactive `x` writes the current table (CSV) or all records (JSON) to a file in
-the working directory. Non-interactively:
+the working directory. Non-interactively, `--export` takes the sqlite3 shell's
+output modes, and `--table` restricts it to one table:
 
 ```sh
-zdbview data.db --export json      # object of { table: [rows...] }, all tables
-zdbview data.db --export csv       # first table as CSV
-zdbview cache.rkyv --export json   # recognized records, value blob as hex
+zdbview data.db --export json               # object of { table: [rows...] }, all tables
+zdbview data.db --export csv                # first table as CSV
+zdbview data.db --export tsv                # .mode tabs (tabs/newlines escaped)
+zdbview data.db --export markdown           # .mode markdown, columns padded
+zdbview data.db --export line               # .mode line, one column per line
+zdbview data.db --export insert             # .mode insert, one INSERT per row
+zdbview data.db --export sql                # .dump — schema and data, replayable
+zdbview data.db --export csv --table users  # just that table
+zdbview cache.rkyv --export json            # recognized records, value blob as hex
+```
+
+`--export sql` is `.dump`: every `CREATE` followed by its rows, wrapped in
+`PRAGMA foreign_keys=OFF` / `BEGIN` / `COMMIT`, and it reads values from the
+database rather than from the grid, so a blob comes out as `x'…'` and a real keeps
+its decimal point. Virtual tables are the case that makes a naive dump
+unreplayable: `CREATE VIRTUAL TABLE` runs the module's constructor and builds the
+shadow tables, which the dump would then try to create a second time. Like the
+shell, zdbview registers the virtual table by writing its `sqlite_schema` row
+under `PRAGMA writable_schema=ON` and emits the shadow tables itself with
+`CREATE TABLE IF NOT EXISTS`, so an FTS5 index survives the round trip and still
+answers `MATCH` queries. Verified line-for-line against `sqlite3 .dump` on a
+database with an FTS5 table: identical content, differing only in the order
+`sqlite_master` is walked.
+
+## Backup
+
+`--backup` copies a database with `VACUUM INTO`, which is the shell's `.backup`
+and the only way to copy a file that may have writers without stopping them. An
+existing target is an error rather than an overwrite:
+
+```sh
+zdbview ~/.zshrs/history.db --backup /tmp/history-copy.db
+# wrote /tmp/history-copy.db (36864 bytes)
 ```
 
 ## Man pages

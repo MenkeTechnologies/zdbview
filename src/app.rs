@@ -97,6 +97,9 @@ enum Screen {
     Top,
     /// The SQL editor: multi-line input, transcript, completion.
     Sql,
+    /// Database facts, integrity check and foreign-key lint (`.dbinfo`, `.intck`,
+    /// `.lint fkey-indexes` in the sqlite3 shell).
+    DbInfo,
     /// SQLite schema (CREATE statements) view.
     Schema,
 }
@@ -188,6 +191,11 @@ pub struct App {
     top_area: Rect,
     /// The SQL editor, while `screen` is `Screen::Sql`.
     sql: Option<crate::sqledit::SqlEdit>,
+    /// Lines of the database-info screen, built when it opens.
+    dbinfo: Vec<(String, String)>,
+    /// Integrity-check and lint output, filled on demand (both can be slow).
+    dbinfo_checks: Vec<String>,
+    dbinfo_scroll: usize,
     /// Rect the SQL editor last rendered into, for paging.
     sql_area: Rect,
     /// Set by `o`: leave the app loop and show the file picker again.
@@ -262,6 +270,9 @@ impl App {
             top: None,
             top_area: Rect::ZERO,
             sql: None,
+            dbinfo: Vec::new(),
+            dbinfo_checks: Vec::new(),
+            dbinfo_scroll: 0,
             sql_area: Rect::ZERO,
             reopen: false,
             open_next: None,
@@ -311,6 +322,9 @@ impl App {
         }
         if self.screen == Screen::Sql {
             return HelpCtx::Sql;
+        }
+        if self.screen == Screen::DbInfo {
+            return HelpCtx::DbInfo;
         }
         match &self.store {
             Store::Sqlite(_) => HelpCtx::Sqlite,
@@ -489,6 +503,7 @@ impl App {
             Screen::HexEdit => return self.key_hex(key),
             Screen::Top => return self.key_top(code),
             Screen::Sql => return self.key_sql(key),
+            Screen::DbInfo => return self.key_dbinfo(code),
             Screen::Detail => return self.key_detail(code),
             Screen::Schema => return self.key_schema(code),
             Screen::Main => {}
@@ -870,6 +885,8 @@ impl App {
                 }
             }
             KeyCode::Char('S') => self.open_schema(),
+            // `D` for the database's own facts, the shell's `.dbinfo`.
+            KeyCode::Char('D') => self.open_dbinfo(),
             // Sorting: `s` toggles the cursor column (asc → desc → off), and
             // `<`/`>` walk the sort across columns keeping the direction.
             KeyCode::Char('s') => self.sort_by_current_column(),
@@ -1986,6 +2003,7 @@ impl App {
                     e.render(f, outer[0], &t);
                 }
             }
+            Screen::DbInfo => self.render_dbinfo(f, outer[0]),
             Screen::Schema => self.render_schema(f, outer[0]),
             Screen::Main => match &self.store {
                 Store::Sqlite(_) => self.render_sqlite(f, outer[0]),
@@ -2112,6 +2130,122 @@ impl App {
         self.notify(format!("watching {} files for writes", n));
     }
 
+    /// Open the database-info screen: the pragmas the sqlite3 shell prints for
+    /// `.dbinfo`, with the integrity check and foreign-key lint a keypress away
+    /// since both can take a while on a large file.
+    fn open_dbinfo(&mut self) {
+        let info = match self.sqlite() {
+            Some(s) => s.db_info(),
+            None => return,
+        };
+        self.dbinfo = info;
+        self.dbinfo_checks.clear();
+        self.dbinfo_scroll = 0;
+        self.screen = Screen::DbInfo;
+        self.status =
+            "database · i integrity check · Q quick check · f foreign-key lint · Esc back".into();
+    }
+
+    fn key_dbinfo(&mut self, code: KeyCode) {
+        match code {
+            KeyCode::Esc | KeyCode::Char('D') => {
+                self.screen = Screen::Main;
+                self.dbinfo_scroll = 0;
+            }
+            // `q` still quits, as on every other screen.
+            KeyCode::Char('q') => self.quit = true,
+            // `i` and `Q` are the shell's two checks; `f` is `.lint fkey-indexes`.
+            KeyCode::Char('i') | KeyCode::Char('Q') => {
+                let quick = code == KeyCode::Char('Q');
+                let out = match self.sqlite() {
+                    Some(s) => s.integrity_check(quick),
+                    None => return,
+                };
+                self.dbinfo_checks = match out {
+                    Ok(lines) if lines == ["ok".to_string()] => {
+                        vec![format!(
+                            "{} check: ok",
+                            if quick { "quick" } else { "integrity" }
+                        )]
+                    }
+                    Ok(lines) => lines,
+                    Err(e) => vec![format!("check failed: {e}")],
+                };
+            }
+            KeyCode::Char('f') => {
+                let out = match self.sqlite() {
+                    Some(s) => s.missing_fk_indexes(),
+                    None => return,
+                };
+                self.dbinfo_checks = match out {
+                    Ok(v) if v.is_empty() => {
+                        vec!["foreign-key lint: every foreign key has an index".into()]
+                    }
+                    Ok(v) => v,
+                    Err(e) => vec![format!("lint failed: {e}")],
+                };
+            }
+            KeyCode::Down | KeyCode::Char('j') => self.dbinfo_scroll += 1,
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.dbinfo_scroll = self.dbinfo_scroll.saturating_sub(1)
+            }
+            KeyCode::PageDown => self.dbinfo_scroll += self.page_step(),
+            KeyCode::PageUp => {
+                self.dbinfo_scroll = self.dbinfo_scroll.saturating_sub(self.page_step())
+            }
+            KeyCode::Char('g') => self.dbinfo_scroll = 0,
+            _ => {}
+        }
+    }
+
+    fn render_dbinfo(&mut self, f: &mut Frame, area: Rect) {
+        let t = self.ov.theme;
+        let mut lines: Vec<Line> = Vec::new();
+        let width = self
+            .dbinfo
+            .iter()
+            .map(|(k, _)| k.chars().count())
+            .max()
+            .unwrap_or(0);
+        for (k, v) in &self.dbinfo {
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("  {:>width$}  ", k, width = width),
+                    Style::default().fg(t.dim),
+                ),
+                Span::styled(v.clone(), Style::default().fg(t.primary)),
+            ]));
+        }
+        if !self.dbinfo_checks.is_empty() {
+            lines.push(Line::from(""));
+            for c in &self.dbinfo_checks {
+                // A clean result reads as a fact; anything else is a finding.
+                let ok = c.ends_with("ok") || c.contains("every foreign key");
+                lines.push(Line::from(Span::styled(
+                    format!("  {c}"),
+                    Style::default().fg(if ok { t.label } else { t.alt }),
+                )));
+            }
+        }
+        let height = area.height.saturating_sub(2) as usize;
+        let max_scroll = lines.len().saturating_sub(height);
+        self.dbinfo_scroll = self.dbinfo_scroll.min(max_scroll);
+        let shown: Vec<Line> = lines
+            .into_iter()
+            .skip(self.dbinfo_scroll)
+            .take(height)
+            .collect();
+        f.render_widget(
+            Paragraph::new(shown).block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(t.accent))
+                    .title(" database — i/Q check · f fk lint · Esc back "),
+            ),
+            area,
+        );
+    }
+
     /// Open the SQL editor, seeded with the schema so Tab can complete against
     /// the real tables and columns.
     fn open_sql(&mut self) {
@@ -2142,6 +2276,24 @@ impl App {
             // history survive a trip back to the data.
             crate::sqledit::Action::Close => self.screen = Screen::Main,
             crate::sqledit::Action::Execute(sql) => self.execute_sql(&sql),
+            crate::sqledit::Action::Explain(sql) => self.explain_sql(&sql),
+        }
+    }
+
+    /// `^e` in the editor: the query plan, as the sqlite3 shell's `.eqp` shows it.
+    fn explain_sql(&mut self, sql: &str) {
+        use crate::sqledit::Entry;
+        let plan = match self.sqlite() {
+            Some(s) => s.explain_plan(sql),
+            None => return,
+        };
+        let entry = match plan {
+            Ok(steps) if steps.is_empty() => Entry::Plan(vec!["(no plan)".into()]),
+            Ok(steps) => Entry::Plan(steps),
+            Err(e) => Entry::Error(e.to_string()),
+        };
+        if let Some(e) = self.sql.as_mut() {
+            e.push(entry);
         }
     }
 
@@ -2149,10 +2301,12 @@ impl App {
     fn execute_sql(&mut self, sql: &str) {
         use crate::sqledit::{Entry, RESULT_ROWS};
         use crate::sqlite::Outcome;
+        let started = std::time::Instant::now();
         let outcome = match self.sqlite() {
             Some(s) => s.run(sql, RESULT_ROWS),
             None => return,
         };
+        let took = started.elapsed();
         let entry = match outcome {
             Ok(Outcome::Rows {
                 columns,
@@ -2172,6 +2326,8 @@ impl App {
         };
         if let Some(e) = self.sql.as_mut() {
             e.push(entry);
+            // The shell prints the duration after the result; so does this.
+            e.push(crate::sqledit::Entry::Timing(took));
         }
     }
 
@@ -3659,6 +3815,53 @@ mod tests {
         app.on_key(KeyEvent::from(KeyCode::Char(c)));
     }
 
+    /// `D` opens the database screen, its checks run on demand, and `q` still
+    /// quits from there like it does everywhere else.
+    #[test]
+    fn dbinfo_screen_reports_and_checks_on_demand() {
+        let (mut app, path) = sqlite_app_rows(3);
+        press(&mut app, 'D');
+        assert_eq!(app.screen, super::Screen::DbInfo);
+        assert!(
+            app.dbinfo.iter().any(|(k, _)| k == "page size"),
+            "pragmas are read when the screen opens: {:?}",
+            app.dbinfo
+        );
+        assert!(
+            app.dbinfo_checks.is_empty(),
+            "the slow checks wait for a keypress"
+        );
+        let rows = frame_rows(&mut app, 100, 24);
+        assert!(contains(&rows, "journal mode"), "{rows:?}");
+        assert!(contains(&rows, "database —"), "{:?}", rows[0]);
+
+        // Both checks pass on a file this small, and the lint has nothing to say
+        // about a table with no foreign keys.
+        press(&mut app, 'i');
+        assert_eq!(app.dbinfo_checks, vec!["integrity check: ok".to_string()]);
+        press(&mut app, 'Q');
+        assert_eq!(app.dbinfo_checks, vec!["quick check: ok".to_string()]);
+        press(&mut app, 'f');
+        assert_eq!(
+            app.dbinfo_checks,
+            vec!["foreign-key lint: every foreign key has an index".to_string()]
+        );
+        let rows = frame_rows(&mut app, 100, 24);
+        assert!(contains(&rows, "every foreign key"), "{rows:?}");
+
+        // The help overlay follows the screen, and `D` again goes back.
+        press(&mut app, 'h');
+        assert_eq!(app.help_ctx(), HelpCtx::DbInfo);
+        press(&mut app, 'h');
+        press(&mut app, 'D');
+        assert_eq!(app.screen, super::Screen::Main);
+
+        press(&mut app, 'D');
+        press(&mut app, 'q');
+        assert!(app.quit, "q quits from the database screen too");
+        let _ = std::fs::remove_file(path);
+    }
+
     /// The overlay openers must work from the app's screens, and keys the
     /// overlay layer doesn't own must still reach the app.
     #[test]
@@ -4349,8 +4552,15 @@ mod tests {
 
         // A SELECT returns rows.
         app.execute_sql("SELECT a FROM t ORDER BY a LIMIT 2");
-        let last = app.sql.as_ref().unwrap().transcript().last().unwrap();
-        match last {
+        // Each statement is timed, as the shell's `.timer` does, so the rows sit
+        // one entry back.
+        let log = app.sql.as_ref().unwrap().transcript();
+        assert!(
+            matches!(log.last(), Some(Entry::Timing(_))),
+            "the run is timed: {:?}",
+            log.last()
+        );
+        match &log[log.len() - 2] {
             Entry::Rows {
                 columns,
                 rows,
@@ -4365,10 +4575,8 @@ mod tests {
 
         // A write reports its change count and the grid reloads with it.
         app.execute_sql("UPDATE t SET b = 'z'");
-        assert_eq!(
-            app.sql.as_ref().unwrap().transcript().last(),
-            Some(&Entry::Changed(5))
-        );
+        let log = app.sql.as_ref().unwrap().transcript();
+        assert_eq!(log[log.len() - 2], Entry::Changed(5));
         assert!(
             app.rows.as_ref().unwrap().rows.iter().all(|r| r[1] == "z"),
             "the grid must show the write"
@@ -4376,10 +4584,36 @@ mod tests {
 
         // A bad statement surfaces the error rather than a bare status line.
         app.execute_sql("SELECT * FROM nope");
-        match app.sql.as_ref().unwrap().transcript().last().unwrap() {
+        let log = app.sql.as_ref().unwrap().transcript();
+        match &log[log.len() - 2] {
             Entry::Error(msg) => assert!(msg.contains("nope"), "got {msg:?}"),
             other => panic!("expected an error, got {other:?}"),
         }
+
+        // Alt-e explains instead of running: the plan lands in the transcript and
+        // the table is untouched.
+        app.on_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+        let mut e = KeyEvent::from(KeyCode::Char('e'));
+        e.modifiers = KeyModifiers::ALT;
+        app.on_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL));
+        for c in "SELECT * FROM t".chars() {
+            app.on_key(KeyEvent::from(KeyCode::Char(c)));
+        }
+        app.on_key(e);
+        let log = app.sql.as_ref().unwrap().transcript();
+        let plan = log
+            .iter()
+            .rev()
+            .find_map(|x| match x {
+                Entry::Plan(steps) => Some(steps.clone()),
+                _ => None,
+            })
+            .expect("a plan entry");
+        assert!(
+            plan.iter()
+                .any(|s| s.contains("SCAN") || s.contains("TABLE")),
+            "plan should name a scan: {plan:?}"
+        );
 
         // The editor draws over the app, and Esc returns to the data with the
         // transcript intact for the next visit.
