@@ -41,48 +41,113 @@ const MAX_CANDIDATES: usize = 12;
 
 /// The SQL keywords offered by completion, upper-case as SQL is conventionally
 /// written. Not the full grammar — the ones actually typed at a prompt.
-const KEYWORDS: &[&str] = &[
+/// What the cursor can legally complete to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Ctx {
+    /// The start of a statement.
+    Start,
+    /// A table name is due (after `FROM`, `JOIN`, `INTO`, `UPDATE`, `TABLE`).
+    Table,
+    /// A column is due, from the tables in scope.
+    Column(Scope),
+    /// `table.` or `alias.` — that table's columns, by schema index.
+    Qualified(usize),
+    /// A pragma name is due.
+    Pragma,
+    /// Nothing can be completed here.
+    Nothing,
+}
+
+/// The tables a statement has named, and any aliases for them.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct Scope {
+    /// Indices into the schema, in the order the statement named them.
+    tables: Vec<usize>,
+    aliases: Vec<(String, usize)>,
+}
+
+impl Scope {
+    /// The table a qualifier refers to: an alias, or a table named outright.
+    fn resolve(&self, name: &str, schema: &[(String, Vec<String>)]) -> Option<usize> {
+        if let Some((_, idx)) = self
+            .aliases
+            .iter()
+            .find(|(a, _)| a.eq_ignore_ascii_case(name))
+        {
+            return Some(*idx);
+        }
+        schema
+            .iter()
+            .position(|(t, _)| t.eq_ignore_ascii_case(name))
+    }
+}
+
+/// Words that open a clause: used to find the clause governing the cursor, and to
+/// tell an alias from a keyword.
+const CLAUSES: &[&str] = &[
+    "SELECT", "FROM", "WHERE", "SET", "VALUES", "JOIN", "ON", "BY", "HAVING", "LIMIT", "OFFSET",
+    "INTO", "UPDATE", "DELETE", "INSERT", "CREATE", "DROP", "ALTER", "PRAGMA", "WITH", "UNION",
+];
+
+/// Keywords a statement can begin with.
+const STATEMENTS: &[&str] = &[
     "SELECT",
-    "FROM",
-    "WHERE",
     "INSERT INTO",
-    "VALUES",
     "UPDATE",
-    "SET",
     "DELETE FROM",
-    "CREATE",
-    "TABLE",
-    "INDEX",
-    "VIEW",
-    "TRIGGER",
-    "DROP",
-    "ALTER",
-    "ADD COLUMN",
-    "RENAME TO",
-    "JOIN",
-    "LEFT JOIN",
-    "INNER JOIN",
-    "CROSS JOIN",
-    "ON",
+    "CREATE TABLE",
+    "CREATE INDEX",
+    "CREATE VIEW",
+    "DROP TABLE",
+    "DROP INDEX",
+    "DROP VIEW",
+    "ALTER TABLE",
+    "PRAGMA",
+    "EXPLAIN",
+    "EXPLAIN QUERY PLAN",
+    "WITH",
+    "BEGIN",
+    "COMMIT",
+    "ROLLBACK",
+    "VACUUM",
+    "ANALYZE",
+    "ATTACH",
+    "DETACH",
+    "REINDEX",
+];
+
+/// Words that continue a clause once a column has been named.
+const CLAUSE_WORDS: &[&str] = &[
     "AS",
     "AND",
     "OR",
     "NOT",
-    "NULL",
     "IS NULL",
     "IS NOT NULL",
     "IN",
     "LIKE",
     "GLOB",
     "BETWEEN",
-    "ORDER BY",
+    "NULL",
+    "FROM",
+    "WHERE",
     "GROUP BY",
+    "ORDER BY",
     "HAVING",
     "LIMIT",
     "OFFSET",
     "ASC",
     "DESC",
     "DISTINCT",
+    "JOIN",
+    "LEFT JOIN",
+    "ON",
+    "UNION ALL",
+    "COLLATE NOCASE",
+];
+
+/// The aggregate and scalar functions worth offering.
+const FUNCTIONS: &[&str] = &[
     "COUNT(*)",
     "SUM",
     "AVG",
@@ -98,34 +163,103 @@ const KEYWORDS: &[&str] = &[
     "COALESCE",
     "IFNULL",
     "CAST",
+    "ROUND",
+    "ABS",
+    "HEX",
+    "QUOTE",
+    "DATETIME",
+    "STRFTIME",
+];
+
+/// The pragmas typed at a prompt often enough to offer.
+const PRAGMAS: &[&str] = &[
+    "table_info",
+    "table_list",
+    "index_list",
+    "index_info",
+    "foreign_key_list",
+    "journal_mode",
+    "wal_checkpoint",
+    "synchronous",
+    "page_size",
+    "page_count",
+    "freelist_count",
+    "cache_size",
+    "integrity_check",
+    "quick_check",
+    "optimize",
+    "user_version",
+    "schema_version",
+    "auto_vacuum",
+    "encoding",
+    "busy_timeout",
+    "compile_options",
+    "database_list",
+];
+
+/// Every keyword as a single word, for telling an alias from a keyword.
+const KEYWORD_WORDS: &[&str] = &[
+    "SELECT",
+    "FROM",
+    "WHERE",
+    "AND",
+    "OR",
+    "NOT",
+    "NULL",
+    "IN",
+    "LIKE",
+    "GLOB",
+    "BETWEEN",
+    "ORDER",
+    "GROUP",
+    "BY",
+    "HAVING",
+    "LIMIT",
+    "OFFSET",
+    "ASC",
+    "DESC",
+    "DISTINCT",
+    "AS",
+    "ON",
+    "JOIN",
+    "LEFT",
+    "INNER",
+    "CROSS",
+    "UNION",
+    "ALL",
+    "EXCEPT",
+    "INTERSECT",
+    "SET",
+    "VALUES",
+    "INTO",
+    "UPDATE",
+    "DELETE",
+    "INSERT",
+    "CREATE",
+    "DROP",
+    "ALTER",
+    "TABLE",
+    "INDEX",
+    "VIEW",
     "PRAGMA",
     "EXPLAIN",
-    "EXPLAIN QUERY PLAN",
+    "WITH",
     "BEGIN",
     "COMMIT",
     "ROLLBACK",
     "VACUUM",
     "ANALYZE",
-    "ATTACH",
-    "DETACH",
-    "WITH",
-    "UNION",
-    "UNION ALL",
-    "EXCEPT",
-    "INTERSECT",
-    "PRIMARY KEY",
-    "FOREIGN KEY",
-    "REFERENCES",
-    "UNIQUE",
-    "DEFAULT",
-    "AUTOINCREMENT",
-    "INTEGER",
-    "TEXT",
-    "REAL",
-    "BLOB",
-    "NUMERIC",
-    "rowid",
+    "USING",
 ];
+
+/// The identifier-ish words of `text`, in order.
+fn words_before(text: &[char]) -> Vec<String> {
+    let s: String = text.iter().collect();
+    s.split(|c: char| !c.is_alphanumeric() && c != '_' && c != '*')
+        .filter(|w| !w.is_empty())
+        .map(|w| w.to_string())
+        .collect()
+}
 
 /// What one key asked the host to do.
 #[derive(Debug, PartialEq, Eq)]
@@ -314,7 +448,7 @@ impl SqlEdit {
             return;
         }
         let (at, prefix) = self.word_before_cursor();
-        let items = self.candidates(&prefix);
+        let items = self.candidates_at(&prefix, at);
         if items.is_empty() {
             return;
         }
@@ -364,44 +498,194 @@ impl SqlEdit {
         (at, self.input[at..self.cursor].iter().collect())
     }
 
-    /// Candidates for `prefix`, most useful first: the tables, then the columns of
-    /// the tables this statement mentions, then every other column, then keywords.
-    /// A name is a likelier next token than a keyword, and a column of a table
-    /// already named is likelier than one from a table that is not.
+    /// Candidates for `prefix`, chosen by what SQL allows at the cursor. The
+    /// editor itself goes through [`Self::candidates_at`], which already knows
+    /// where the word starts; this is the form the tests read.
+    #[cfg(test)]
     fn candidates(&self, prefix: &str) -> Vec<String> {
-        let p = prefix.to_lowercase();
-        let text = self.text().to_lowercase();
-        let matches = |s: &str| p.is_empty() || s.to_lowercase().starts_with(&p);
-        let mentioned: Vec<&(String, Vec<String>)> = self
-            .schema
-            .iter()
-            .filter(|(t, _)| text.contains(&t.to_lowercase()))
-            .collect();
+        let at = self.cursor - prefix.chars().count();
+        self.candidates_at(prefix, at)
+    }
 
+    /// [`Self::candidates`] with the word's start given, for the completion path
+    /// that has already computed it.
+    fn candidates_at(&self, prefix: &str, at: usize) -> Vec<String> {
+        let p = prefix.to_lowercase();
         let mut out: Vec<String> = Vec::new();
         let push = |s: &str, out: &mut Vec<String>| {
-            if matches(s) && !out.iter().any(|o| o.eq_ignore_ascii_case(s)) {
+            if (p.is_empty() || s.to_lowercase().starts_with(&p))
+                && !out.iter().any(|o| o.eq_ignore_ascii_case(s))
+            {
                 out.push(s.to_string());
             }
         };
-        for (t, _) in &self.schema {
-            push(t, &mut out);
-        }
-        for (_, cols) in &mentioned {
-            for c in cols.iter() {
-                push(c.as_str(), &mut out);
+        let tables = |out: &mut Vec<String>| {
+            for (t, _) in &self.schema {
+                push(t, out);
             }
-        }
-        for (_, cols) in &self.schema {
-            for c in cols {
-                push(c.as_str(), &mut out);
+        };
+
+        match self.context(at) {
+            // Nothing legal can follow an unknown qualifier.
+            Ctx::Nothing => {}
+            // Only a statement can start here.
+            Ctx::Start => {
+                for k in STATEMENTS {
+                    push(k, &mut out);
+                }
             }
-        }
-        for k in KEYWORDS {
-            push(k, &mut out);
+            Ctx::Pragma => {
+                for k in PRAGMAS {
+                    push(k, &mut out);
+                }
+            }
+            Ctx::Table => tables(&mut out),
+            Ctx::Qualified(t) => {
+                for c in &self.schema[t].1 {
+                    push(c.as_str(), &mut out);
+                }
+            }
+            Ctx::Column(scope) => {
+                // The columns of the tables this statement named, in that order.
+                for &t in &scope.tables {
+                    for c in &self.schema[t].1 {
+                        push(c.as_str(), &mut out);
+                    }
+                }
+                for (alias, _) in &scope.aliases {
+                    push(alias, &mut out);
+                }
+                // With no table named yet, any column is fair game.
+                if scope.tables.is_empty() {
+                    for (_, cols) in &self.schema {
+                        for c in cols {
+                            push(c.as_str(), &mut out);
+                        }
+                    }
+                }
+                // Then what continues the clause, then table names, then functions:
+                // a column is what belongs here, so it leads.
+                for k in CLAUSE_WORDS {
+                    push(k, &mut out);
+                }
+                tables(&mut out);
+                for k in FUNCTIONS {
+                    push(k, &mut out);
+                }
+            }
         }
         out.truncate(MAX_CANDIDATES);
         out
+    }
+
+    /// What the cursor is positioned to complete. SQL says which kind of name can
+    /// legally come next, so the candidates follow the clause rather than a fixed
+    /// ranking: `FROM ` can only take a table, `WHERE ` can only take a column of
+    /// the tables in scope, `t.` only that table's columns, and the start of a
+    /// statement only a statement keyword.
+    fn context(&self, at: usize) -> Ctx {
+        // `t.` or `alias.` — only that table's columns are possible.
+        if at > 0 && self.input[at - 1] == '.' {
+            let mut start = at - 1;
+            while start > 0 {
+                let c = self.input[start - 1];
+                if c.is_alphanumeric() || c == '_' {
+                    start -= 1;
+                } else {
+                    break;
+                }
+            }
+            let name: String = self.input[start..at - 1].iter().collect();
+            let scope = self.scope(at);
+            if let Some(t) = scope.resolve(&name, &self.schema) {
+                return Ctx::Qualified(t);
+            }
+            // An unknown qualifier means no candidate can be right.
+            return Ctx::Nothing;
+        }
+
+        let words = words_before(&self.input[..at]);
+        let last = words.last().map(|w| w.to_ascii_uppercase());
+        let last = last.as_deref().unwrap_or("");
+        // The clause keyword governing the position, scanning back.
+        let clause = words
+            .iter()
+            .rev()
+            .map(|w| w.to_ascii_uppercase())
+            .find(|w| CLAUSES.contains(&w.as_str()));
+
+        // Nothing typed yet, or right after a statement separator: a statement
+        // keyword is the only thing that can start here.
+        let after_semicolon = self.input[..at]
+            .iter()
+            .rev()
+            .find(|c| !c.is_whitespace())
+            .map(|&c| c == ';')
+            .unwrap_or(true);
+        if words.is_empty() || after_semicolon {
+            return Ctx::Start;
+        }
+        if last == "PRAGMA" {
+            return Ctx::Pragma;
+        }
+        if matches!(last, "FROM" | "JOIN" | "INTO" | "UPDATE" | "TABLE") {
+            return Ctx::Table;
+        }
+        let scope = self.scope(at);
+        match clause.as_deref() {
+            // A column belongs everywhere else in these clauses.
+            Some("SELECT") | Some("WHERE") | Some("SET") | Some("ON") | Some("BY")
+            | Some("HAVING") | Some("VALUES") | None => Ctx::Column(scope),
+            _ => Ctx::Column(scope),
+        }
+    }
+
+    /// The tables (and their aliases) a statement has brought into scope, read from
+    /// its `FROM`/`JOIN`/`UPDATE`/`INTO` clauses. Columns are then offered from
+    /// these, in the order they were named, rather than from every table in the
+    /// database.
+    fn scope(&self, at: usize) -> Scope {
+        let words = words_before(&self.input[..at]);
+        let mut scope = Scope::default();
+        let mut expect = false;
+        for (i, w) in words.iter().enumerate() {
+            let upper = w.to_ascii_uppercase();
+            if matches!(upper.as_str(), "FROM" | "JOIN" | "UPDATE" | "INTO") {
+                expect = true;
+                continue;
+            }
+            if !expect {
+                continue;
+            }
+            expect = false;
+            if let Some(idx) = self
+                .schema
+                .iter()
+                .position(|(t, _)| t.eq_ignore_ascii_case(w))
+            {
+                if !scope.tables.contains(&idx) {
+                    scope.tables.push(idx);
+                }
+                // `FROM t alias` or `FROM t AS alias`.
+                let mut n = i + 1;
+                if words.get(n).map(|w| w.eq_ignore_ascii_case("AS")) == Some(true) {
+                    n += 1;
+                }
+                if let Some(alias) = words.get(n) {
+                    let upper = alias.to_ascii_uppercase();
+                    if !CLAUSES.contains(&upper.as_str())
+                        && !KEYWORD_WORDS.contains(&upper.as_str())
+                        && !self
+                            .schema
+                            .iter()
+                            .any(|(t, _)| t.eq_ignore_ascii_case(alias))
+                    {
+                        scope.aliases.push((alias.to_string(), idx));
+                    }
+                }
+            }
+        }
+        scope
     }
 
     /// Handle one key. `page` is a screenful of transcript, for `PgUp`/`PgDn`.
@@ -853,83 +1137,121 @@ mod tests {
         );
     }
 
-    /// Tab completes the word before the cursor, ranking names above keywords and
-    /// the mentioned table's columns above other tables' columns.
+    /// Completion follows the clause: what SQL allows at the cursor is what is
+    /// offered. Ranking alone was not enough — after `from users where na` the old
+    /// version offered the `named_dirs` table before the `name` column.
     #[test]
-    fn tab_completes_names_before_keywords() {
+    fn completion_follows_the_clause() {
+        // A statement can only start with a statement keyword.
         let mut e = ed();
-        // `ord` matches the orders table and the order_id column, so the menu
-        // opens with the table first — a name is likelier than a column here.
-        type_str(&mut e, "select * from ord");
+        assert_eq!(e.candidates(""), {
+            let mut v: Vec<String> = STATEMENTS.iter().map(|s| s.to_string()).collect();
+            v.truncate(MAX_CANDIDATES);
+            v
+        });
+        type_str(&mut e, "sel");
         e.on_key(code(KeyCode::Tab), 10);
-        let c = e.completion.as_ref().expect("two candidates open a menu");
-        assert_eq!(c.items[0], "orders", "table ranks first: {:?}", c.items);
+        assert_eq!(e.text(), "SELECT", "the only statement starting with sel");
+
+        // After FROM only a table can follow.
+        let mut e = ed();
+        type_str(&mut e, "select * from ");
+        assert_eq!(e.candidates(""), vec!["users".to_string(), "orders".into()]);
+        type_str(&mut e, "us");
+        e.on_key(code(KeyCode::Tab), 10);
+        assert_eq!(e.text(), "select * from users");
+
+        // In WHERE, the scoped table's columns lead — this is the reported bug.
+        type_str(&mut e, " where us");
+        let cands = e.candidates("us");
+        assert_eq!(
+            cands.first().map(String::as_str),
+            Some("user_id"),
+            "the scoped column must come before the table name: {cands:?}"
+        );
+        e.on_key(code(KeyCode::Tab), 10);
+        // Two candidates (user_id, users) so a menu opens with the column first.
+        let c = e.completion.as_ref().expect("menu");
+        assert_eq!(c.items[0], "user_id");
         e.on_key(code(KeyCode::Enter), 10);
-        assert_eq!(e.text(), "select * from orders");
+        assert_eq!(e.text(), "select * from users where user_id");
 
-        // A prefix matching exactly one thing is taken outright, with no menu:
-        // `ema` is the email column and no keyword or table.
+        // A column with no table named yet can come from any table.
         let mut e = ed();
-        type_str(&mut e, "select ema");
+        type_str(&mut e, "select tot");
         e.on_key(code(KeyCode::Tab), 10);
-        assert_eq!(e.text(), "select email");
-        assert!(e.completion.is_none(), "one candidate needs no menu");
+        assert_eq!(
+            e.text(),
+            "select total",
+            "orders.total, table not yet named"
+        );
+    }
 
-        // Set up the mentioned-table case the ranking assertions below use.
+    /// `t.` and `alias.` complete only that table's columns.
+    #[test]
+    fn qualified_completion_uses_the_alias() {
         let mut e = ed();
-        type_str(&mut e, "select * from users");
-
-        // With users mentioned, its columns are offered before other candidates.
-        type_str(&mut e, " where ");
-        let (_, prefix) = e.word_before_cursor();
-        assert!(prefix.is_empty());
+        type_str(&mut e, "select * from orders o where o.");
         let cands = e.candidates("");
         assert_eq!(
-            &cands[..2],
-            &["users".to_string(), "orders".to_string()],
-            "tables first: {cands:?}"
+            cands,
+            vec!["order_id".to_string(), "total".into()],
+            "{cands:?}"
         );
-        let user_col = cands.iter().position(|c| c == "email").unwrap();
-        let other_col = cands.iter().position(|c| c == "order_id").unwrap();
+        type_str(&mut e, "tot");
+        e.on_key(code(KeyCode::Tab), 10);
+        assert_eq!(e.text(), "select * from orders o where o.total");
+
+        // The table's own name works as a qualifier too.
+        let mut e = ed();
+        type_str(&mut e, "select users.");
+        assert!(e.candidates("").contains(&"email".to_string()));
+
+        // An unknown qualifier offers nothing rather than guessing.
+        let mut e = ed();
+        type_str(&mut e, "select nosuch.");
+        assert!(e.candidates("").is_empty());
+        e.on_key(code(KeyCode::Tab), 10);
+        assert_eq!(e.text(), "select nosuch.", "nothing was inserted");
+    }
+
+    /// A join brings both tables into scope, in the order they were named.
+    #[test]
+    fn a_join_scopes_both_tables() {
+        let mut e = ed();
+        type_str(
+            &mut e,
+            "select * from users u join orders o on u.user_id = o.",
+        );
+        assert_eq!(
+            e.candidates(""),
+            vec!["order_id".to_string(), "total".into()],
+            "the qualifier decides"
+        );
+        // Unqualified, both tables' columns are in scope, users first.
+        let mut e = ed();
+        type_str(&mut e, "select * from users join orders where ");
+        let cands = e.candidates("");
+        let users_first = cands.iter().position(|c| c == "user_id").unwrap();
+        let orders_next = cands.iter().position(|c| c == "order_id").unwrap();
+        assert!(users_first < orders_next, "FROM order preserved: {cands:?}");
+    }
+
+    /// `PRAGMA` completes pragma names, not tables or keywords.
+    #[test]
+    fn pragma_completes_pragma_names() {
+        let mut e = ed();
+        type_str(&mut e, "pragma jour");
+        e.on_key(code(KeyCode::Tab), 10);
+        assert_eq!(e.text(), "pragma journal_mode");
+        let mut e = ed();
+        type_str(&mut e, "pragma ");
+        let cands = e.candidates("");
+        assert!(cands.contains(&"table_info".to_string()), "{cands:?}");
         assert!(
-            user_col < other_col,
-            "the mentioned table's columns rank higher: {cands:?}"
+            !cands.iter().any(|c| c == "users"),
+            "no tables here: {cands:?}"
         );
-        let keyword = cands.iter().position(|c| c == "SELECT");
-        if let Some(k) = keyword {
-            assert!(user_col < k, "names outrank keywords: {cands:?}");
-        }
-
-        // A prefix matching several things opens the menu, and Tab walks it:
-        // `su` is SUM and SUBSTR.
-        let mut e = ed();
-        type_str(&mut e, "su");
-        e.on_key(code(KeyCode::Tab), 10);
-        let c = e.completion.as_ref().expect("menu opened");
-        assert!(c.items.len() > 1, "{:?}", c.items);
-        assert_eq!(c.selected, 0);
-        let first = c.items[0].clone();
-        let second = c.items[1].clone();
-        e.on_key(code(KeyCode::Tab), 10);
-        assert_eq!(e.completion.as_ref().unwrap().selected, 1);
-        e.on_key(code(KeyCode::BackTab), 10);
-        assert_eq!(e.completion.as_ref().unwrap().selected, 0);
-        // Enter accepts the highlighted one.
-        e.on_key(code(KeyCode::Enter), 10);
-        assert!(e.completion.is_none());
-        assert_eq!(e.text(), first, "the highlighted candidate replaced `su`");
-        assert_ne!(first, second, "the menu offered distinct candidates");
-
-        // Esc dismisses the menu without touching the text.
-        let mut e = ed();
-        type_str(&mut e, "su");
-        e.on_key(code(KeyCode::Tab), 10);
-        assert!(e.completion.is_some());
-        assert_eq!(e.on_key(code(KeyCode::Esc), 10), Action::None);
-        assert!(e.completion.is_none(), "Esc closed the menu");
-        assert_eq!(e.text(), "su", "and left the text alone");
-        // A second Esc leaves the editor.
-        assert_eq!(e.on_key(code(KeyCode::Esc), 10), Action::Close);
     }
 
     /// Completion only replaces the word under the cursor, mid-statement too.
@@ -1054,18 +1376,20 @@ mod tests {
         assert!(r.iter().any(|l| l.contains("6 chars")));
     }
 
-    /// The candidate menu is drawn above the input.
+    /// The candidate menu is drawn above the input, titled with the prefix.
     #[test]
     fn render_shows_the_completion_menu() {
         let mut e = ed();
-        type_str(&mut e, "se");
+        // In WHERE, `us` matches the user_id column and the users table.
+        type_str(&mut e, "select * from users where us");
         e.on_key(code(KeyCode::Tab), 10);
+        assert!(e.completion.is_some(), "a menu should be open");
         let r = rows_of(&mut e, 100, 18);
         assert!(
-            r.iter().any(|l| l.contains("SELECT")),
+            r.iter().any(|l| l.contains("user_id")),
             "the menu is not on screen: {r:#?}"
         );
-        assert!(r.iter().any(|l| l.contains(" se ")), "prefix not titled");
+        assert!(r.iter().any(|l| l.contains(" us ")), "prefix not titled");
     }
 
     /// Rendering must survive a terminal too small for the panes.

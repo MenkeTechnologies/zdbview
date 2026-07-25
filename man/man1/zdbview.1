@@ -141,9 +141,16 @@ runs the statement,
 .BR Ctrl\-j " (or " Alt\-Enter ")"
 inserts a newline,
 .B Tab
-completes the word before the cursor against the table names, the columns of the
-tables the statement mentions, and the SQL keywords \(em in that order, and
-without a menu when only one candidate matches.
+completes the word before the cursor from what SQL allows there: statement keywords
+at the start, table names after
+.BR FROM / JOIN / INTO / UPDATE ,
+the columns of the tables in scope inside a clause (aliases resolved, so
+.B a.
+offers only that table's columns), and pragma names after
+.BR PRAGMA .
+Tables enter scope in the order the statement names them, so a join offers the left
+table's columns first. A prefix matching one candidate is taken without a menu, and
+an unknown qualifier offers nothing rather than guessing.
 .BR \(ua / \(da
 or
 .BR Ctrl\-p / Ctrl\-n

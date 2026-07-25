@@ -368,11 +368,24 @@ count; anything else reports what it changed and reloads the grid behind it; a
 refusal shows SQLite's own message. Results are capped at 500 rows per statement,
 and the cap is stated when it bites.
 
-Completion has no LSP to ask — it uses the schema in hand: the table and view
-names, then the columns of the tables the statement mentions, then every other
-column, then the SQL keywords. A name is a likelier next token than a keyword, and
-a column of a table already named is likelier than one from a table that is not. A
-prefix matching exactly one candidate is taken without a menu.
+Completion has no LSP to ask, so it reads the statement instead: what SQL allows at
+the cursor is what it offers. Measured against `~/.zshrs/compsys.db`:
+
+| typed | offers |
+|-------|--------|
+| *(nothing)* | `SELECT`, `INSERT INTO`, `UPDATE`, `DELETE FROM`, `CREATE TABLE` … |
+| `select * from ` | the tables, and only the tables |
+| `select * from autoloads where na` | **`name`** (the scoped table's column), then `named_dirs` |
+| `select * from autoloads a where a.` | `name`, `source`, `offset`, `size`, `body` — the alias resolved |
+| `select ` | columns; with no table named yet, from any table |
+| `pragma jour` | `journal_mode` |
+| `select * from nosuch.` | nothing, rather than a guess |
+
+`FROM`/`JOIN`/`UPDATE`/`INTO` bring tables into scope in the order they are named,
+aliases included, so a join offers the left table's columns before the right one's.
+Inside a clause the scoped columns lead, then what continues the clause (`AND`,
+`ORDER BY`, …), then table names, then the functions. A prefix matching exactly one
+candidate is taken without a menu.
 
 History persists to `$XDG_CACHE_HOME/zdbview/sql_history` (200 statements, newlines
 escaped so one statement stays one line), written temp-plus-rename like the other
