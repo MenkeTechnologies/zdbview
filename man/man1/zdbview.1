@@ -233,6 +233,37 @@ the transcript, and the readline chords move and kill as elsewhere.
 .B Esc
 returns to the data with the transcript intact.
 .PP
+A line beginning with
+.B .
+is a dot-command rather than SQL, and
+.B Tab
+completes those too.
+.B .help
+lists what is implemented:
+.BR .tables ", " .schema ", " .indexes ", " .dump ", " .databases ", " .attach ", "
+.BR .detach ", " .mode ", " .headers ", " .output ", " .once ", " .timer ", " .eqp ", "
+.BR .import ", " .read ", " .backup ", " .expert ", " .vacuum ", " .analyze ", "
+.BR .reindex " and " .quit .
+.B .mode
+takes
+.BR list ", " csv ", " tsv ", " markdown ", " line ", " insert " or " json ;
+.B list
+is the grid the editor draws and the others render the result as text through the
+same writers
+.B \-\-export
+uses.
+.B .output
+and
+.B .once
+send results to a file instead of the transcript, all of them or just the next one.
+.B .expert
+is not
+.BR sqlite3_expert ,
+for which rusqlite exposes no binding: it reads the plan the planner produced and
+the columns the statement compares on, then names an index for each table chosen
+for a full scan, attributing a column to a table only when no other table in the
+statement has one by that name.
+.PP
 .B Alt\-e
 (or
 .BR F5 ,
@@ -393,7 +424,18 @@ keys, the extracted strings, and the whole path of each row in the picker (where
 clears the filter and a second
 .B Esc
 quits). Matching is a
-case-insensitive substring. The Hex view is not filtered: there
+case-insensitive substring. A term of the form
+.I col:value
+restricts that term to one column, and terms are ANDed, so
+.B cwd:zshrs echo
+keeps rows whose
+.B cwd
+contains
+.B zshrs
+and some column contains
+.BR echo .
+A name that is not a column leaves the token as one plain term, so a filter
+containing a colon still works. The Hex view is not filtered: there
 .B /
 searches for a byte sequence, case-sensitively.
 .TP
@@ -497,6 +539,16 @@ file.
 or
 .B D
 returns to the data.
+.TP
+.B F
+Follow the foreign key on the cursor column to the row it references: jump to the
+parent table, select that row, and leave the cursor on the key column. The parent
+column comes from
+.BR "PRAGMA foreign_key_list" ,
+resolved to the parent's primary key when the pragma leaves it empty. A dangling
+key, a
+.B NULL
+key and a column that is not a key are each reported rather than followed.
 .TP
 .B A
 Describe the current table's columns: rows, nulls, distinct values, how many cells

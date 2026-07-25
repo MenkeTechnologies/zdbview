@@ -54,6 +54,8 @@ enum Ctx {
     Qualified(usize),
     /// A pragma name is due.
     Pragma,
+    /// A dot-command is being typed, so only those are candidates.
+    Dot,
     /// Nothing can be completed here.
     Nothing,
 }
@@ -172,6 +174,33 @@ const FUNCTIONS: &[&str] = &[
 ];
 
 /// The pragmas typed at a prompt often enough to offer.
+/// The dot-commands the host implements, offered when a line starts with `.`.
+/// Kept in step with `App::run_dot`, which is where they are carried out.
+pub const DOT_COMMANDS: &[&str] = &[
+    ".help",
+    ".tables",
+    ".schema",
+    ".indexes",
+    ".dump",
+    ".databases",
+    ".attach",
+    ".detach",
+    ".mode",
+    ".headers",
+    ".output",
+    ".once",
+    ".timer",
+    ".eqp",
+    ".import",
+    ".read",
+    ".backup",
+    ".expert",
+    ".vacuum",
+    ".analyze",
+    ".reindex",
+    ".quit",
+];
+
 const PRAGMAS: &[&str] = &[
     "table_info",
     "table_list",
@@ -292,6 +321,9 @@ pub enum Entry {
     Timing(std::time::Duration),
     /// A query plan, one step per line.
     Plan(Vec<String>),
+    /// Plain output from a dot-command: a table list, a schema, a written-file
+    /// confirmation, the help.
+    Note(Vec<String>),
     /// The message SQLite refused with.
     Error(String),
 }
@@ -351,6 +383,15 @@ impl SqlEdit {
     }
 
     /// Record what running the last statement produced.
+    /// The last statement the transcript recorded, which is what `.expert` asks
+    /// about.
+    pub fn last_statement(&self) -> Option<String> {
+        self.transcript.iter().rev().find_map(|e| match e {
+            Entry::Sql(sql) if !sql.starts_with('.') => Some(sql.clone()),
+            _ => None,
+        })
+    }
+
     pub fn push(&mut self, entry: Entry) {
         self.transcript.push(entry);
         while self.transcript.len() > MAX_TRANSCRIPT {
@@ -515,6 +556,19 @@ impl SqlEdit {
                 break;
             }
         }
+        // A dot-command's name includes the dot, and the candidates carry it, so
+        // the word being replaced has to start there — otherwise completing `.tab`
+        // would produce `..tables`.
+        if at > 0
+            && self.input[at - 1] == '.'
+            && self.input[..at - 1]
+                .iter()
+                .rev()
+                .take_while(|c| **c != '\n')
+                .all(|c| c.is_whitespace())
+        {
+            at -= 1;
+        }
         (at, self.input[at..self.cursor].iter().collect())
     }
 
@@ -556,6 +610,11 @@ impl SqlEdit {
             }
             Ctx::Pragma => {
                 for k in PRAGMAS {
+                    push(k, &mut out);
+                }
+            }
+            Ctx::Dot => {
+                for k in DOT_COMMANDS {
                     push(k, &mut out);
                 }
             }
@@ -624,6 +683,11 @@ impl SqlEdit {
             return Ctx::Nothing;
         }
 
+        // A line that starts with `.` is a dot-command, not SQL.
+        let typed: String = self.input[..at].iter().collect();
+        if typed.trim_start().starts_with('.') && !typed.trim().contains(' ') {
+            return Ctx::Dot;
+        }
         let words = words_before(&self.input[..at]);
         let last = words.last().map(|w| w.to_ascii_uppercase());
         let last = last.as_deref().unwrap_or("");
@@ -851,6 +915,14 @@ impl SqlEdit {
                         out.push(Line::from(Span::styled(
                             format!("     {s}"),
                             Style::default().fg(t.label),
+                        )));
+                    }
+                }
+                Entry::Note(lines) => {
+                    for l in lines {
+                        out.push(Line::from(Span::styled(
+                            format!("     {l}"),
+                            Style::default().fg(t.primary),
                         )));
                     }
                 }

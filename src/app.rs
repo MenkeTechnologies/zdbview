@@ -34,6 +34,110 @@ const FREQUENCY_ROWS: i64 = 20;
 /// toast dismisses itself on time (iftoprs's `event::poll` tick).
 const TICK: std::time::Duration = std::time::Duration::from_millis(250);
 
+/// What `.help` prints in the SQL editor. Every line here is a command `run_dot`
+/// implements; the completion list in [`crate::sqledit::DOT_COMMANDS`] is the same
+/// set.
+const DOT_HELP: &str = "\
+.tables                 list the tables
+.schema [TABLE]         CREATE statements
+.indexes [TABLE]        indexes on a table, with their columns
+.dump [TABLE]           schema and data as replayable SQL
+.databases              attached databases
+.attach FILE ALIAS      attach another database
+.detach ALIAS           detach it again
+.mode MODE              list csv tsv markdown line insert json
+.headers on|off         column names in redirected output
+.output FILE            send results to a file
+.once FILE              send the next result to a file
+.timer on|off           report how long a statement took
+.eqp on|off             print the query plan before each statement
+.import FILE TABLE      load a CSV or TSV
+.read FILE              run the statements in a file
+.backup FILE            copy the database with VACUUM INTO
+.expert                 index advice for the statement just run
+.vacuum .analyze .reindex   maintenance
+.quit                   leave zdbview";
+
+/// How a result set is rendered — the sqlite3 shell's `.mode`, over the writers in
+/// [`crate::export`]. `List` is zdbview's own: the grid the editor draws.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum OutputMode {
+    List,
+    Csv,
+    Tsv,
+    Markdown,
+    Line,
+    Insert,
+    Json,
+}
+
+impl OutputMode {
+    fn parse(name: &str) -> Option<Self> {
+        Some(match name.to_lowercase().as_str() {
+            "list" | "column" | "box" | "table" => OutputMode::List,
+            "csv" => OutputMode::Csv,
+            "tsv" | "tabs" => OutputMode::Tsv,
+            "markdown" => OutputMode::Markdown,
+            "line" => OutputMode::Line,
+            "insert" => OutputMode::Insert,
+            "json" => OutputMode::Json,
+            _ => return None,
+        })
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            OutputMode::List => "list",
+            OutputMode::Csv => "csv",
+            OutputMode::Tsv => "tsv",
+            OutputMode::Markdown => "markdown",
+            OutputMode::Line => "line",
+            OutputMode::Insert => "insert",
+            OutputMode::Json => "json",
+        }
+    }
+
+    /// Render a result set. `table` names the target of `insert` mode.
+    fn render(
+        self,
+        columns: &[String],
+        rows: &[Vec<String>],
+        table: &str,
+        headers: bool,
+    ) -> String {
+        use crate::export::*;
+        match self {
+            OutputMode::Csv => {
+                let out = rows_to_csv(columns, rows);
+                if headers {
+                    out
+                } else {
+                    out.split_once('\n')
+                        .map(|(_, r)| r.to_string())
+                        .unwrap_or(out)
+                }
+            }
+            OutputMode::Tsv => {
+                let out = rows_to_tsv(columns, rows);
+                if headers {
+                    out
+                } else {
+                    out.split_once('\n')
+                        .map(|(_, r)| r.to_string())
+                        .unwrap_or(out)
+                }
+            }
+            OutputMode::Markdown => rows_to_markdown(columns, rows),
+            OutputMode::Line => rows_to_lines(columns, rows),
+            OutputMode::Insert => rows_to_inserts(table, columns, rows),
+            OutputMode::Json => rows_to_json(columns, rows),
+            // The grid has no text form; a redirect falls back to CSV, which is
+            // what the shell's default list mode is closest to.
+            OutputMode::List => rows_to_csv(columns, rows),
+        }
+    }
+}
+
 /// What the hex editor has open, which decides where `^s` writes.
 #[derive(Clone, PartialEq, Eq, Debug)]
 enum HexTarget {
@@ -231,6 +335,17 @@ pub struct App {
     dbinfo_scroll: usize,
     /// Rect the SQL editor last rendered into, for paging.
     sql_area: Rect,
+    /// How the editor renders a result set — the shell's `.mode`.
+    sql_mode: OutputMode,
+    /// `.output` / `.once`: where results go instead of the transcript, and
+    /// whether the redirect ends after the next statement.
+    sql_out: Option<(PathBuf, bool)>,
+    /// `.headers off` drops the column names from redirected output.
+    sql_headers: bool,
+    /// `.timer off` stops reporting how long a statement took.
+    sql_timer: bool,
+    /// `.eqp on` prints each statement's plan before running it.
+    sql_eqp: bool,
     /// Set by `o`: leave the app loop and show the file picker again.
     reopen: bool,
     /// A file the monitor asked to open, taking precedence over the picker.
@@ -313,6 +428,11 @@ impl App {
             dbinfo_checks: Vec::new(),
             dbinfo_scroll: 0,
             sql_area: Rect::ZERO,
+            sql_mode: OutputMode::List,
+            sql_out: None,
+            sql_headers: true,
+            sql_timer: true,
+            sql_eqp: false,
             reopen: false,
             open_next: None,
             search_origin: None,
@@ -968,6 +1088,9 @@ impl App {
             // `A` analyzes the table's columns, `Y` copies the row as an INSERT.
             KeyCode::Char('A') => self.open_stats(),
             KeyCode::Char('Y') => self.copy_row_as_insert(),
+            // `F` follows the foreign key under the cursor to the row it points
+            // at, which is the one navigation a schema gives you for free.
+            KeyCode::Char('F') => self.follow_foreign_key(),
             // Sorting: `s` toggles the cursor column (asc → desc → off), and
             // `<`/`>` walk the sort across columns keeping the direction.
             KeyCode::Char('s') => self.sort_by_current_column(),
@@ -2497,6 +2620,104 @@ impl App {
         );
     }
 
+    /// `F`: follow the foreign key on the cursor column to the row it references,
+    /// the way DB Browser and Datasette link a child row to its parent. Jumps to
+    /// the parent table, selects the row, and leaves the column on the key.
+    fn follow_foreign_key(&mut self) {
+        let (table, columns, value) = match (self.current_table(), self.rows.as_ref()) {
+            (Some(t), Some(v)) => {
+                let value = match v.rows.get(self.row_idx).and_then(|r| r.get(self.col_idx)) {
+                    Some(v) => v.clone(),
+                    None => return,
+                };
+                (t, v.columns.clone(), value)
+            }
+            _ => return,
+        };
+        let column = match columns.get(self.col_idx) {
+            Some(c) => c.clone(),
+            None => return,
+        };
+        let keys = match self.sqlite() {
+            Some(s) => s.foreign_keys(&table).unwrap_or_default(),
+            None => return,
+        };
+        let (parent, parent_col) = match keys
+            .iter()
+            .find(|(child, _, _)| child.eq_ignore_ascii_case(&column))
+        {
+            Some((_, parent, parent_col)) => (parent.clone(), parent_col.clone()),
+            None => {
+                self.notify(format!("{column} is not a foreign key"));
+                return;
+            }
+        };
+        if value == "NULL" {
+            self.notify(format!("{column} is NULL — nothing to follow"));
+            return;
+        }
+        // `rowid` as the parent column means the key targets the parent's implicit
+        // rowid, which is already what positions a row.
+        let found = match self.sqlite() {
+            Some(s) => {
+                if parent_col == "rowid" {
+                    value.parse::<i64>().ok()
+                } else {
+                    s.rowid_where(&parent, &parent_col, &value).unwrap_or(None)
+                }
+            }
+            None => return,
+        };
+        let rowid = match found {
+            Some(r) => r,
+            None => {
+                self.notify(format!("no {parent} row with {parent_col} = {value}"));
+                return;
+            }
+        };
+        let idx = match self
+            .sqlite()
+            .and_then(|s| s.tables.iter().position(|t| *t == parent))
+        {
+            Some(i) => i,
+            None => {
+                self.notify(format!("{parent} is not listed"));
+                return;
+            }
+        };
+        // The filter belongs to the table being left, and the parent row has to be
+        // reachable, so clear it before jumping.
+        self.filter.clear();
+        self.select_table(idx);
+        self.focus = Focus::Right;
+        self.goto_rowid(rowid, &parent_col);
+        self.notify(format!(
+            "{table}.{column} → {parent}.{parent_col} = {value}"
+        ));
+    }
+
+    /// Put the cursor on `rowid`, paging to wherever it sits in the display order,
+    /// and on `column` if the table has one by that name.
+    fn goto_rowid(&mut self, rowid: i64, column: &str) {
+        let ord = match (self.current_table(), self.sqlite()) {
+            (Some(t), Some(s)) => s
+                .rowid_ordinal(&t, rowid, self.sort.as_ref(), &self.filter)
+                .unwrap_or(1),
+            _ => return,
+        };
+        let idx0 = (ord - 1).max(0);
+        self.page_offset = (idx0 / PAGE) * PAGE;
+        self.load_table();
+        self.row_idx = (idx0 - self.page_offset) as usize;
+        if let Some(i) = self
+            .rows
+            .as_ref()
+            .and_then(|r| r.columns.iter().position(|c| c == column))
+        {
+            self.col_idx = i;
+        }
+    }
+
     /// `Y`: the selected row as an `INSERT`, on the clipboard — DB Browser's
     /// "Copy as INSERT", which is how a row moves into a bug report or a fixture.
     fn copy_row_as_insert(&mut self) {
@@ -2723,6 +2944,14 @@ impl App {
     fn execute_sql(&mut self, sql: &str) {
         use crate::sqledit::{Entry, RESULT_ROWS};
         use crate::sqlite::Outcome;
+        // A line starting with `.` is a dot-command, as in the shell.
+        if sql.trim_start().starts_with('.') {
+            return self.run_dot(sql.trim());
+        }
+        if self.sql_eqp {
+            // `.eqp on`: the plan first, then the statement.
+            self.explain_sql(sql);
+        }
         let started = std::time::Instant::now();
         let outcome = match self.sqlite() {
             Some(s) => s.run(sql, RESULT_ROWS),
@@ -2734,11 +2963,27 @@ impl App {
                 columns,
                 rows,
                 truncated,
-            }) => Entry::Rows {
-                columns,
-                rows,
-                truncated,
-            },
+            }) => {
+                // `.output` / `.once` send the result to a file instead, and
+                // `.mode` decides how anything but the grid is written.
+                match self.write_result(&columns, &rows) {
+                    Some(note) => Entry::Note(vec![note]),
+                    None if self.sql_mode == OutputMode::List => Entry::Rows {
+                        columns,
+                        rows,
+                        truncated,
+                    },
+                    None => {
+                        let text = self.sql_mode.render(
+                            &columns,
+                            &rows,
+                            &self.current_table().unwrap_or_else(|| "table".into()),
+                            self.sql_headers,
+                        );
+                        Entry::Note(text.lines().map(str::to_string).collect())
+                    }
+                }
+            }
             Ok(Outcome::Changed(n)) => {
                 // A write may have changed what the grid is showing.
                 self.load_table();
@@ -2746,11 +2991,299 @@ impl App {
             }
             Err(e) => Entry::Error(e.to_string()),
         };
+        let timer = self.sql_timer;
         if let Some(e) = self.sql.as_mut() {
             e.push(entry);
-            // The shell prints the duration after the result; so does this.
-            e.push(crate::sqledit::Entry::Timing(took));
+            // The shell prints the duration after the result; so does this, unless
+            // `.timer off`.
+            if timer {
+                e.push(crate::sqledit::Entry::Timing(took));
+            }
         }
+    }
+
+    /// Carry out a dot-command, the way the sqlite3 shell does. The editor holds no
+    /// database access of its own, so this is the host's job — which also keeps
+    /// every file path and every write in one place.
+    fn run_dot(&mut self, line: &str) {
+        use crate::sqledit::Entry;
+        let mut parts = line.split_whitespace();
+        let cmd = parts.next().unwrap_or("").to_lowercase();
+        let args: Vec<&str> = parts.collect();
+        let arg = |i: usize| args.get(i).copied();
+        let on_off = |v: Option<&str>, current: bool| match v {
+            Some("on") | Some("yes") | Some("1") => true,
+            Some("off") | Some("no") | Some("0") => false,
+            _ => !current,
+        };
+
+        let note: Vec<String> = match cmd.as_str() {
+            ".help" => DOT_HELP.lines().map(str::to_string).collect(),
+            ".tables" => match self.sqlite() {
+                Some(s) => s.tables.clone(),
+                None => return,
+            },
+            ".schema" => {
+                let only = arg(0);
+                match self.sqlite().map(|s| s.schema()) {
+                    Some(Ok(objects)) => objects
+                        .into_iter()
+                        .filter(|(_, name, _)| only.is_none_or(|o| o.eq_ignore_ascii_case(name)))
+                        .flat_map(|(_, _, sql)| {
+                            let mut lines: Vec<String> = sql.lines().map(str::to_string).collect();
+                            lines.push(";".into());
+                            lines
+                        })
+                        .collect(),
+                    Some(Err(e)) => vec![format!("{e}")],
+                    None => return,
+                }
+            }
+            ".indexes" => {
+                let table = match arg(0).map(str::to_string).or_else(|| self.current_table()) {
+                    Some(t) => t,
+                    None => return,
+                };
+                match self.sqlite().map(|s| s.indexes(&table)) {
+                    Some(Ok(list)) if list.is_empty() => vec![format!("{table}: no indexes")],
+                    Some(Ok(list)) => list
+                        .into_iter()
+                        .map(|(name, cols)| format!("{name}  ({})", cols.join(", ")))
+                        .collect(),
+                    Some(Err(e)) => vec![format!("{e}")],
+                    None => return,
+                }
+            }
+            ".dump" => match self.sqlite().map(|s| s.dump(arg(0))) {
+                Some(Ok(text)) => text.lines().map(str::to_string).collect(),
+                Some(Err(e)) => vec![format!("{e}")],
+                None => return,
+            },
+            ".databases" => match self.sqlite().map(|s| s.databases()) {
+                Some(Ok(list)) => list
+                    .into_iter()
+                    .map(|(alias, file)| format!("{alias:<10} {file}"))
+                    .collect(),
+                Some(Err(e)) => vec![format!("{e}")],
+                None => return,
+            },
+            ".attach" => match (arg(0), arg(1)) {
+                (Some(file), Some(alias)) => {
+                    match self
+                        .sqlite()
+                        .map(|s| s.attach(std::path::Path::new(file), alias))
+                    {
+                        Some(Ok(())) => vec![format!("attached {file} as {alias}")],
+                        Some(Err(e)) => vec![format!("{e}")],
+                        None => return,
+                    }
+                }
+                _ => vec!["usage: .attach FILE ALIAS".into()],
+            },
+            ".detach" => match (arg(0), self.sqlite()) {
+                (Some(alias), Some(s)) => match s.detach(alias) {
+                    Ok(()) => vec![format!("detached {alias}")],
+                    Err(e) => vec![format!("{e}")],
+                },
+                (None, _) => vec!["usage: .detach ALIAS".into()],
+                _ => return,
+            },
+            ".mode" => match arg(0) {
+                Some(name) => match OutputMode::parse(name) {
+                    Some(m) => {
+                        self.sql_mode = m;
+                        vec![format!("mode: {}", m.label())]
+                    }
+                    None => vec![format!(
+                        "unknown mode {name:?} — list csv tsv markdown line insert json"
+                    )],
+                },
+                None => vec![format!("mode: {}", self.sql_mode.label())],
+            },
+            ".headers" => {
+                self.sql_headers = on_off(arg(0), self.sql_headers);
+                vec![format!(
+                    "headers: {}",
+                    if self.sql_headers { "on" } else { "off" }
+                )]
+            }
+            ".timer" => {
+                self.sql_timer = on_off(arg(0), self.sql_timer);
+                vec![format!(
+                    "timer: {}",
+                    if self.sql_timer { "on" } else { "off" }
+                )]
+            }
+            ".eqp" => {
+                self.sql_eqp = on_off(arg(0), self.sql_eqp);
+                vec![format!("eqp: {}", if self.sql_eqp { "on" } else { "off" })]
+            }
+            ".output" | ".once" => match arg(0) {
+                Some(file) => {
+                    self.sql_out = Some((PathBuf::from(file), cmd == ".once"));
+                    vec![format!(
+                        "{} results to {file}",
+                        if cmd == ".once" { "next" } else { "all" }
+                    )]
+                }
+                None => {
+                    self.sql_out = None;
+                    vec!["output: the transcript".into()]
+                }
+            },
+            ".import" => match (arg(0), arg(1)) {
+                (Some(file), Some(table)) => self.import_file(file, table),
+                _ => vec!["usage: .import FILE TABLE".into()],
+            },
+            ".read" => match arg(0) {
+                Some(file) => match std::fs::read_to_string(file) {
+                    Ok(text) => {
+                        // Each statement runs as if typed, so a script's results and
+                        // errors land in the transcript in order.
+                        let statements: Vec<String> = text
+                            .split(';')
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                            .map(str::to_string)
+                            .collect();
+                        let n = statements.len();
+                        for stmt in statements {
+                            self.execute_sql(&stmt);
+                        }
+                        vec![format!(
+                            "ran {n} statement{} from {file}",
+                            if n == 1 { "" } else { "s" }
+                        )]
+                    }
+                    Err(e) => vec![format!("cannot read {file}: {e}")],
+                },
+                None => vec!["usage: .read FILE".into()],
+            },
+            ".backup" => match (arg(0), self.sqlite()) {
+                (Some(file), Some(s)) => {
+                    let dest = std::path::Path::new(file);
+                    if dest.exists() {
+                        vec![format!("{file} already exists")]
+                    } else {
+                        match s.backup_to(dest) {
+                            Ok(()) => vec![format!("wrote {file}")],
+                            Err(e) => vec![format!("{e}")],
+                        }
+                    }
+                }
+                (None, _) => vec!["usage: .backup FILE".into()],
+                _ => return,
+            },
+            ".expert" => {
+                // The advice is about the statement above, which is the one the
+                // transcript last ran.
+                let last = self
+                    .sql
+                    .as_ref()
+                    .and_then(|e| e.last_statement())
+                    .unwrap_or_default();
+                if last.is_empty() {
+                    vec![".expert: run a statement first, then ask about it".into()]
+                } else {
+                    match self.sqlite().map(|s| s.index_advice(&last)) {
+                        Some(Ok(advice)) if advice.is_empty() => {
+                            vec![format!("{last}: the planner scans nothing in full")]
+                        }
+                        Some(Ok(advice)) => advice,
+                        Some(Err(e)) => vec![format!("{e}")],
+                        None => return,
+                    }
+                }
+            }
+            ".vacuum" | ".analyze" | ".reindex" => {
+                let op = match cmd.as_str() {
+                    ".vacuum" => crate::sqlite::Maintenance::Vacuum,
+                    ".analyze" => crate::sqlite::Maintenance::Analyze,
+                    _ => crate::sqlite::Maintenance::Reindex,
+                };
+                match self.sqlite().map(|s| s.maintain(op)) {
+                    Some(Ok(delta)) => vec![format!(
+                        "{}: done, {}",
+                        op.label(),
+                        if delta == 0 {
+                            "no change in size".to_string()
+                        } else if delta < 0 {
+                            format!("{} smaller", human_size((-delta) as u64))
+                        } else {
+                            format!("{} larger", human_size(delta as u64))
+                        }
+                    )],
+                    Some(Err(e)) => vec![format!("{e}")],
+                    None => return,
+                }
+            }
+            ".quit" | ".exit" => {
+                self.quit = true;
+                return;
+            }
+            other => vec![format!("unknown command {other:?} — .help lists them")],
+        };
+        if let Some(e) = self.sql.as_mut() {
+            e.push(Entry::Note(note));
+        }
+    }
+
+    /// `.import FILE TABLE`, sharing the reader and the insert path with the
+    /// `--import` flag.
+    fn import_file(&mut self, file: &str, table: &str) -> Vec<String> {
+        let text = match std::fs::read_to_string(file) {
+            Ok(t) => t,
+            Err(e) => return vec![format!("cannot read {file}: {e}")],
+        };
+        let sep = match std::path::Path::new(file)
+            .extension()
+            .and_then(|e| e.to_str())
+        {
+            Some("tsv") | Some("tab") => '\t',
+            _ => ',',
+        };
+        let csv = match crate::import::parse(&text, sep) {
+            Ok(c) => c,
+            Err(e) => return vec![format!("{file}: {e}")],
+        };
+        let done = match self.sqlite() {
+            Some(s) => s.import_rows(table, &csv.header, &csv.rows),
+            None => return Vec::new(),
+        };
+        match done {
+            Ok(n) => {
+                self.load_table();
+                vec![format!("imported {n} rows into {table}")]
+            }
+            Err(e) => vec![format!("{e}")],
+        }
+    }
+
+    /// Write a result set to wherever `.output` / `.once` points, returning what to
+    /// report. `None` when no redirect is active, which leaves the transcript to
+    /// show the result itself.
+    fn write_result(&mut self, columns: &[String], rows: &[Vec<String>]) -> Option<String> {
+        let (path, once) = self.sql_out.clone()?;
+        let text = self.sql_mode.render(
+            columns,
+            rows,
+            &self.current_table().unwrap_or_else(|| "table".into()),
+            self.sql_headers,
+        );
+        let note = match std::fs::write(&path, text.as_bytes()) {
+            Ok(()) => format!(
+                "wrote {} row{} to {} as {}",
+                rows.len(),
+                if rows.len() == 1 { "" } else { "s" },
+                path.display(),
+                self.sql_mode.label()
+            ),
+            Err(e) => format!("cannot write {}: {e}", path.display()),
+        };
+        if once {
+            self.sql_out = None;
+        }
+        Some(note)
     }
 
     fn key_top(&mut self, code: KeyCode) {
@@ -4286,6 +4819,203 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
         panic!("the statistics pass never finished");
+    }
+
+    /// The dot-commands, which is what makes the editor a stand-in for the shell:
+    /// output modes, redirects, schema queries, import, scripts and index advice.
+    #[test]
+    fn the_sql_editor_runs_dot_commands() {
+        use crate::sqledit::Entry;
+        let path = scratch("db");
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE t (a TEXT, b INTEGER);
+             CREATE INDEX t_a ON t(a);
+             INSERT INTO t VALUES ('x', 1), ('y', 2);",
+        )
+        .unwrap();
+        drop(conn);
+        let mut app = App::with_theme(
+            Store::Sqlite(SqliteStore::open(&path).unwrap()),
+            Theme::from_name(ThemeName::NeonSprawl),
+        );
+        press(&mut app, ':');
+        let note = |app: &App| -> Vec<String> {
+            app.sql
+                .as_ref()
+                .unwrap()
+                .transcript()
+                .iter()
+                .rev()
+                .find_map(|e| match e {
+                    Entry::Note(lines) => Some(lines.clone()),
+                    _ => None,
+                })
+                .expect("a note")
+        };
+
+        app.execute_sql(".tables");
+        assert_eq!(note(&app), vec!["t".to_string()]);
+
+        app.execute_sql(".indexes t");
+        assert!(note(&app)[0].starts_with("t_a  (a)"), "{:?}", note(&app));
+
+        app.execute_sql(".help");
+        assert!(
+            note(&app).iter().any(|l| l.starts_with(".expert")),
+            "the help lists every command it implements"
+        );
+
+        // `.mode` changes how a result set is rendered: no grid, formatted text.
+        app.execute_sql(".mode csv");
+        app.execute_sql("SELECT a, b FROM t ORDER BY a");
+        assert_eq!(note(&app), vec!["a,b", "x,1", "y,2"]);
+        app.execute_sql(".headers off");
+        app.execute_sql("SELECT a, b FROM t ORDER BY a");
+        assert_eq!(
+            note(&app),
+            vec!["x,1", "y,2"],
+            "headers off drops the names"
+        );
+        app.execute_sql(".mode list");
+        app.execute_sql("SELECT a FROM t");
+        assert!(
+            matches!(
+                app.sql.as_ref().unwrap().transcript().iter().rev().nth(1),
+                Some(Entry::Rows { .. })
+            ),
+            "list mode is the grid again"
+        );
+
+        // `.once` writes the next result only.
+        let out = scratch("csv");
+        app.execute_sql(".mode csv");
+        app.execute_sql(".headers on"); // still off from the toggle above
+        app.execute_sql(&format!(".once {}", out.display()));
+        app.execute_sql("SELECT a FROM t ORDER BY a");
+        assert!(note(&app)[0].contains("wrote 2 rows"), "{:?}", note(&app));
+        assert_eq!(std::fs::read_to_string(&out).unwrap(), "a\nx\ny\n");
+        assert!(
+            app.sql_out.is_none(),
+            "a once redirect ends after one result"
+        );
+
+        // `.import` shares the reader with --import; `.read` runs a script.
+        let csv = scratch("in.csv");
+        std::fs::write(&csv, "a,b\nz,3\n").unwrap();
+        app.execute_sql(&format!(".import {} t", csv.display()));
+        assert_eq!(note(&app), vec!["imported 1 rows into t".to_string()]);
+        let script = scratch("sql");
+        std::fs::write(
+            &script,
+            "UPDATE t SET b = 9 WHERE a = 'z';\nSELECT count(*) FROM t;",
+        )
+        .unwrap();
+        app.execute_sql(&format!(".read {}", script.display()));
+        assert!(
+            note(&app).iter().any(|l| l.contains("ran 2 statements")),
+            "{:?}",
+            note(&app)
+        );
+
+        // `.expert` asks about the statement the transcript last ran, so this one
+        // goes through the editor: typing and Enter is what records it.
+        app.execute_sql(".mode list");
+        for c in "SELECT a FROM t WHERE b = 1".chars() {
+            app.on_key(KeyEvent::from(KeyCode::Char(c)));
+        }
+        app.on_key(KeyEvent::from(KeyCode::Enter));
+        app.execute_sql(".expert");
+        let advice = note(&app);
+        assert!(
+            advice[0].contains("full scan") && advice[0].contains("CREATE INDEX"),
+            "{advice:?}"
+        );
+        assert!(
+            advice[0].contains("\"b\""),
+            "the column compared: {advice:?}"
+        );
+
+        // An unknown command says so instead of reaching SQLite.
+        app.execute_sql(".nope");
+        assert!(
+            note(&app)[0].contains("unknown command"),
+            "{:?}",
+            note(&app)
+        );
+        for f in [path, out, csv, script] {
+            let _ = std::fs::remove_file(f);
+        }
+    }
+
+    /// `F` follows the foreign key under the cursor into the parent table and puts
+    /// the cursor on the row it references.
+    #[test]
+    fn f_follows_a_foreign_key_to_its_parent_row() {
+        let path = scratch("db");
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            // Enforcement off so the fixture can hold a dangling key, which is
+            // exactly the case `F` has to report rather than follow.
+            "PRAGMA foreign_keys=OFF;
+             CREATE TABLE author (id INTEGER PRIMARY KEY, name TEXT);
+             CREATE TABLE book (title TEXT, author_id INTEGER REFERENCES author(id));
+             INSERT INTO author VALUES (1, 'first'), (2, 'second'), (3, 'third');
+             INSERT INTO book VALUES ('a book', 3), ('orphan', 99), ('unknown', NULL);",
+        )
+        .unwrap();
+        drop(conn);
+        let mut app = App::with_theme(
+            Store::Sqlite(SqliteStore::open(&path).unwrap()),
+            Theme::from_name(ThemeName::NeonSprawl),
+        );
+        // `book` is the second table; focus its grid and put the cursor on the key.
+        let book = app
+            .sqlite()
+            .unwrap()
+            .tables
+            .iter()
+            .position(|t| t == "book")
+            .unwrap();
+        app.select_table(book);
+        app.on_key(KeyEvent::from(KeyCode::Tab));
+        app.on_key(KeyEvent::from(KeyCode::Right)); // author_id
+
+        press(&mut app, 'F');
+        assert_eq!(
+            app.current_table().as_deref(),
+            Some("author"),
+            "it jumps to the parent table"
+        );
+        let row = &app.rows.as_ref().unwrap().rows[app.row_idx];
+        assert_eq!(row[1], "third", "and lands on the referenced row");
+        assert_eq!(
+            app.rows.as_ref().unwrap().columns[app.col_idx],
+            "id",
+            "with the cursor on the key column"
+        );
+
+        // A key with no matching parent row says so and stays put. (Focus is
+        // already on the grid here, so Tab would move it away.)
+        app.select_table(book);
+        app.on_key(KeyEvent::from(KeyCode::Right));
+        app.on_key(KeyEvent::from(KeyCode::Down)); // the orphan row
+        press(&mut app, 'F');
+        assert_eq!(app.current_table().as_deref(), Some("book"));
+        assert!(app.status.contains("no author row"), "got {:?}", app.status);
+
+        // A NULL key, and a column that is not a key at all.
+        app.on_key(KeyEvent::from(KeyCode::Down)); // the NULL row
+        press(&mut app, 'F');
+        assert!(app.status.contains("NULL"), "got {:?}", app.status);
+        app.on_key(KeyEvent::from(KeyCode::Left)); // title
+        press(&mut app, 'F');
+        assert!(
+            app.status.contains("not a foreign key"),
+            "got {:?}",
+            app.status
+        );
+        let _ = std::fs::remove_file(path);
     }
 
     /// `Y` puts the row on the clipboard as an `INSERT`. With no tty the copy

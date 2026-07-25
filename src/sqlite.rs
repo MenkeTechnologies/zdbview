@@ -97,6 +97,79 @@ impl Maintenance {
     }
 }
 
+/// A parsed grid filter. A bare word matches any column; `name:value` restricts
+/// the match to that column, which is DB Browser's per-column filter. Terms are
+/// separated by whitespace and ANDed, so `cwd:zshrs echo` means "cwd contains
+/// zshrs and some column contains echo".
+///
+/// `name:` is only read as a column when `name` is one — otherwise the whole
+/// token stays a plain term, so filtering for `12:30` or `http://x` still works.
+#[derive(Debug, Default, PartialEq)]
+pub struct Filter {
+    terms: Vec<Term>,
+}
+
+#[derive(Debug, PartialEq)]
+enum Term {
+    /// Matched against every column.
+    Any(String),
+    /// Matched against one named column.
+    Column { column: String, value: String },
+}
+
+impl Filter {
+    pub fn parse(text: &str, columns: &[String]) -> Self {
+        let mut terms = Vec::new();
+        for token in text.split_whitespace() {
+            match token.split_once(':') {
+                Some((name, value)) if !value.is_empty() => {
+                    match columns.iter().find(|c| c.eq_ignore_ascii_case(name)) {
+                        Some(column) => terms.push(Term::Column {
+                            column: column.clone(),
+                            value: value.to_string(),
+                        }),
+                        None => terms.push(Term::Any(token.to_string())),
+                    }
+                }
+                _ => terms.push(Term::Any(token.to_string())),
+            }
+        }
+        Filter { terms }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.terms.is_empty()
+    }
+
+    /// The `WHERE` body for this filter and the patterns to bind, with parameters
+    /// numbered from `first_param` so the same filter can sit beside a search
+    /// pattern in one statement.
+    fn sql(&self, columns: &[String], first_param: usize) -> (String, Vec<String>) {
+        let mut parts = Vec::new();
+        let mut binds = Vec::new();
+        for term in &self.terms {
+            let n = first_param + binds.len();
+            match term {
+                Term::Any(v) => {
+                    if columns.is_empty() {
+                        continue;
+                    }
+                    parts.push(format!("({})", SqliteStore::like_group(columns, n)));
+                    binds.push(format!("%{}%", like_escape(v)));
+                }
+                Term::Column { column, value } => {
+                    parts.push(format!(
+                        "(CAST(\"{}\" AS TEXT) LIKE ?{n} ESCAPE '\\')",
+                        esc(column)
+                    ));
+                    binds.push(format!("%{}%", like_escape(value)));
+                }
+            }
+        }
+        (parts.join(" AND "), binds)
+    }
+}
+
 /// What a row search is looking for: the table and its columns, the term, and the
 /// two things that decide which rows are eligible and in what order — the active
 /// sort and the grid filter.
@@ -130,11 +203,8 @@ impl SqliteStore {
         })
     }
 
-    /// `WHERE` body matching `term` against every column as text, plus the bound
-    /// pattern. `None` when there is no filter.
     /// `col LIKE ?N OR col LIKE ?N …` over every column, for the search term and
-    /// for the grid filter — which need different parameters in the same
-    /// statement, hence the index.
+    /// for a filter's any-column terms.
     fn like_group(columns: &[String], param: usize) -> String {
         columns
             .iter()
@@ -143,19 +213,18 @@ impl SqliteStore {
             .join(" OR ")
     }
 
-    fn filter_clause(columns: &[String], term: &str) -> Option<(String, String)> {
-        if term.is_empty() || columns.is_empty() {
+    /// ` WHERE …` for a filter plus the patterns to bind, or `None` when the
+    /// filter selects everything.
+    fn filter_clause(columns: &[String], filter: &str) -> Option<(String, Vec<String>)> {
+        let parsed = Filter::parse(filter, columns);
+        if parsed.is_empty() {
             return None;
         }
-        let likes = columns
-            .iter()
-            .map(|c| format!("CAST(\"{}\" AS TEXT) LIKE ?1 ESCAPE '\\'", esc(c)))
-            .collect::<Vec<_>>()
-            .join(" OR ");
-        Some((
-            format!(" WHERE ({likes})"),
-            format!("%{}%", like_escape(term)),
-        ))
+        let (body, binds) = parsed.sql(columns, 1);
+        if body.is_empty() {
+            return None;
+        }
+        Some((format!(" WHERE {body}"), binds))
     }
 
     /// Rows matching `filter`, i.e. how many the filtered grid has in total.
@@ -163,9 +232,11 @@ impl SqliteStore {
         let columns = self.columns(table)?;
         match Self::filter_clause(&columns, filter) {
             None => self.count(table),
-            Some((where_sql, pattern)) => {
+            Some((where_sql, binds)) => {
                 let sql = format!("SELECT COUNT(*) FROM \"{}\"{}", esc(table), where_sql);
-                Ok(self.conn.query_row(&sql, params![pattern], |r| r.get(0))?)
+                Ok(self
+                    .conn
+                    .query_row(&sql, rusqlite::params_from_iter(binds), |r| r.get(0))?)
             }
         }
     }
@@ -256,7 +327,7 @@ impl SqliteStore {
         let mut rows_out = Vec::new();
         let mut rowids = Vec::new();
         let mut q = match &clause {
-            Some((_, pattern)) => stmt.query(params![pattern])?,
+            Some((_, binds)) => stmt.query(rusqlite::params_from_iter(binds))?,
             None => stmt.query([])?,
         };
         while let Some(row) = q.next()? {
@@ -297,8 +368,9 @@ impl SqliteStore {
         let likes = Self::like_group(columns, 1);
         // A filtered grid lists a subset, so the search has to walk that subset —
         // otherwise `n` lands on a row the filter hides and the ordinal that
-        // positions it counts rows nobody can see.
-        let keep = Self::and_filter(columns, filter);
+        // positions it counts rows nobody can see. The search pattern is `?1` and
+        // the marker rowid `?2`, so the filter's parameters start at `?3`.
+        let (keep, keep_binds) = Self::and_filter(columns, filter, 3);
         // Search must step through the rows in the order they are displayed, so
         // both the comparison and the ORDER BY follow the active sort.
         let sql = match sort {
@@ -327,11 +399,8 @@ impl SqliteStore {
             }
         };
         let pattern = format!("%{}%", like_escape(term));
-        let keep_pattern = format!("%{}%", like_escape(filter));
         let mut binds: Vec<&dyn rusqlite::ToSql> = vec![&pattern, &from_rowid];
-        if !keep.is_empty() {
-            binds.push(&keep_pattern);
-        }
+        binds.extend(keep_binds.iter().map(|b| b as &dyn rusqlite::ToSql));
         let mut stmt = self.conn.prepare(&sql)?;
         let rid = stmt
             .query_row(binds.as_slice(), |r| r.get::<_, i64>(0))
@@ -339,12 +408,15 @@ impl SqliteStore {
         Ok(rid)
     }
 
-    /// ` AND (filter…)` bound to `?3`, or nothing when no filter is active.
-    fn and_filter(columns: &[String], filter: &str) -> String {
-        if filter.is_empty() || columns.is_empty() {
-            String::new()
+    /// ` AND (filter…)` with parameters numbered from `first_param`, plus the
+    /// patterns to bind. Empty when no filter is active.
+    fn and_filter(columns: &[String], filter: &str, first_param: usize) -> (String, Vec<String>) {
+        let parsed = Filter::parse(filter, columns);
+        let (body, binds) = parsed.sql(columns, first_param);
+        if body.is_empty() {
+            (String::new(), Vec::new())
         } else {
-            format!(" AND ({})", Self::like_group(columns, 3))
+            (format!(" AND {body}"), binds)
         }
     }
 
@@ -364,7 +436,8 @@ impl SqliteStore {
             return Ok(None);
         }
         let likes = Self::like_group(columns, 1);
-        let keep = Self::and_filter(columns, filter);
+        // No marker row in this form, so the filter's parameters start at `?2`.
+        let (keep, keep_binds) = Self::and_filter(columns, filter, 2);
         let order = match sort {
             Some(s) if columns.contains(&s.column) => {
                 if forward {
@@ -375,10 +448,6 @@ impl SqliteStore {
             }
             _ => format!("rowid {}", if forward { "ASC" } else { "DESC" }),
         };
-        // `?2` is unused here, and binding a parameter a statement does not
-        // mention is an error, so the filter keeps its `?3` slot only when the
-        // marker form needs one: build it against `?2` instead.
-        let keep = keep.replace("?3", "?2");
         let sql = format!(
             "SELECT rowid FROM \"{}\" WHERE ({}){} ORDER BY {} LIMIT 1",
             esc(table),
@@ -387,11 +456,8 @@ impl SqliteStore {
             order
         );
         let pattern = format!("%{}%", like_escape(term));
-        let keep_pattern = format!("%{}%", like_escape(filter));
         let mut binds: Vec<&dyn rusqlite::ToSql> = vec![&pattern];
-        if !keep.is_empty() {
-            binds.push(&keep_pattern);
-        }
+        binds.extend(keep_binds.iter().map(|b| b as &dyn rusqlite::ToSql));
         let mut stmt = self.conn.prepare(&sql)?;
         Ok(stmt
             .query_row(binds.as_slice(), |r| r.get::<_, i64>(0))
@@ -410,8 +476,8 @@ impl SqliteStore {
         let columns = self.columns(table)?;
         // The ordinal has to count the rows the grid actually lists, or a filtered
         // search scrolls to a page the row is not on. `?1` and `?2` are both the
-        // marker rowid here, so the filter keeps its own `?3`.
-        let keep = Self::and_filter(&columns, filter);
+        // marker rowid here, so the filter's parameters start at `?3`.
+        let (keep, keep_binds) = Self::and_filter(&columns, filter, 3);
         let sql = match sort {
             // Everything not strictly after the marker row is at or before it.
             Some(s) => format!(
@@ -426,11 +492,8 @@ impl SqliteStore {
                 keep
             ),
         };
-        let keep_pattern = format!("%{}%", like_escape(filter));
         let mut binds: Vec<&dyn rusqlite::ToSql> = vec![&rowid, &rowid];
-        if !keep.is_empty() {
-            binds.push(&keep_pattern);
-        }
+        binds.extend(keep_binds.iter().map(|b| b as &dyn rusqlite::ToSql));
         let n: i64 = self.conn.query_row(&sql, binds.as_slice(), |r| r.get(0))?;
         Ok(n)
     }
@@ -806,6 +869,191 @@ impl SqliteStore {
         Ok(())
     }
 
+    /// Attach another database file under `alias`, the shell's `.open`-adjacent
+    /// `ATTACH`. Cross-database queries then work in the SQL editor.
+    pub fn attach(&self, path: &Path, alias: &str) -> Result<()> {
+        self.conn.execute(
+            &format!("ATTACH DATABASE ?1 AS \"{}\"", esc(alias)),
+            params![path.to_string_lossy()],
+        )?;
+        Ok(())
+    }
+
+    pub fn detach(&self, alias: &str) -> Result<()> {
+        self.conn
+            .execute_batch(&format!("DETACH DATABASE \"{}\"", esc(alias)))?;
+        Ok(())
+    }
+
+    /// `(alias, file)` for every attached database — the shell's `.databases`.
+    pub fn databases(&self) -> Result<Vec<(String, String)>> {
+        let mut stmt = self.conn.prepare("PRAGMA database_list")?;
+        let out = stmt
+            .query_map([], |r| {
+                Ok((r.get::<_, String>(1)?, r.get::<_, Option<String>>(2)?))
+            })?
+            .filter_map(|r| r.ok())
+            .map(|(alias, file)| (alias, file.unwrap_or_else(|| "(temporary)".into())))
+            .collect();
+        Ok(out)
+    }
+
+    /// Indexes on `table` with their columns, in index order — the shell's
+    /// `.indexes`, which the schema view does not break out per table.
+    pub fn indexes(&self, table: &str) -> Result<Vec<(String, Vec<String>)>> {
+        let mut stmt = self
+            .conn
+            .prepare(&format!("PRAGMA index_list(\"{}\")", esc(table)))?;
+        let names: Vec<String> = stmt
+            .query_map([], |r| r.get::<_, String>(1))?
+            .filter_map(|r| r.ok())
+            .collect();
+        let mut out = Vec::with_capacity(names.len());
+        for name in names {
+            let mut info = self
+                .conn
+                .prepare(&format!("PRAGMA index_info(\"{}\")", esc(&name)))?;
+            let cols: Vec<String> = info
+                .query_map([], |r| r.get::<_, Option<String>>(2))?
+                .filter_map(|r| r.ok())
+                .flatten()
+                .collect();
+            out.push((name, cols));
+        }
+        Ok(out)
+    }
+
+    /// Index advice for `sql`, in the spirit of the shell's `.expert`: every table
+    /// the planner chose to scan in full, with the columns that statement compares
+    /// it on.
+    ///
+    /// This is not sqlite3_expert — that builds candidate indexes and re-plans
+    /// against them, which rusqlite exposes no binding for. It reads the plan the
+    /// planner actually produced and the statement's own column references, which
+    /// covers the case that matters: a full scan of a table whose filter column
+    /// could be indexed. Columns are attributed to a table only when the name is
+    /// unambiguous, so a join on two tables that share a column name is reported
+    /// without that column rather than with a guess.
+    pub fn index_advice(&self, sql: &str) -> Result<Vec<String>> {
+        let plan = self.explain_plan(sql)?;
+        let scanned: Vec<String> = plan
+            .iter()
+            .filter_map(|line| {
+                let rest = line.trim_start_matches(['|', '`', '-', ' ']);
+                let name = rest.strip_prefix("SCAN ")?.split_whitespace().next()?;
+                // A scan of a subquery or a materialized CTE names no real table.
+                self.tables.iter().find(|t| t.as_str() == name).cloned()
+            })
+            .collect();
+        if scanned.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mentioned = compared_columns(sql);
+        let mut out = Vec::new();
+        for table in scanned {
+            let columns = self.columns(&table)?;
+            // Only names this table has, and that no other table in the statement
+            // also has — otherwise the attribution would be a guess.
+            let mut useful: Vec<String> = Vec::new();
+            for name in &mentioned {
+                if !columns.iter().any(|c| c.eq_ignore_ascii_case(name)) {
+                    continue;
+                }
+                let ambiguous = self
+                    .tables
+                    .iter()
+                    .filter(|t| *t != &table)
+                    .filter_map(|t| self.columns(t).ok())
+                    .any(|cols| cols.iter().any(|c| c.eq_ignore_ascii_case(name)));
+                if !ambiguous && !useful.iter().any(|c| c.eq_ignore_ascii_case(name)) {
+                    useful.push(name.clone());
+                }
+            }
+            let already: Vec<Vec<String>> = self
+                .indexes(&table)?
+                .into_iter()
+                .map(|(_, cols)| cols)
+                .collect();
+            useful.retain(|c| {
+                !already
+                    .iter()
+                    .any(|cols| cols.first().is_some_and(|f| f.eq_ignore_ascii_case(c)))
+            });
+            if useful.is_empty() {
+                out.push(format!(
+                    "{table}: full scan, and no unindexed column of it is compared here"
+                ));
+            } else {
+                out.push(format!(
+                    "{table}: full scan — CREATE INDEX \"{table}_{}\" ON \"{table}\"({});",
+                    useful.join("_"),
+                    useful
+                        .iter()
+                        .map(|c| format!("\"{}\"", esc(c)))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+            }
+        }
+        Ok(out)
+    }
+
+    /// The foreign keys of `table`: `(child column, parent table, parent column)`.
+    /// `PRAGMA foreign_key_list` leaves the parent column empty when the key
+    /// targets the parent's primary key, so that case is resolved here — a caller
+    /// wanting to follow the key needs a column name either way.
+    pub fn foreign_keys(&self, table: &str) -> Result<Vec<(String, String, String)>> {
+        let mut stmt = self
+            .conn
+            .prepare(&format!("PRAGMA foreign_key_list(\"{}\")", esc(table)))?;
+        let raw: Vec<(String, String, Option<String>)> = stmt
+            .query_map([], |r| Ok((r.get(3)?, r.get(2)?, r.get(4)?)))?
+            .filter_map(|r| r.ok())
+            .collect();
+        let mut out = Vec::with_capacity(raw.len());
+        for (child, parent, parent_col) in raw {
+            let col = match parent_col {
+                Some(c) => c,
+                None => self.primary_key(&parent)?.unwrap_or_else(|| "rowid".into()),
+            };
+            out.push((child, parent, col));
+        }
+        Ok(out)
+    }
+
+    /// The single-column primary key of `table`, if it has one.
+    fn primary_key(&self, table: &str) -> Result<Option<String>> {
+        let mut stmt = self
+            .conn
+            .prepare(&format!("PRAGMA table_info(\"{}\")", esc(table)))?;
+        let keys: Vec<String> = stmt
+            .query_map([], |r| Ok((r.get::<_, String>(1)?, r.get::<_, i64>(5)?)))?
+            .filter_map(|r| r.ok())
+            .filter(|(_, pk)| *pk > 0)
+            .map(|(name, _)| name)
+            .collect();
+        Ok(if keys.len() == 1 {
+            keys.into_iter().next()
+        } else {
+            None
+        })
+    }
+
+    /// The rowid of the row in `table` whose `column` equals `value`, which is how
+    /// a foreign key is followed to the row it points at. Compared as text so the
+    /// grid's display string can be used directly.
+    pub fn rowid_where(&self, table: &str, column: &str, value: &str) -> Result<Option<i64>> {
+        let sql = format!(
+            "SELECT rowid FROM \"{}\" WHERE CAST(\"{}\" AS TEXT) = ?1 LIMIT 1",
+            esc(table),
+            esc(column)
+        );
+        Ok(self
+            .conn
+            .query_row(&sql, params![value], |r| r.get::<_, i64>(0))
+            .optional()?)
+    }
+
     /// One column's shape: what a `describe` in VisiData or `analyze-tables` in
     /// sqlite-utils reports. `min`/`max` come back as the display strings the grid
     /// would show, so a blob reads as its size rather than as bytes.
@@ -1097,6 +1345,36 @@ fn list_tables(conn: &Connection) -> Result<Vec<String>> {
 }
 
 /// Escape a double-quoted SQL identifier.
+/// Identifiers a statement compares on: what follows `WHERE`, `AND`, `OR`, `ON`,
+/// `ORDER BY` or `GROUP BY`. Deliberately shallow — a real parser is not needed to
+/// notice `WHERE cwd = ?`, and anything it misses simply produces no advice.
+fn compared_columns(sql: &str) -> Vec<String> {
+    let lowered = sql.to_lowercase();
+    let words: Vec<&str> = lowered
+        .split(|c: char| !(c.is_alphanumeric() || c == '_' || c == '.'))
+        .filter(|w| !w.is_empty())
+        .collect();
+    const AFTER: &[&str] = &["where", "and", "or", "on", "by", "having"];
+    let mut out = Vec::new();
+    for (i, w) in words.iter().enumerate() {
+        if !AFTER.contains(w) {
+            continue;
+        }
+        if let Some(next) = words.get(i + 1) {
+            // `t.col` names the column; the qualifier is resolved by the caller,
+            // which knows which tables are in play.
+            let name = next.rsplit('.').next().unwrap_or(next);
+            if name.chars().next().is_some_and(|c| c.is_alphabetic())
+                && !AFTER.contains(&name)
+                && !out.iter().any(|o: &String| o == name)
+            {
+                out.push(name.to_string());
+            }
+        }
+    }
+    out
+}
+
 fn esc(ident: &str) -> String {
     ident.replace('"', "\"\"")
 }

@@ -247,6 +247,7 @@ is published on crates.io); disable with `--no-default-features`.
 | `S` | schema view (SQLite) |
 | `D` | database report: pragmas, integrity check, foreign-key lint, maintenance (SQLite) |
 | `A` | column statistics for the table, with a per-column frequency table (SQLite) |
+| `F` | follow the foreign key under the cursor to the row it references (SQLite) |
 | `Y` | copy the row as an `INSERT` (SQLite) |
 | `0` `1` `2` `3` | Records / Info / Strings / Hex (rkyv) |
 | `v` | cycle value render (auto / hex / text / disasm) — detail screen |
@@ -405,6 +406,42 @@ Inside a clause the scoped columns lead, then what continues the clause (`AND`,
 `ORDER BY`, …), then table names, then the functions. A prefix matching exactly one
 candidate is taken without a menu.
 
+### Dot-commands
+
+A line starting with `.` is a dot-command, as in the shell — `Tab` completes them,
+and `.help` lists exactly what is implemented:
+
+| Command | Does |
+|---------|------|
+| `.tables` / `.schema [T]` / `.indexes [T]` | the objects, their `CREATE` statements, a table's indexes with their columns |
+| `.dump [T]` | schema and data as replayable SQL (the same writer as `--export sql`) |
+| `.databases` / `.attach FILE ALIAS` / `.detach ALIAS` | attached databases, so a statement can join across files |
+| `.mode list\|csv\|tsv\|markdown\|line\|insert\|json` | how a result set is rendered; `list` is the grid |
+| `.headers on\|off` | column names in redirected output |
+| `.output FILE` / `.once FILE` | send results to a file — all of them, or just the next one |
+| `.timer on\|off` / `.eqp on\|off` | statement timing; plan before each statement |
+| `.import FILE TABLE` | load a CSV or TSV (the same reader as `--import`) |
+| `.read FILE` | run a file's statements, each one as if typed |
+| `.backup FILE` | `VACUUM INTO` a copy |
+| `.expert` | index advice for the statement just run (see below) |
+| `.vacuum` / `.analyze` / `.reindex` | the maintenance statements |
+| `.quit` | leave zdbview |
+
+`.expert` is **not** `sqlite3_expert` — that builds candidate indexes and re-plans
+against them, and rusqlite exposes no binding for it. This reads the plan the
+planner actually produced and the columns the statement compares on, then names an
+index for each table the planner chose to scan in full:
+
+```
+sql> SELECT id FROM big WHERE note = 'note 5'
+sql> .expert
+     big: full scan — CREATE INDEX "big_note" ON "big"("note");
+```
+
+A column is attributed to a table only when no other table in the statement has a
+column by that name, so an ambiguous join reports the scan without guessing at the
+index.
+
 History persists to `$XDG_CACHE_HOME/zdbview/sql_history` (200 statements, newlines
 escaped so one statement stays one line), written temp-plus-rename like the other
 appdata.
@@ -429,6 +466,16 @@ The lint reads `foreign_key_list`, `index_list` and `index_info` per table and
 reports a key only when no index *starts* with the child column, which is the
 condition that makes every parent-row change scan the child table. An index on
 some other column of the same table does not count.
+
+## Following a foreign key (`F`)
+
+`F` on a foreign-key column jumps to the row it references — the one piece of
+navigation a schema gives you for free, and what DB Browser and Datasette both
+link. It reads `PRAGMA foreign_key_list`, resolves the parent column (the pragma
+leaves it empty when the key targets the parent's primary key), finds the parent
+row, and lands on it with the cursor on the key column. A key with no matching
+parent row, a `NULL` key and a column that is not a key each say so instead of
+moving.
 
 ## Column statistics (`A`)
 
@@ -524,7 +571,19 @@ text cursor.
 
 For SQLite the filter is a SQL `WHERE` across every column, so it covers the
 **whole table** — the row count and paging follow the filter, not just the loaded
-page. The table list, the rkyv Records and Strings views, and the file picker
+page. A term of the form `col:value` restricts that term to one column — DB
+Browser's filter row — and terms are ANDed:
+
+| Typed | Keeps |
+|-------|-------|
+| `zshrs` | rows where any column contains `zshrs` |
+| `cwd:zshrs` | rows whose `cwd` contains `zshrs` |
+| `cwd:zshrs line:echo` | both conditions, each on its own column |
+| `12:30` | rows containing `12:30` — `12` is not a column, so the token stays one plain term |
+
+Unknown column names stay plain terms, so a filter that happens to contain a colon
+keeps working, and each term binds its own parameter rather than being pasted into
+the SQL. The table list, the rkyv Records and Strings views, and the file picker
 filter the same way; the Hex view is unfiltered (bytes have no rows) and keeps
 `/` as a byte search. Matching is case-insensitive substring; the hex byte search
 is case-sensitive.

@@ -973,3 +973,150 @@ fn search_and_ordinals_stay_inside_the_filter() {
     assert_eq!(name_of(first), "keep three", "descending by name, filtered");
     let _ = std::fs::remove_file(&path);
 }
+
+/// Per-column filters, the way DB Browser's filter row works: `name:value` limits
+/// the match to that column, bare words still match anywhere, and terms are ANDed.
+/// `name:` counts as a column only when `name` is one, so filtering for a value
+/// that happens to contain a colon still works.
+#[test]
+fn a_filter_can_target_one_column() {
+    let path = tmp("colfilter.db");
+    let _ = std::fs::remove_file(&path);
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE t (cwd TEXT, line TEXT);
+         INSERT INTO t VALUES
+            ('/home/zshrs',  'echo one'),
+            ('/home/other',  'echo two'),
+            ('/home/zshrs',  'ls three'),
+            ('/tmp',         'at 12:30 do this');",
+    )
+    .unwrap();
+    drop(conn);
+    let store = SqliteStore::open(&path).unwrap();
+    let lines = |filter: &str| -> Vec<String> {
+        store
+            .rows("t", 50, 0, None, filter)
+            .unwrap()
+            .rows
+            .iter()
+            .map(|r| r[1].clone())
+            .collect()
+    };
+
+    // A bare word still matches any column.
+    assert_eq!(lines("zshrs").len(), 2);
+    // One column only: `line:echo` must not match a cwd that contains "echo".
+    assert_eq!(lines("line:echo"), ["echo one", "echo two"]);
+    assert_eq!(lines("cwd:zshrs"), ["echo one", "ls three"]);
+    // Terms are ANDed across columns.
+    assert_eq!(lines("cwd:zshrs line:echo"), ["echo one"]);
+    // A value with a colon whose prefix is not a column stays one plain term.
+    assert_eq!(lines("12:30"), ["at 12:30 do this"]);
+    // An unknown column name is a plain term too, so nothing matches "nope:x".
+    assert!(lines("nope:x").is_empty());
+    // The count the pager uses agrees with the rows.
+    assert_eq!(store.count_filtered("t", "cwd:zshrs").unwrap(), 2);
+    // And a per-column filter constrains the search the same way a bare one does.
+    let cols = store.columns("t").unwrap();
+    let q = sqlite::RowQuery {
+        table: "t",
+        columns: &cols,
+        term: "echo",
+        sort: None,
+        filter: "cwd:zshrs",
+    };
+    let hit = store.find_row_edge(&q, true).unwrap().unwrap();
+    let view = store.rows("t", 50, 0, None, "").unwrap();
+    let i = view.rowids.iter().position(|r| *r == Some(hit)).unwrap();
+    assert_eq!(view.rows[i][1], "echo one");
+    let _ = std::fs::remove_file(&path);
+}
+
+/// `.databases` / ATTACH, and the index advice `.expert` reports. The advice is
+/// read from the plan the planner actually produced, so the assertions are about
+/// what it chose, not about what it might have.
+#[test]
+fn attach_lists_databases_and_advice_follows_the_plan() {
+    let main = tmp("attach_main.db");
+    let other = tmp("attach_other.db");
+    for p in [&main, &other] {
+        let _ = std::fs::remove_file(p);
+    }
+    let conn = rusqlite::Connection::open(&main).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE big (id INTEGER PRIMARY KEY, tag TEXT, note TEXT);
+         CREATE INDEX big_tag ON big(tag);",
+    )
+    .unwrap();
+    for i in 0..200 {
+        conn.execute(
+            "INSERT INTO big (tag, note) VALUES (?1, ?2)",
+            [format!("tag{}", i % 7), format!("note {i}")],
+        )
+        .unwrap();
+    }
+    drop(conn);
+    rusqlite::Connection::open(&other)
+        .unwrap()
+        .execute_batch("CREATE TABLE side (v TEXT)")
+        .unwrap();
+
+    let store = SqliteStore::open(&main).unwrap();
+    // Only `main` until something is attached.
+    let names: Vec<String> = store
+        .databases()
+        .unwrap()
+        .into_iter()
+        .map(|(a, _)| a)
+        .collect();
+    assert_eq!(names, ["main".to_string()]);
+    store.attach(&other, "side").unwrap();
+    let listed = store.databases().unwrap();
+    assert!(
+        listed
+            .iter()
+            .any(|(a, f)| a == "side" && f.ends_with("attach_other.db")),
+        "{listed:?}"
+    );
+    // A cross-database query works once attached.
+    assert!(store.run("SELECT count(*) FROM side.side", 10).is_ok());
+    store.detach("side").unwrap();
+    assert_eq!(store.databases().unwrap().len(), 1, "detached again");
+
+    // An unindexed column that the statement compares: advice names an index.
+    let advice = store
+        .index_advice("SELECT id FROM big WHERE note = 'note 5'")
+        .unwrap();
+    assert_eq!(advice.len(), 1, "{advice:?}");
+    assert!(advice[0].contains("big: full scan"), "{advice:?}");
+    assert!(
+        advice[0].contains("CREATE INDEX") && advice[0].contains("\"note\""),
+        "{advice:?}"
+    );
+
+    // A column that already has an index: the planner uses it, so there is nothing
+    // to advise.
+    assert!(
+        store
+            .index_advice("SELECT id FROM big WHERE tag = 'tag1'")
+            .unwrap()
+            .is_empty(),
+        "an indexed lookup is not a full scan"
+    );
+
+    // A scan whose columns are all indexed already is reported without advice
+    // rather than with an index that exists.
+    let advice = store.index_advice("SELECT count(*) FROM big").unwrap();
+    assert_eq!(advice.len(), 1);
+    assert!(
+        advice[0].contains("no unindexed column"),
+        "a bare count scans, but nothing is compared: {advice:?}"
+    );
+
+    // Bad SQL is an error, not silent advice.
+    assert!(store.index_advice("SELECT * FROM nope").is_err());
+    for p in [main, other] {
+        let _ = std::fs::remove_file(p);
+    }
+}
