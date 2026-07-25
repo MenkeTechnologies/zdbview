@@ -835,7 +835,11 @@ fn help_sections(ctx: HelpCtx) -> Vec<HelpSection> {
             },
             HelpSection {
                 title: "SCAN",
-                keys: &[("r", "Rescan now"), ("R", "Rescan, ignore cache")],
+                keys: &[
+                    ("r", "Rescan now"),
+                    ("R", "Rescan, ignore cache"),
+                    ("w", "Write monitor"),
+                ],
             },
             HelpSection {
                 title: "DISPLAY",

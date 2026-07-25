@@ -367,7 +367,8 @@ is case-sensitive.
 
 `w` opens a `top` for stores: every shard and database zdbview knows about — the
 open file, the recent list and the saved scan — with what is being written to it
-right now.
+right now. It works from the file picker as well as from an open file; it is one
+screen shared by both, so the keys and columns are identical.
 
 ```
 ┌ writes — 130 files, 2 active, 70 K in 6s at 29 K/s · sort written ─────────────┐

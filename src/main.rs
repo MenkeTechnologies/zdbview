@@ -17,6 +17,7 @@ mod disasm;
 mod export;
 mod formats;
 mod hexedit;
+mod monitor;
 mod mru;
 mod overlay;
 mod prefs;
