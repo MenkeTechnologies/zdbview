@@ -23,6 +23,7 @@ mod overlay;
 mod prefs;
 mod rkyv_inspect;
 mod scan;
+mod sqledit;
 mod sqlite;
 mod store;
 mod theme;

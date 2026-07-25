@@ -141,7 +141,7 @@ SQLite files are self-describing, so every operation works on any database:
 - `e` — edit the selected cell in place.
 - `a` — insert a row using column defaults.
 - `d` — delete the selected row (confirm with `y`).
-- `:` — run an arbitrary SQL statement.
+- `:` — open the **SQL editor** (see below).
 
 Rows are addressed by `rowid`; `WITHOUT ROWID` tables are listed read-only.
 Identifiers are double-quoted with internal quotes doubled, and edited values are
@@ -328,6 +328,55 @@ record edit: deserialize, mutate, re-serialize byte-identically, atomic rename.
 
 `o`/`O`/`x` are a zdbview addition: zmax edits a fixed-length file, while a
 record's value can legitimately change length.
+
+## SQL editor (`:`)
+
+`:` opens a multi-line SQL editor with Tab completion and a transcript, ported from
+[`zmax`](https://github.com/MenkeTechnologies/zmax)'s REPL panel
+(`zmax-term/src/ui/repl.rs`). The old `:` was one line that reported only an
+affected-row count, so a `SELECT` looked like it had done nothing.
+
+```
+┌ SQL — 3 statements · Tab completes · ^j newline · Enter runs · Esc back ───────┐
+│     a                            b                                            │
+│     1                            y                                            │
+│     11 rows                                                                    │
+│     1 row changed                                                              │
+│    ┌ su ──────────┐              biggest                                       │
+│    │SUM           │              9                                             │
+│    │SUBSTR        │                                                            │
+│    └──────────────┘missing_table                                               │
+└────────────────────────────────────────────────────────────────────────────────┘
+┌ input · 9 chars ──────────────────────────────────────────────────────────────┐
+│sql> select su                                                                 │
+└────────────────────────────────────────────────────────────────────────────────┘
+```
+
+| Key | Action |
+|-----|--------|
+| `Enter` | run the statement |
+| `Ctrl-j` (or `Alt-Enter`) | insert a newline — statements may span lines |
+| `Tab` / `Shift-Tab` | complete the word before the cursor; walk the candidates |
+| `↑` `↓` / `Ctrl-p` `Ctrl-n` | browse history, with the in-progress line stashed |
+| `Ctrl-g` | clear the input; `Ctrl-l` clears the transcript |
+| `Ctrl-a` `Ctrl-e` `Ctrl-b` `Ctrl-f` `Ctrl-w` `Ctrl-u` `Ctrl-k` | readline motions and kills |
+| `PgUp` / `PgDn` | scroll the transcript |
+| `Esc` | back to the data; the transcript and history survive |
+
+A `SELECT` (or `PRAGMA`, `EXPLAIN`, a CTE) comes back as a grid of rows with a
+count; anything else reports what it changed and reloads the grid behind it; a
+refusal shows SQLite's own message. Results are capped at 500 rows per statement,
+and the cap is stated when it bites.
+
+Completion has no LSP to ask — it uses the schema in hand: the table and view
+names, then the columns of the tables the statement mentions, then every other
+column, then the SQL keywords. A name is a likelier next token than a keyword, and
+a column of a table already named is likelier than one from a table that is not. A
+prefix matching exactly one candidate is taken without a menu.
+
+History persists to `$XDG_CACHE_HOME/zdbview/sql_history` (200 statements, newlines
+escaped so one statement stays one line), written temp-plus-rename like the other
+appdata.
 
 ## Sorting
 

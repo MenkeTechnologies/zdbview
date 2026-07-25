@@ -409,6 +409,62 @@ impl SqliteStore {
     pub fn exec(&self, sql: &str) -> Result<usize> {
         Ok(self.conn.execute(sql, [])?)
     }
+
+    /// Run one arbitrary statement. A statement that returns columns comes back
+    /// as [`Outcome::Rows`] — the old path only reported an affected count, so
+    /// `SELECT` looked like it did nothing — and anything else as the number of
+    /// rows it changed. `limit` caps what is materialised for display.
+    pub fn run(&self, sql: &str, limit: usize) -> Result<Outcome> {
+        let mut stmt = self.conn.prepare(sql)?;
+        if stmt.column_count() == 0 {
+            // No result set: DML/DDL. `execute` reports the change count.
+            drop(stmt);
+            return Ok(Outcome::Changed(self.exec(sql)?));
+        }
+        let columns: Vec<String> = stmt
+            .column_names()
+            .into_iter()
+            .map(|c| c.to_string())
+            .collect();
+        let ncols = columns.len();
+        let mut rows = Vec::new();
+        let mut truncated = false;
+        let mut q = stmt.query([])?;
+        while let Some(row) = q.next()? {
+            if rows.len() >= limit {
+                truncated = true;
+                break;
+            }
+            rows.push((0..ncols).map(|i| value_to_string(row, i)).collect());
+        }
+        Ok(Outcome::Rows {
+            columns,
+            rows,
+            truncated,
+        })
+    }
+
+    /// Table and view names with their columns, for the SQL editor's completion.
+    pub fn schema_names(&self) -> Vec<(String, Vec<String>)> {
+        self.tables
+            .iter()
+            .map(|t| (t.clone(), self.columns(t).unwrap_or_default()))
+            .collect()
+    }
+}
+
+/// What running a statement produced.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Outcome {
+    /// A result set (`SELECT`, `PRAGMA`, `EXPLAIN`, a CTE …).
+    Rows {
+        columns: Vec<String>,
+        rows: Vec<Vec<String>>,
+        /// More rows were available than `limit` allowed.
+        truncated: bool,
+    },
+    /// Rows changed by a statement that returns nothing.
+    Changed(usize),
 }
 
 fn value_to_string(row: &rusqlite::Row, idx: usize) -> String {

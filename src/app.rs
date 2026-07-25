@@ -44,8 +44,6 @@ enum Mode {
     Normal,
     /// Editing a SQLite cell in place; buffer holds the pending value.
     EditCell(String),
-    /// A raw SQL command line (`:`); buffer holds the statement.
-    Command(String),
     /// A `/` search prompt; buffer holds the pattern being typed.
     Search(String),
     /// Adding a new rkyv record; buffer holds the key being typed.
@@ -97,6 +95,8 @@ enum Screen {
     HexEdit,
     /// Live write monitor over every store zdbview knows about.
     Top,
+    /// The SQL editor: multi-line input, transcript, completion.
+    Sql,
     /// SQLite schema (CREATE statements) view.
     Schema,
 }
@@ -186,6 +186,10 @@ pub struct App {
     top: Option<crate::monitor::Monitor>,
     /// Rect the monitor last rendered into, for its header hit test.
     top_area: Rect,
+    /// The SQL editor, while `screen` is `Screen::Sql`.
+    sql: Option<crate::sqledit::SqlEdit>,
+    /// Rect the SQL editor last rendered into, for paging.
+    sql_area: Rect,
     /// Set by `o`: leave the app loop and show the file picker again.
     reopen: bool,
     /// A file the monitor asked to open, taking precedence over the picker.
@@ -257,6 +261,8 @@ impl App {
             hex_area: Rect::ZERO,
             top: None,
             top_area: Rect::ZERO,
+            sql: None,
+            sql_area: Rect::ZERO,
             reopen: false,
             open_next: None,
             search_origin: None,
@@ -288,6 +294,13 @@ impl App {
         self.ov.theme
     }
 
+    /// Screens that take every printable key for themselves, so the global
+    /// bindings must stay out of the way: the hex editor (letters are hex digits
+    /// and motions) and the SQL editor (letters are the statement).
+    fn screen_owns_keys(&self) -> bool {
+        matches!(self.screen, Screen::HexEdit | Screen::Sql)
+    }
+
     /// Which key sections the help overlay lists for what is on screen.
     fn help_ctx(&self) -> HelpCtx {
         if self.screen == Screen::HexEdit {
@@ -295,6 +308,9 @@ impl App {
         }
         if self.screen == Screen::Top {
             return HelpCtx::Top;
+        }
+        if self.screen == Screen::Sql {
+            return HelpCtx::Sql;
         }
         match &self.store {
             Store::Sqlite(_) => HelpCtx::Sqlite,
@@ -390,7 +406,6 @@ impl App {
         // `self.mode` is held across the `&mut self` dispatch call.
         enum Modal {
             Edit(String),
-            Cmd(String),
             Search(String),
             Add(String),
             Rename(String),
@@ -399,7 +414,6 @@ impl App {
         }
         let modal = match &self.mode {
             Mode::EditCell(buf) => Modal::Edit(buf.clone()),
-            Mode::Command(buf) => Modal::Cmd(buf.clone()),
             Mode::Search(buf) => Modal::Search(buf.clone()),
             Mode::AddRecord(buf) => Modal::Add(buf.clone()),
             Mode::RenameRecord(buf) => Modal::Rename(buf.clone()),
@@ -410,7 +424,6 @@ impl App {
             Modal::Edit(buf) => {
                 return self.key_input(key, buf, Mode::EditCell, App::commit_edit_cell)
             }
-            Modal::Cmd(buf) => return self.key_input(key, buf, Mode::Command, App::commit_command),
             Modal::Search(buf) => {
                 // The arrows (and paging) move through the filtered list while the
                 // prompt stays open — the pattern only takes Left/Right for its
@@ -449,25 +462,23 @@ impl App {
         }
 
         // The overlay openers (`h`/`?` help, `c` chooser, `C` editor) work from
-        // every screen, exactly as on the recent-files picker — except inside the
-        // hex editor, where those keys are motions and data.
-        if self.screen != Screen::HexEdit && self.ov.on_key(code) {
+        // every screen, exactly as on the recent-files picker — except on the
+        // screens that own their keys: the hex editor's motions and the SQL
+        // editor's text.
+        if !self.screen_owns_keys() && self.ov.on_key(code) {
             return;
         }
 
-        // `w` opens the write monitor from any screen but the hex editor (where
-        // every letter is data) and the monitor itself, where it closes.
-        if code == KeyCode::Char('w')
-            && self.screen != Screen::HexEdit
-            && self.screen != Screen::Top
-        {
+        // `w` opens the write monitor from any screen that does not own its keys,
+        // and not from the monitor itself, where it closes.
+        if code == KeyCode::Char('w') && !self.screen_owns_keys() && self.screen != Screen::Top {
             self.open_top();
             return;
         }
 
         // `o` goes back to the file picker from any screen but the hex editor,
         // where it inserts a byte.
-        if code == KeyCode::Char('o') && self.screen != Screen::HexEdit {
+        if code == KeyCode::Char('o') && !self.screen_owns_keys() {
             self.back_to_files();
             return;
         }
@@ -477,6 +488,7 @@ impl App {
             // because those are its own motions and data.
             Screen::HexEdit => return self.key_hex(key),
             Screen::Top => return self.key_top(code),
+            Screen::Sql => return self.key_sql(key),
             Screen::Detail => return self.key_detail(code),
             Screen::Schema => return self.key_schema(code),
             Screen::Main => {}
@@ -865,7 +877,8 @@ impl App {
             KeyCode::Char('>') => self.sort_shift_column(true),
             KeyCode::Char('x') => self.export_current(),
             KeyCode::Char('y') => self.copy_sqlite_cell(),
-            KeyCode::Char(':') => self.open_modal(Mode::Command(String::new())),
+            // `:` opens the SQL editor (multi-line, completion, transcript).
+            KeyCode::Char(':') => self.open_sql(),
             _ => {}
         }
     }
@@ -1206,18 +1219,12 @@ impl App {
             self.search_origin = Some(self.snapshot_position());
         }
         self.input_cursor = match &mode {
-            Mode::EditCell(s)
-            | Mode::Command(s)
-            | Mode::Search(s)
-            | Mode::AddRecord(s)
-            | Mode::RenameRecord(s) => s.len(),
+            Mode::EditCell(s) | Mode::Search(s) | Mode::AddRecord(s) | Mode::RenameRecord(s) => {
+                s.len()
+            }
             _ => 0,
         };
         self.mode = mode;
-    }
-
-    fn commit_command(&mut self, sql: &str) {
-        self.run_sql(sql);
     }
 
     fn commit_search(&mut self, pattern: &str) {
@@ -1753,19 +1760,6 @@ impl App {
         }
     }
 
-    fn run_sql(&mut self, sql: &str) {
-        if sql.trim().is_empty() {
-            return;
-        }
-        match self.sqlite().unwrap().exec(sql) {
-            Ok(n) => {
-                self.notify(format!("ok, {} row(s) affected", n));
-                self.load_table();
-            }
-            Err(e) => self.status = format!("sql error: {}", e),
-        }
-    }
-
     /// `gg` — jump to the first table (left) or first row of the first page
     /// (right).
     fn goto_top(&mut self) {
@@ -1985,6 +1979,13 @@ impl App {
                     m.render(f, outer[0], &t);
                 }
             }
+            Screen::Sql => {
+                let t = self.ov.theme;
+                self.sql_area = outer[0];
+                if let Some(e) = self.sql.as_mut() {
+                    e.render(f, outer[0], &t);
+                }
+            }
             Screen::Schema => self.render_schema(f, outer[0]),
             Screen::Main => match &self.store {
                 Store::Sqlite(_) => self.render_sqlite(f, outer[0]),
@@ -1996,7 +1997,6 @@ impl App {
         // Modal overlays.
         match &self.mode {
             Mode::EditCell(buf) => self.render_input(f, "edit cell (Enter=save, Esc=cancel)", buf),
-            Mode::Command(buf) => self.render_input(f, "SQL (Enter=run, Esc=cancel)", buf),
             Mode::Search(buf) => self.render_input(f, "search / (Enter, Esc)", buf),
             Mode::AddRecord(buf) => self.render_input(f, "new record key (Enter=add, Esc)", buf),
             Mode::RenameRecord(buf) => self.render_input(f, "rename key to (Enter, Esc)", buf),
@@ -2110,6 +2110,69 @@ impl App {
         self.top = Some(m);
         self.screen = Screen::Top;
         self.notify(format!("watching {} files for writes", n));
+    }
+
+    /// Open the SQL editor, seeded with the schema so Tab can complete against
+    /// the real tables and columns.
+    fn open_sql(&mut self) {
+        let schema = match self.sqlite() {
+            Some(s) => s.schema_names(),
+            None => return,
+        };
+        if self.sql.is_none() {
+            self.sql = Some(crate::sqledit::SqlEdit::new(schema));
+        }
+        self.screen = Screen::Sql;
+        self.status =
+            "SQL editor · Tab completes · ^j newline · Enter runs · ↑/↓ history · Esc back".into();
+    }
+
+    fn key_sql(&mut self, key: KeyEvent) {
+        let page = crate::sqledit::SqlEdit::page_rows(self.sql_area);
+        let action = match self.sql.as_mut() {
+            Some(e) => e.on_key(key, page),
+            None => {
+                self.screen = Screen::Main;
+                return;
+            }
+        };
+        match action {
+            crate::sqledit::Action::None => {}
+            // The editor stays alive behind the main screen, so its transcript and
+            // history survive a trip back to the data.
+            crate::sqledit::Action::Close => self.screen = Screen::Main,
+            crate::sqledit::Action::Execute(sql) => self.execute_sql(&sql),
+        }
+    }
+
+    /// Run a statement from the editor and hand the outcome back to it.
+    fn execute_sql(&mut self, sql: &str) {
+        use crate::sqledit::{Entry, RESULT_ROWS};
+        use crate::sqlite::Outcome;
+        let outcome = match self.sqlite() {
+            Some(s) => s.run(sql, RESULT_ROWS),
+            None => return,
+        };
+        let entry = match outcome {
+            Ok(Outcome::Rows {
+                columns,
+                rows,
+                truncated,
+            }) => Entry::Rows {
+                columns,
+                rows,
+                truncated,
+            },
+            Ok(Outcome::Changed(n)) => {
+                // A write may have changed what the grid is showing.
+                self.load_table();
+                Entry::Changed(n)
+            }
+            Err(e) => Entry::Error(e.to_string()),
+        };
+        if let Some(e) = self.sql.as_mut() {
+            e.push(entry);
+        }
     }
 
     fn key_top(&mut self, code: KeyCode) {
@@ -4269,6 +4332,67 @@ mod tests {
         press(&mut app, 'o');
         assert!(!app.reopen, "the editor keeps o for inserting a byte");
         assert_eq!(app.hex.as_ref().unwrap().bytes.len(), before + 1);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// `:` opens the SQL editor and a statement runs through it: a SELECT comes
+    /// back as rows (the old prompt reported only an affected count), a write
+    /// reports what it changed and reloads the grid, and a bad statement shows
+    /// SQLite's own message.
+    #[test]
+    fn sql_editor_runs_statements_and_shows_results() {
+        use crate::sqledit::Entry;
+        let (mut app, path) = sqlite_app_rows(5);
+        press(&mut app, ':');
+        assert_eq!(app.screen, super::Screen::Sql);
+        assert!(app.sql.is_some(), "the editor is open");
+
+        // A SELECT returns rows.
+        app.execute_sql("SELECT a FROM t ORDER BY a LIMIT 2");
+        let last = app.sql.as_ref().unwrap().transcript().last().unwrap();
+        match last {
+            Entry::Rows {
+                columns,
+                rows,
+                truncated,
+            } => {
+                assert_eq!(columns, &["a".to_string()]);
+                assert_eq!(rows.len(), 2, "two rows for LIMIT 2");
+                assert!(!truncated);
+            }
+            other => panic!("expected rows, got {other:?}"),
+        }
+
+        // A write reports its change count and the grid reloads with it.
+        app.execute_sql("UPDATE t SET b = 'z'");
+        assert_eq!(
+            app.sql.as_ref().unwrap().transcript().last(),
+            Some(&Entry::Changed(5))
+        );
+        assert!(
+            app.rows.as_ref().unwrap().rows.iter().all(|r| r[1] == "z"),
+            "the grid must show the write"
+        );
+
+        // A bad statement surfaces the error rather than a bare status line.
+        app.execute_sql("SELECT * FROM nope");
+        match app.sql.as_ref().unwrap().transcript().last().unwrap() {
+            Entry::Error(msg) => assert!(msg.contains("nope"), "got {msg:?}"),
+            other => panic!("expected an error, got {other:?}"),
+        }
+
+        // The editor draws over the app, and Esc returns to the data with the
+        // transcript intact for the next visit.
+        let rows = frame_rows(&mut app, 100, 20);
+        assert!(contains(&rows, "SQL —"), "editor not drawn: {:?}", rows[0]);
+        assert!(contains(&rows, "no such table"), "error not on screen");
+        app.on_key(KeyEvent::from(KeyCode::Esc));
+        assert_eq!(app.screen, super::Screen::Main);
+        press(&mut app, ':');
+        assert!(
+            !app.sql.as_ref().unwrap().transcript().is_empty(),
+            "reopening keeps the transcript"
+        );
         let _ = std::fs::remove_file(&path);
     }
 

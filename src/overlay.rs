@@ -58,6 +58,8 @@ pub enum HelpCtx {
     HexEdit,
     /// The live write monitor.
     Top,
+    /// The SQL editor.
+    Sql,
 }
 
 /// The overlay layer: active scheme plus help / chooser / editor / toast state.
@@ -723,6 +725,7 @@ impl HelpCtx {
             HelpCtx::Picker => "recent files",
             HelpCtx::HexEdit => "hex editor",
             HelpCtx::Top => "write monitor",
+            HelpCtx::Sql => "SQL editor",
         }
     }
 }
@@ -751,6 +754,35 @@ const MOUSE_KEYS: &[(&str, &str)] = &[
 
 /// The help overlay's contents for a screen.
 fn help_sections(ctx: HelpCtx) -> Vec<HelpSection> {
+    if ctx == HelpCtx::Sql {
+        return vec![
+            HelpSection {
+                title: "RUN",
+                keys: &[
+                    ("Enter", "Run the statement"),
+                    ("^j", "Newline (Alt-Enter)"),
+                    ("Tab", "Complete the word"),
+                    ("^g", "Clear the input"),
+                    ("^l", "Clear the transcript"),
+                    ("Esc", "Back to the data"),
+                ],
+            },
+            HelpSection {
+                title: "HISTORY",
+                keys: &[("↑ / ^p", "Older statement"), ("↓ / ^n", "Newer statement")],
+            },
+            HelpSection {
+                title: "EDIT",
+                keys: &[
+                    ("^a / ^e", "Line start / end"),
+                    ("^b / ^f", "Char back / fwd"),
+                    ("^w", "Delete word"),
+                    ("^u / ^k", "Kill to start/end"),
+                    ("PgUp/PgDn", "Scroll transcript"),
+                ],
+            },
+        ];
+    }
     if ctx == HelpCtx::Top {
         return vec![
             HelpSection {
