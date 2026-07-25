@@ -22,6 +22,7 @@ mod monitor;
 mod mru;
 mod overlay;
 mod prefs;
+mod recover;
 mod rkyv_inspect;
 mod scan;
 mod sqledit;
@@ -184,6 +185,12 @@ struct Cli {
     import: Option<PathBuf>,
     #[arg(
         long,
+        help_heading = H_OUTPUT,
+        help = "\x1b[32m//\x1b[0m Salvage rows page by page to stdout as SQL, and exit"
+    )]
+    recover: bool,
+    #[arg(
+        long,
         value_name = "NAME",
         help_heading = H_APPEARANCE,
         help = "\x1b[32m//\x1b[0m Colour scheme for this run (see --list-themes)"
@@ -253,6 +260,11 @@ fn main() -> Result<()> {
     }
     if let Some(src) = &cli.import {
         return run_import(&cli, src);
+    }
+    // `--recover` reads pages, never opening the database, so it works on a file
+    // SQLite itself refuses.
+    if cli.recover {
+        return run_recover(&cli);
     }
 
     // Resolve --theme before touching the terminal so a typo prints plainly
@@ -351,6 +363,32 @@ fn run_export(cli: &Cli, fmt: &str) -> Result<()> {
     let kind = store::detect(&file, cli.sqlite, cli.rkyv)?;
     let (store, _) = store::Store::open(&file, kind)?;
     print!("{}", export_store(&store, &fmt, cli.table.as_deref())?);
+    Ok(())
+}
+
+/// `--recover`: salvage what the file still holds, as a replayable script. Reads
+/// pages directly, so a corrupt or truncated database is still readable.
+fn run_recover(cli: &Cli) -> Result<()> {
+    let file = cli
+        .file
+        .clone()
+        .ok_or_else(|| anyhow!("--recover requires a file argument"))?;
+    let found = recover::recover(&file)?;
+    let (tables, rows, orphans) = (found.tables.len(), found.rows.len(), found.orphans());
+    print!("{}", recover::to_sql(&found));
+    // The summary goes to stderr so the script on stdout stays replayable.
+    eprintln!(
+        "recovered {} row{} across {} table{}{}",
+        rows,
+        if rows == 1 { "" } else { "s" },
+        tables,
+        if tables == 1 { "" } else { "s" },
+        if orphans > 0 {
+            format!(", {orphans} in lost_and_found")
+        } else {
+            String::new()
+        }
+    );
     Ok(())
 }
 

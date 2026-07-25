@@ -424,6 +424,7 @@ and `.help` lists exactly what is implemented:
 | `.read FILE` | run a file's statements, each one as if typed |
 | `.backup FILE` | `VACUUM INTO` a copy |
 | `.expert` | index advice for the statement just run (see below) |
+| `.recover [FILE]` | salvage rows page by page into a script (see below) |
 | `.vacuum` / `.analyze` / `.reindex` | the maintenance statements |
 | `.quit` | leave zdbview |
 
@@ -713,6 +714,45 @@ under `PRAGMA writable_schema=ON` and emits the shadow tables itself with
 answers `MATCH` queries. Verified line-for-line against `sqlite3 .dump` on a
 database with an FTS5 table: identical content, differing only in the order
 `sqlite_master` is walked.
+
+## Recovery
+
+`--recover` (and `.recover` in the editor) salvages what a file still holds by
+reading **pages**, never opening the database — so it works on a file SQLite
+refuses. It walks every page rather than only the ones reachable from
+`sqlite_master`, which is what brings back rows a corrupt b-tree root has
+orphaned:
+
+```sh
+zdbview broken.db --recover > recovered.sql
+# recovered 400 rows across 1 table
+sqlite3 fixed.db < recovered.sql
+```
+
+Measured against a 400-row database with its table's root page zeroed — SQLite
+answers `database disk image is malformed` and refuses the rows — `sqlite3
+.recover` emits 400 inserts and so does this, and replaying the script produces
+data identical to the original. Truncated to 20 of its 35 pages, both recover the
+same 226 rows.
+
+The parser reads the parts of the [file format](https://sqlite.org/fileformat2.html)
+that hold data: the 100-byte header (page size, reserved bytes, page count), table
+b-tree pages, cells with their payload and rowid, the overflow chain when a value
+does not fit on a page, and the record's serial types. A 20 KB text value spanning
+overflow pages comes back whole.
+
+Pages that cannot be attributed to a table — because the schema is damaged, or
+because more than one table has that column count — go to a `lost_and_found` table
+with the page number each row came from, as the shell's `.recover` does. Every
+assumption the pass made is written into the script as a comment:
+
+```sql
+-- t: root page 2 is not a readable table page, so its rows are recovered from unreachable pages instead
+-- 33 pages unreachable from any root matched t by column count alone
+```
+
+It does not recover indexes (the script replays their `CREATE INDEX` statements
+instead), read `WITHOUT ROWID` index-leaf pages, or repair the file in place.
 
 ## Backup
 

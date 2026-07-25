@@ -55,6 +55,7 @@ const DOT_HELP: &str = "\
 .read FILE              run the statements in a file
 .backup FILE            copy the database with VACUUM INTO
 .expert                 index advice for the statement just run
+.recover [FILE]         salvage rows page by page into a script
 .vacuum .analyze .reindex   maintenance
 .quit                   leave zdbview";
 
@@ -3174,6 +3175,35 @@ impl App {
                 (None, _) => vec!["usage: .backup FILE".into()],
                 _ => return,
             },
+            ".recover" => {
+                // The script is far too long to read in a transcript, so it goes
+                // to a file and the transcript gets the tally.
+                let path = match self.sqlite() {
+                    Some(s) => s.path.clone(),
+                    None => return,
+                };
+                match crate::recover::recover(&path) {
+                    Ok(found) => {
+                        let sql = crate::recover::to_sql(&found);
+                        let dest = arg(0)
+                            .map(PathBuf::from)
+                            .unwrap_or_else(|| PathBuf::from("recovered.sql"));
+                        let mut lines = vec![format!(
+                            "{} rows across {} tables, {} in lost_and_found",
+                            found.rows.len(),
+                            found.tables.len(),
+                            found.orphans()
+                        )];
+                        lines.extend(found.notes.clone());
+                        match std::fs::write(&dest, sql.as_bytes()) {
+                            Ok(()) => lines.push(format!("script written to {}", dest.display())),
+                            Err(e) => lines.push(format!("cannot write {}: {e}", dest.display())),
+                        }
+                        lines
+                    }
+                    Err(e) => vec![format!("recover failed: {e}")],
+                }
+            }
             ".expert" => {
                 // The advice is about the statement above, which is the one the
                 // transcript last ran.

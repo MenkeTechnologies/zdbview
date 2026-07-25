@@ -195,6 +195,7 @@ pub const DOT_COMMANDS: &[&str] = &[
     ".read",
     ".backup",
     ".expert",
+    ".recover",
     ".vacuum",
     ".analyze",
     ".reindex",

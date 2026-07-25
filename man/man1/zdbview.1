@@ -121,6 +121,21 @@ drop. The whole file is one transaction, so a row with the wrong field count rol
 all of it back. Quoted fields may contain the separator, newlines and doubled
 quotes; CRLF and a missing final newline are both accepted.
 .TP
+.B \-\-recover
+Salvage what the file still holds and print it as a replayable script, then exit.
+Reads pages directly and never opens the database, so it works on a file SQLite
+refuses, and it walks every page rather than only those reachable from
+.BR sqlite_master ,
+which is what recovers rows an unreadable b\-tree root has orphaned. Values that
+span overflow pages are followed to their end. Rows on pages that cannot be
+attributed to one table go to a
+.B lost_and_found
+table carrying the page each came from, and every assumption the pass made is
+written into the script as a comment. Indexes are not recovered \(em their
+.B CREATE INDEX
+statements are replayed instead \(em and the file is never modified. The row tally
+goes to standard error so the script on standard output stays replayable.
+.TP
 .BI \-\-theme " NAME"
 Use color scheme
 .I NAME
@@ -849,6 +864,12 @@ Load a CSV into an existing table:
 .PP
 .RS 4
 .B zdbview data.db \-\-import rows.csv \-\-table people
+.RE
+.PP
+Salvage a database SQLite refuses to open:
+.PP
+.RS 4
+.B zdbview broken.db \-\-recover > recovered.sql
 .RE
 .SH SEE ALSO
 .BR zdbviewall (1),

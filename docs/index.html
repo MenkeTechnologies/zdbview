@@ -301,6 +301,13 @@ zdbview cache.rkyv --export json            # decoded records; each value blob a
       </section>
 
       <section class="tutorial-section">
+        <h2>Recovery</h2>
+        <p><code>--recover</code> (and <code>.recover</code> in the editor) salvages what a file still holds by reading <strong>pages</strong> — it never opens the database, so it works on a file SQLite refuses, and it walks every page rather than only those reachable from <code>sqlite_master</code>, which is what brings back rows a corrupt b-tree root has orphaned.</p>
+        <p class="doc-note">Measured against a 400-row database with its table root zeroed — SQLite answers <code>database disk image is malformed</code> — <code>sqlite3 .recover</code> emits 400 inserts and so does this, and the replayed script holds data identical to the original. Truncated to 20 of 35 pages, both recover the same 226 rows. A 20&nbsp;KB value spanning overflow pages comes back whole.</p>
+        <p>Rows on pages that cannot be attributed to a table go to a <code>lost_and_found</code> table carrying the page each came from, and every assumption the pass made is written into the script as a comment. Indexes are not recovered — the script replays their <code>CREATE INDEX</code> statements — and the file is never modified.</p>
+      </section>
+
+      <section class="tutorial-section">
         <h2>Clipboard</h2>
         <p><code>y</code> copies through the <strong>OSC 52</strong> terminal escape, written straight to <code>/dev/tty</code>. That means no clipboard library, no X/Wayland/pbcopy dependency, and it works over SSH — the terminal emulator on your side sets the clipboard. It is best-effort: with no controlling terminal (output redirected), the copy silently does nothing.</p>
       </section>
@@ -322,6 +329,7 @@ zdbview cache.rkyv --export json            # decoded records; each value blob a
             <tr><td>&nbsp;&nbsp;&nbsp;&nbsp;--table TABLE</td><td>Restrict <code>--export</code> to one table</td></tr>
             <tr><td>&nbsp;&nbsp;&nbsp;&nbsp;--backup FILE</td><td>Copy the database with <code>VACUUM INTO</code> and exit</td></tr>
             <tr><td>&nbsp;&nbsp;&nbsp;&nbsp;--import FILE</td><td>Load a CSV (or TSV, by extension) into <code>--table</code> and exit</td></tr>
+            <tr><td>&nbsp;&nbsp;&nbsp;&nbsp;--recover</td><td>Salvage rows page by page to stdout as SQL, without opening the database</td></tr>
             <tr><td>-h, --help</td><td>Print usage</td></tr>
             <tr><td>-V, --version</td><td>Print the version</td></tr>
           </tbody>

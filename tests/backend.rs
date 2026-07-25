@@ -20,6 +20,9 @@ mod hexedit;
 #[path = "../src/mru.rs"]
 mod mru;
 #[allow(dead_code)]
+#[path = "../src/recover.rs"]
+mod recover;
+#[allow(dead_code)]
 #[path = "../src/rkyv_inspect.rs"]
 mod rkyv_inspect;
 #[allow(dead_code)]
@@ -1119,4 +1122,250 @@ fn attach_lists_databases_and_advice_follows_the_plan() {
     for p in [main, other] {
         let _ = std::fs::remove_file(p);
     }
+}
+
+// ----- .recover: reading pages when SQLite refuses the file --------------------
+
+/// A database with more rows than fit on one page, so its b-tree has an interior
+/// root above real leaves. `page_size` is small to keep the fixture small.
+fn multipage_db(name: &str, rows: usize) -> std::path::PathBuf {
+    let path = tmp(name);
+    let _ = std::fs::remove_file(&path);
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute_batch(
+        "PRAGMA page_size=512;
+         CREATE TABLE t (a TEXT, b INTEGER);
+         CREATE INDEX t_b ON t(b);",
+    )
+    .unwrap();
+    for i in 0..rows {
+        conn.execute(
+            "INSERT INTO t VALUES (?1, ?2)",
+            (format!("row {i} with padding to fill the page"), i as i64),
+        )
+        .unwrap();
+    }
+    drop(conn);
+    path
+}
+
+/// Overwrite `page` (1-based) with zeroes, which is what a bad sector looks like
+/// to SQLite: it refuses the whole file.
+fn zero_page(path: &std::path::Path, page: usize, page_size: usize) {
+    let mut bytes = std::fs::read(path).unwrap();
+    let start = (page - 1) * page_size;
+    for b in &mut bytes[start..start + page_size] {
+        *b = 0;
+    }
+    std::fs::write(path, bytes).unwrap();
+}
+
+/// The case `.recover` exists for: the table's b-tree root is destroyed, so every
+/// leaf under it is unreachable and SQLite will not read the table at all. Reading
+/// pages directly still finds every row.
+#[test]
+fn recover_reads_rows_a_corrupt_root_has_orphaned() {
+    let path = multipage_db("recover_root.db", 400);
+    // Sanity: intact, SQLite reads all 400.
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        let n: i64 = conn
+            .query_row("SELECT count(*) FROM t", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 400);
+        let root: i64 = conn
+            .query_row(
+                "SELECT rootpage FROM sqlite_master WHERE name = 't'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(root, 2, "the fixture's root page");
+    }
+    zero_page(&path, 2, 512);
+
+    // SQLite now refuses the table. (`count(*)` alone can still be answered from
+    // the index, so the query has to read the table's own pages.)
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        assert!(
+            conn.query_row("SELECT sum(length(a)) FROM t", [], |r| r.get::<_, i64>(0))
+                .is_err(),
+            "a zeroed root must make SQLite refuse the table's rows"
+        );
+    }
+
+    let found = recover::recover(&path).unwrap();
+    assert_eq!(
+        found.rows.len(),
+        400,
+        "every row comes back: {:?}",
+        found.notes
+    );
+    assert_eq!(found.orphans(), 0, "all attributed to t: {:?}", found.notes);
+    assert!(
+        found.notes.iter().any(|n| n.contains("unreachable")),
+        "the pass says how it attributed them: {:?}",
+        found.notes
+    );
+
+    // The values are the original ones, not just the right count.
+    let first = found.rows_for("t").find(|r| r.rowid == 1).expect("rowid 1");
+    assert_eq!(
+        first.values[0],
+        recover::Value::Text("row 0 with padding to fill the page".into())
+    );
+    assert_eq!(first.values[1], recover::Value::Int(0));
+
+    // And the script it writes replays into a working database.
+    let sql = recover::to_sql(&found);
+    let replay = tmp("recover_root_replay.db");
+    let _ = std::fs::remove_file(&replay);
+    let conn = rusqlite::Connection::open(&replay).unwrap();
+    conn.execute_batch(&sql).expect("the recovery must replay");
+    let (n, min, max): (i64, i64, i64) = conn
+        .query_row("SELECT count(*), min(b), max(b) FROM t", [], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        })
+        .unwrap();
+    assert_eq!((n, min, max), (400, 0, 399));
+    // The index came back too, because its CREATE statement is in the script.
+    let idx: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM sqlite_master WHERE type='index' AND name='t_b'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(idx, 1);
+    for p in [path, replay] {
+        let _ = std::fs::remove_file(p);
+    }
+}
+
+/// A truncated file: the header still claims the original page count, so the pass
+/// has to trust the bytes that are actually there.
+#[test]
+fn recover_handles_a_truncated_file() {
+    let path = multipage_db("recover_trunc.db", 400);
+    let full = recover::recover(&path).unwrap().rows.len();
+    assert_eq!(full, 400);
+
+    // Keep the first twenty pages and a fragment of the twenty-first.
+    let bytes = std::fs::read(&path).unwrap();
+    std::fs::write(&path, &bytes[..512 * 20 + 100]).unwrap();
+
+    let found = recover::recover(&path).unwrap();
+    assert!(
+        found.rows.len() > 100 && found.rows.len() < 400,
+        "what survived, not everything and not nothing: {}",
+        found.rows.len()
+    );
+    assert!(
+        found.notes.iter().any(|n| n.contains("partial")),
+        "the partial last page is reported: {:?}",
+        found.notes
+    );
+    // Rowids are contiguous from 1, which is what shows nothing was misdecoded.
+    let mut ids: Vec<i64> = found.rows_for("t").map(|r| r.rowid).collect();
+    ids.sort_unstable();
+    assert_eq!(ids.first(), Some(&1));
+    assert_eq!(
+        ids.last().copied().unwrap() as usize,
+        ids.len(),
+        "no gaps in what came back"
+    );
+    let _ = std::fs::remove_file(&path);
+}
+
+/// Values bigger than a page live on overflow pages, and a recovery that stops at
+/// the page boundary would truncate them.
+#[test]
+fn recover_follows_overflow_pages() {
+    let path = tmp("recover_overflow.db");
+    let _ = std::fs::remove_file(&path);
+    let big = "x".repeat(20_000);
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute_batch("PRAGMA page_size=512; CREATE TABLE t (a TEXT, b BLOB, c REAL)")
+        .unwrap();
+    conn.execute(
+        "INSERT INTO t VALUES (?1, ?2, ?3)",
+        rusqlite::params![big, vec![0xabu8; 5000], 1.5f64],
+    )
+    .unwrap();
+    drop(conn);
+
+    let found = recover::recover(&path).unwrap();
+    assert_eq!(found.rows.len(), 1, "{:?}", found.notes);
+    let row = &found.rows[0];
+    assert_eq!(
+        row.values[0],
+        recover::Value::Text(big),
+        "a 20 KB text value spans overflow pages and must come back whole"
+    );
+    assert_eq!(row.values[1], recover::Value::Blob(vec![0xab; 5000]));
+    assert_eq!(row.values[2], recover::Value::Real(1.5));
+    let _ = std::fs::remove_file(&path);
+}
+
+/// A file with no readable schema at all: the rows still come back, as
+/// lost_and_found, because that is better than nothing.
+#[test]
+fn recover_puts_unattributable_rows_in_lost_and_found() {
+    let path = multipage_db("recover_lost.db", 60);
+    // Wipe the schema b-tree but keep the 100-byte file header, which is what says
+    // how big a page is — the shape of a damaged page 1 rather than a missing file.
+    {
+        let mut bytes = std::fs::read(&path).unwrap();
+        for b in &mut bytes[100..512] {
+            *b = 0;
+        }
+        std::fs::write(&path, bytes).unwrap();
+    }
+    let found = recover::recover(&path).unwrap();
+    assert!(found.tables.is_empty(), "no schema survived");
+    assert!(found.orphans() > 0, "but rows did: {:?}", found.notes);
+    assert!(
+        found.notes.iter().any(|n| n.contains("lost_and_found")),
+        "{:?}",
+        found.notes
+    );
+
+    let sql = recover::to_sql(&found);
+    assert!(sql.contains("CREATE TABLE lost_and_found("), "{sql:.200}");
+    let replay = tmp("recover_lost_replay.db");
+    let _ = std::fs::remove_file(&replay);
+    let conn = rusqlite::Connection::open(&replay).unwrap();
+    conn.execute_batch(&sql)
+        .expect("lost_and_found must replay");
+    let n: i64 = conn
+        .query_row("SELECT count(*) FROM lost_and_found", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(n as usize, found.orphans());
+    // The page each row came from is recorded, which is what makes it auditable.
+    let pages: i64 = conn
+        .query_row("SELECT count(DISTINCT pgno) FROM lost_and_found", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert!(pages >= 1);
+    for p in [path, replay] {
+        let _ = std::fs::remove_file(p);
+    }
+}
+
+#[test]
+fn recover_refuses_what_is_not_a_database() {
+    let path = tmp("recover_notdb.bin");
+    // Long enough to have a header, so it is the magic that rejects it.
+    std::fs::write(&path, "not a database, just text\n".repeat(10)).unwrap();
+    let err = recover::recover(&path).unwrap_err().to_string();
+    assert!(err.contains("not a SQLite database"), "{err}");
+
+    std::fs::write(&path, b"short").unwrap();
+    assert!(recover::recover(&path)
+        .unwrap_err()
+        .to_string()
+        .contains("too short"));
+    let _ = std::fs::remove_file(&path);
 }
