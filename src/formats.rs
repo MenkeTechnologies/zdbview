@@ -1239,15 +1239,27 @@ fn decode_canonical(s: &ArchivedCanonicalShard) -> Decoded {
         format: "zshrs canonical shard (ZSHS)".into(),
         kind: FormatKind::Canonical,
         header: vec![
-            ("magic".into(), format!("{:#010x}", u32::from(s.header.magic))),
+            (
+                "magic".into(),
+                format!("{:#010x}", u32::from(s.header.magic)),
+            ),
             (
                 "format_version".into(),
                 u32::from(s.header.format_version).to_string(),
             ),
-            ("generation".into(), u64::from(s.header.generation).to_string()),
-            ("built_at_ns".into(), u64::from(s.header.built_at_ns).to_string()),
+            (
+                "generation".into(),
+                u64::from(s.header.generation).to_string(),
+            ),
+            (
+                "built_at_ns".into(),
+                u64::from(s.header.built_at_ns).to_string(),
+            ),
             ("slug".into(), s.header.slug.as_str().to_string()),
-            ("source_root".into(), s.header.source_root.as_str().to_string()),
+            (
+                "source_root".into(),
+                s.header.source_root.as_str().to_string(),
+            ),
             (
                 "entry_count".into(),
                 u32::from(s.header.entry_count).to_string(),
@@ -1278,7 +1290,9 @@ fn canonical_edit(bytes: &[u8], addr: &str, op: CanonicalOp) -> Result<Vec<u8>, 
     // `extras/<sub>/<key>` has two separators, so it is matched before the
     // one-separator map form.
     if let Some(rest) = addr.strip_prefix("extras/") {
-        let (sub, key) = rest.split_once('/').ok_or("extras address needs <sub>/<key>")?;
+        let (sub, key) = rest
+            .split_once('/')
+            .ok_or("extras address needs <sub>/<key>")?;
         let (sub, key) = (sub.to_string(), key.to_string());
         return edit_shard::<CanonicalShard, _>(bytes, move |s| match op {
             CanonicalOp::Set(v) => {
@@ -1296,7 +1310,10 @@ fn canonical_edit(bytes: &[u8], addr: &str, op: CanonicalOp) -> Result<Vec<u8>, 
                 // The new name may be typed bare or as a full address; anything
                 // naming a different subsystem is refused rather than moved.
                 let prefix = format!("extras/{sub}/");
-                let new = new.strip_prefix(prefix.as_str()).unwrap_or(new.as_str()).to_string();
+                let new = new
+                    .strip_prefix(prefix.as_str())
+                    .unwrap_or(new.as_str())
+                    .to_string();
                 if new.contains('/') {
                     return;
                 }
@@ -1340,7 +1357,10 @@ fn canonical_edit(bytes: &[u8], addr: &str, op: CanonicalOp) -> Result<Vec<u8>, 
                     // refused, since moving an entry across sections would change
                     // what the shell does with it.
                     let prefix = format!("{section}/");
-                    let new = new.strip_prefix(prefix.as_str()).unwrap_or(new.as_str()).to_string();
+                    let new = new
+                        .strip_prefix(prefix.as_str())
+                        .unwrap_or(new.as_str())
+                        .to_string();
                     if new.contains('/') {
                         return;
                     }
@@ -1464,7 +1484,9 @@ mod canonical_tests {
     }
 
     fn bytes() -> Vec<u8> {
-        rkyv::to_bytes::<_, 4096>(&shard()).expect("serialize").into_vec()
+        rkyv::to_bytes::<_, 4096>(&shard())
+            .expect("serialize")
+            .into_vec()
     }
 
     #[test]
@@ -1474,9 +1496,18 @@ mod canonical_tests {
         assert!(matches!(d.kind, FormatKind::Canonical));
 
         let keys: Vec<&str> = d.records.iter().map(|r| r.key.as_str()).collect();
-        assert!(keys.contains(&"aliases/ll"), "map entries are section/key: {keys:?}");
-        assert!(keys.contains(&"path[0]"), "list entries are section[index]: {keys:?}");
-        assert!(keys.contains(&"zstyle[0]"), "pair lists are indexed too: {keys:?}");
+        assert!(
+            keys.contains(&"aliases/ll"),
+            "map entries are section/key: {keys:?}"
+        );
+        assert!(
+            keys.contains(&"path[0]"),
+            "list entries are section[index]: {keys:?}"
+        );
+        assert!(
+            keys.contains(&"zstyle[0]"),
+            "pair lists are indexed too: {keys:?}"
+        );
         assert!(
             keys.contains(&"extras/autoload_completion/_git"),
             "extras nest one level deeper: {keys:?}"
@@ -1484,19 +1515,27 @@ mod canonical_tests {
 
         let alias = d.records.iter().find(|r| r.key == "aliases/ll").unwrap();
         assert_eq!(alias.value, b"ls -la");
-        assert!(d.header.iter().any(|(k, v)| k == "slug" && v == "zinit-plugin-example"));
+        assert!(d
+            .header
+            .iter()
+            .any(|(k, v)| k == "slug" && v == "zinit-plugin-example"));
     }
 
     #[test]
     fn a_map_entry_round_trips_through_edit_and_delete() {
-        let edited = set_value(&bytes(), FormatKind::Canonical, "aliases/ll", b"ls -A".to_vec())
-            .expect("set");
+        let edited = set_value(
+            &bytes(),
+            FormatKind::Canonical,
+            "aliases/ll",
+            b"ls -A".to_vec(),
+        )
+        .expect("set");
         let d = try_decode(&edited).expect("still valid");
         let alias = d.records.iter().find(|r| r.key == "aliases/ll").unwrap();
         assert_eq!(alias.value, b"ls -A", "the shell reads the new value");
 
-        let renamed =
-            rename_record(&edited, FormatKind::Canonical, "aliases/ll", "aliases/l").expect("rename");
+        let renamed = rename_record(&edited, FormatKind::Canonical, "aliases/ll", "aliases/l")
+            .expect("rename");
         let d = try_decode(&renamed).expect("valid");
         assert!(d.records.iter().any(|r| r.key == "aliases/l"));
         assert!(!d.records.iter().any(|r| r.key == "aliases/ll"));
@@ -1508,15 +1547,23 @@ mod canonical_tests {
 
     #[test]
     fn a_list_slot_is_addressed_by_index() {
-        let edited = set_value(&bytes(), FormatKind::Canonical, "path[0]", b"/opt/bin".to_vec())
-            .expect("set");
+        let edited = set_value(
+            &bytes(),
+            FormatKind::Canonical,
+            "path[0]",
+            b"/opt/bin".to_vec(),
+        )
+        .expect("set");
         let d = try_decode(&edited).expect("valid");
         let row = d.records.iter().find(|r| r.key == "path[0]").unwrap();
         assert_eq!(row.value, b"/opt/bin");
 
         let deleted = delete_record(&edited, FormatKind::Canonical, "path[0]").expect("delete");
         let d = try_decode(&deleted).expect("valid");
-        assert!(!d.records.iter().any(|r| r.key.starts_with("path[")), "the row is gone");
+        assert!(
+            !d.records.iter().any(|r| r.key.starts_with("path[")),
+            "the row is gone"
+        );
     }
 
     #[test]
@@ -1550,15 +1597,27 @@ fn decode_system(s: &ArchivedSystemShard) -> Decoded {
         format: "zshrs system shard (ZSHS)".into(),
         kind: FormatKind::System,
         header: vec![
-            ("magic".into(), format!("{:#010x}", u32::from(s.header.magic))),
+            (
+                "magic".into(),
+                format!("{:#010x}", u32::from(s.header.magic)),
+            ),
             (
                 "format_version".into(),
                 u32::from(s.header.format_version).to_string(),
             ),
-            ("generation".into(), u64::from(s.header.generation).to_string()),
-            ("built_at_ns".into(), u64::from(s.header.built_at_ns).to_string()),
+            (
+                "generation".into(),
+                u64::from(s.header.generation).to_string(),
+            ),
+            (
+                "built_at_ns".into(),
+                u64::from(s.header.built_at_ns).to_string(),
+            ),
             ("slug".into(), s.header.slug.as_str().to_string()),
-            ("source_root".into(), s.header.source_root.as_str().to_string()),
+            (
+                "source_root".into(),
+                s.header.source_root.as_str().to_string(),
+            ),
             (
                 "entry_count".into(),
                 u32::from(s.header.entry_count).to_string(),
@@ -1590,7 +1649,9 @@ mod system_shard_tests {
             },
             entries,
         };
-        rkyv::to_bytes::<_, 4096>(&shard).expect("serialize").into_vec()
+        rkyv::to_bytes::<_, 4096>(&shard)
+            .expect("serialize")
+            .into_vec()
     }
 
     /// Both ZSHS layouts share a magic, so the arm must try the canonical shard
@@ -1609,12 +1670,25 @@ mod system_shard_tests {
     #[test]
     fn system_values_are_binary_and_round_trip() {
         // A blob, not text: the edit path must take the bytes verbatim.
-        let edited = set_value(&system_bytes(), FormatKind::System, "cmd:grep", vec![1, 2, 3])
-            .expect("set");
+        let edited = set_value(
+            &system_bytes(),
+            FormatKind::System,
+            "cmd:grep",
+            vec![1, 2, 3],
+        )
+        .expect("set");
         let d = try_decode(&edited).expect("valid");
-        assert_eq!(d.records.iter().find(|r| r.key == "cmd:grep").unwrap().value, vec![1, 2, 3]);
+        assert_eq!(
+            d.records
+                .iter()
+                .find(|r| r.key == "cmd:grep")
+                .unwrap()
+                .value,
+            vec![1, 2, 3]
+        );
 
-        let renamed = rename_record(&edited, FormatKind::System, "cmd:grep", "cmd:rg").expect("rename");
+        let renamed =
+            rename_record(&edited, FormatKind::System, "cmd:grep", "cmd:rg").expect("rename");
         let d = try_decode(&renamed).expect("valid");
         assert!(d.records.iter().any(|r| r.key == "cmd:rg"));
 
@@ -1660,10 +1734,15 @@ mod system_shard_tests {
             sourced_files: Vec::new(),
             extras: HashMap::new(),
         };
-        let bytes = rkyv::to_bytes::<_, 4096>(&shard).expect("serialize").into_vec();
+        let bytes = rkyv::to_bytes::<_, 4096>(&shard)
+            .expect("serialize")
+            .into_vec();
 
         let d = try_decode(&bytes).expect("an unstamped shard still decodes");
-        assert!(d.header.iter().any(|(k, v)| k == "magic" && v == "0x00000000"));
+        assert!(d
+            .header
+            .iter()
+            .any(|(k, v)| k == "magic" && v == "0x00000000"));
         assert!(d.records.iter().any(|r| r.key == "aliases/g"));
     }
 }
