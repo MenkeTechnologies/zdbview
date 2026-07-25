@@ -91,12 +91,12 @@
       <h2 class="tutorial-title"><span class="step-hash">&gt;_</span>EXECUTIVE SUMMARY</h2>
       <p class="tutorial-subtitle">zdbview v0.4.0 is a single-crate, single-binary Rust TUI (~7,800 lines across 14 source files plus one integration-test file) that opens both halves of the cache stack: <strong>SQLite</strong> databases with full generic CRUD, and <strong>rkyv</strong> archives through a format registry that decodes recognized archives to key/value records — now writable in place as well as readable — and falls back to a structural view for everything else. The split is not a limitation of effort but of the formats: SQLite is self-describing, rkyv is not, so key/value decoding requires carrying the producer's archive type. Backend selection comes from the file's header bytes, never its name, because rkyv shards are routinely written under a <code>.db</code> name.</p>
       <div class="stat-grid">
-        <div class="stat-card"><div class="stat-val accent">8</div><div class="stat-label">Rust source files</div></div>
-        <div class="stat-card"><div class="stat-val">~3,650</div><div class="stat-label">Lines of Rust</div></div>
+        <div class="stat-card"><div class="stat-val accent">14</div><div class="stat-label">Rust source files</div></div>
+        <div class="stat-card"><div class="stat-val">~7,470</div><div class="stat-label">Lines of Rust</div></div>
         <div class="stat-card"><div class="stat-val">2</div><div class="stat-label">Store backends</div></div>
         <div class="stat-card"><div class="stat-val">8</div><div class="stat-label">Recognized rkyv formats</div></div>
-        <div class="stat-card"><div class="stat-val">6</div><div class="stat-label">Direct dependencies</div></div>
-        <div class="stat-card"><div class="stat-val green">18</div><div class="stat-label">Tests</div></div>
+        <div class="stat-card"><div class="stat-val">8</div><div class="stat-label">Direct dependencies</div></div>
+        <div class="stat-card"><div class="stat-val green">74</div><div class="stat-label">Tests</div></div>
       </div>
 
       <hr class="section-rule">
