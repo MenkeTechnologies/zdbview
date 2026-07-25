@@ -40,7 +40,7 @@ pub struct Decoded {
     /// knows it.
     pub owner: Option<String>,
     pub kind: PageKind,
-    pub rows: Vec<(i64, Vec<Value>)>,
+    pub rows: Vec<(Option<i64>, Vec<Value>)>,
     /// A value continued onto an overflow page, which is a different frame.
     pub overflowed: bool,
 }
@@ -57,6 +57,12 @@ pub struct FrameView {
     owners: HashMap<u32, String>,
     /// Column names per table, so a decoded row can be labelled.
     columns: HashMap<String, Vec<String>>,
+    /// Active filter over what a frame is: an owner name, or `commit`. A log can
+    /// hold tens of thousands of frames, and the question is usually about one
+    /// table or one transaction.
+    pub filter: String,
+    /// True while the `/` prompt is open.
+    pub typing: bool,
     pub note: String,
 }
 
@@ -78,6 +84,8 @@ impl FrameView {
             current: None,
             owners,
             columns,
+            filter: String::new(),
+            typing: false,
             note: String::new(),
         };
         view.decode();
@@ -106,6 +114,32 @@ impl FrameView {
         });
     }
 
+    /// Indices of the frames the filter leaves listed, newest first. A frame matches
+    /// on its owner's name, on `commit`, or on its page number.
+    pub fn visible(&self) -> Vec<usize> {
+        if self.filter.is_empty() {
+            return (0..self.frames.len()).collect();
+        }
+        let needle = self.filter.to_lowercase();
+        self.frames
+            .iter()
+            .enumerate()
+            .filter(|(_, f)| {
+                let owner = self
+                    .owners
+                    .get(&f.page)
+                    .cloned()
+                    .unwrap_or_default()
+                    .to_lowercase();
+                owner.contains(&needle)
+                    || f.page.to_string().contains(&needle)
+                    || (f.commit && "commit".contains(&needle))
+                    || (!f.live && "stale".contains(&needle))
+            })
+            .map(|(i, _)| i)
+            .collect()
+    }
+
     /// Column names for the selected frame's table, when it is known.
     fn current_columns(&self) -> Option<&Vec<String>> {
         let owner = self.current.as_ref()?.owner.as_ref()?;
@@ -113,17 +147,55 @@ impl FrameView {
     }
 
     pub fn on_key(&mut self, code: KeyCode, page: usize) -> Action {
+        // While `/` is open the keys belong to the filter, and the list narrows as
+        // it is typed — the same prompt the rest of the app uses.
+        if self.typing {
+            let mut sel = 0usize;
+            let visible = self.visible();
+            let last = visible.len().saturating_sub(1);
+            match crate::app::filter_prompt_key(code, &mut self.filter, &mut sel, last, page) {
+                crate::app::Prompt::Open => {}
+                crate::app::Prompt::Accept => self.typing = false,
+                crate::app::Prompt::Cancel => {
+                    self.typing = false;
+                    self.filter.clear();
+                }
+            }
+            // Keep the cursor on something that is still listed.
+            let visible = self.visible();
+            if !visible.contains(&self.sel) {
+                self.sel = visible.first().copied().unwrap_or(0);
+            }
+            self.decode();
+            return Action::None;
+        }
+        let visible = self.visible();
         let last = self.frames.len().saturating_sub(1);
+        // Stepping moves through the listed frames, not through the log's own
+        // numbering, so a filter narrows what j/k walk.
+        let pos = visible.iter().position(|&i| i == self.sel).unwrap_or(0);
+        let at = |p: usize| visible.get(p.min(visible.len().saturating_sub(1))).copied();
         match code {
+            KeyCode::Esc if !self.filter.is_empty() => {
+                self.filter.clear();
+                return Action::None;
+            }
             KeyCode::Esc | KeyCode::Char('F') => return Action::Back,
+            KeyCode::Char('/') => {
+                self.typing = true;
+                self.filter.clear();
+                return Action::None;
+            }
             KeyCode::Char('q') => return Action::Quit,
             // Down is back in time: the list is newest first.
-            KeyCode::Down | KeyCode::Char('j') => self.sel = (self.sel + 1).min(last),
-            KeyCode::Up | KeyCode::Char('k') => self.sel = self.sel.saturating_sub(1),
-            KeyCode::PageDown => self.sel = (self.sel + page).min(last),
-            KeyCode::PageUp => self.sel = self.sel.saturating_sub(page),
-            KeyCode::Char('g') | KeyCode::Home => self.sel = 0,
-            KeyCode::Char('G') | KeyCode::End => self.sel = last,
+            KeyCode::Down | KeyCode::Char('j') => self.sel = at(pos + 1).unwrap_or(self.sel),
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.sel = at(pos.saturating_sub(1)).unwrap_or(self.sel)
+            }
+            KeyCode::PageDown => self.sel = at(pos + page).unwrap_or(self.sel),
+            KeyCode::PageUp => self.sel = at(pos.saturating_sub(page)).unwrap_or(self.sel),
+            KeyCode::Char('g') | KeyCode::Home => self.sel = at(0).unwrap_or(0),
+            KeyCode::Char('G') | KeyCode::End => self.sel = visible.last().copied().unwrap_or(last),
             // `[` and `]` step to the previous / next commit, which is a whole
             // transaction rather than one page.
             KeyCode::Char(']') => {
@@ -168,14 +240,16 @@ impl FrameView {
             ..area
         };
 
-        let commits = self.frames.iter().filter(|fr| fr.commit).count();
+        let visible = self.visible();
+        let commits = visible.iter().filter(|&&i| self.frames[i].commit).count();
         let header = Row::new(vec![
             Cell::from("frame"),
             Cell::from("page"),
             Cell::from("what"),
         ])
         .style(Style::default().fg(t.label).add_modifier(Modifier::BOLD));
-        let rows = self.frames.iter().enumerate().map(|(i, fr)| {
+        let rows = visible.iter().map(|&i| {
+            let fr = &self.frames[i];
             let style = if i == self.sel {
                 Style::default().add_modifier(Modifier::REVERSED)
             } else if !fr.live {
@@ -214,10 +288,18 @@ impl FrameView {
                 Block::default()
                     .borders(Borders::ALL)
                     .border_style(Style::default().fg(t.accent))
-                    .title(format!(
-                        " {} frames · {commits} commits ",
-                        self.frames.len()
-                    )),
+                    .title(if self.typing {
+                        format!(" /{}", self.filter)
+                    } else if self.filter.is_empty() {
+                        format!(" {} frames · {commits} commits ", self.frames.len())
+                    } else {
+                        format!(
+                            " {}/{} frames · {commits} commits · /{} ",
+                            visible.len(),
+                            self.frames.len(),
+                            self.filter
+                        )
+                    }),
             ),
             left,
         );
@@ -266,8 +348,12 @@ impl FrameView {
                 }
                 let columns = self.current_columns().cloned().unwrap_or_default();
                 for (rowid, values) in &d.rows {
+                    // A row off an index leaf has no rowid: its key is the handle.
                     lines.push(Line::from(Span::styled(
-                        format!("rowid {rowid}"),
+                        match rowid {
+                            Some(id) => format!("rowid {id}"),
+                            None => "keyed row".to_string(),
+                        },
                         Style::default().fg(t.accent),
                     )));
                     for (i, v) in values.iter().enumerate() {
@@ -291,7 +377,9 @@ impl FrameView {
                 Block::default()
                     .borders(Borders::ALL)
                     .border_style(Style::default().fg(t.alt))
-                    .title(" what this frame wrote — j/k step · [ ] commits · Esc back "),
+                    .title(
+                        " what this frame wrote — j/k step · [ ] commits · / filter · Esc back ",
+                    ),
             ),
             right,
         );
@@ -434,6 +522,79 @@ mod tests {
 
         assert_eq!(view.on_key(KeyCode::Esc, 10), Action::Back);
         assert_eq!(view.on_key(KeyCode::Char('q'), 10), Action::Quit);
+        drop(conn);
+        clean(&path);
+    }
+
+    /// `/` narrows the log to one table's frames or to commits, and stepping then
+    /// walks only what is listed.
+    #[test]
+    fn the_filter_narrows_the_log() {
+        let (path, conn) = wal_db("filter.db");
+        conn.execute_batch(
+            "CREATE TABLE alpha (v TEXT);
+             CREATE TABLE beta (v TEXT);",
+        )
+        .unwrap();
+        for i in 0..40 {
+            conn.execute(
+                "INSERT INTO alpha VALUES (?1)",
+                [format!("a{i} padded out")],
+            )
+            .unwrap();
+        }
+        for i in 0..40 {
+            conn.execute("INSERT INTO beta VALUES (?1)", [format!("b{i} padded out")])
+                .unwrap();
+        }
+
+        let mut view = FrameView::open(&path, HashMap::new()).expect("frames");
+        let all = view.frames.len();
+        assert!(view.visible().len() == all, "no filter lists everything");
+
+        // Only alpha's frames.
+        view.filter = "alpha".into();
+        let listed = view.visible();
+        assert!(
+            !listed.is_empty() && listed.len() < all,
+            "{} of {all}",
+            listed.len()
+        );
+        assert!(
+            listed.iter().all(
+                |&i| view.owners.get(&view.frames[i].page).map(String::as_str) == Some("alpha")
+            ),
+            "every listed frame belongs to alpha"
+        );
+
+        // Stepping stays inside the filter.
+        view.sel = listed[0];
+        view.on_key(KeyCode::Char('j'), 5);
+        assert_eq!(view.sel, listed[1], "j moves to the next listed frame");
+        view.on_key(KeyCode::Char('G'), 5);
+        assert_eq!(
+            view.sel,
+            *listed.last().unwrap(),
+            "G is the oldest listed one"
+        );
+
+        // `commit` is a filter too, and Esc clears an applied one without leaving.
+        view.filter = "commit".into();
+        assert!(
+            view.visible().iter().all(|&i| view.frames[i].commit),
+            "only commit frames"
+        );
+        assert_eq!(view.on_key(KeyCode::Esc, 5), Action::None);
+        assert!(view.filter.is_empty(), "the first Esc clears the filter");
+        assert_eq!(
+            view.on_key(KeyCode::Esc, 5),
+            Action::Back,
+            "the second leaves"
+        );
+
+        // A filter matching nothing lists nothing rather than everything.
+        view.filter = "no such table".into();
+        assert!(view.visible().is_empty());
         drop(conn);
         clean(&path);
     }

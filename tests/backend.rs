@@ -77,7 +77,9 @@ fn sqlite_full_crud_roundtrip() {
     let rowid_a = view.rowids[0].expect("rowid present");
 
     // UPDATE
-    store.update_cell("items", rowid_a, "qty", "42").unwrap();
+    store
+        .update_cell_keyed("items", &sqlite::RowKey::Rowid(rowid_a), "qty", "42")
+        .unwrap();
     let view = store.rows("items", 100, 0, None, "").unwrap();
     assert_eq!(view.rows[0], vec!["a".to_string(), "42".to_string()]);
 
@@ -86,7 +88,9 @@ fn sqlite_full_crud_roundtrip() {
     assert_eq!(store.count("items").unwrap(), 3);
 
     // DELETE
-    store.delete_row("items", rowid_a).unwrap();
+    store
+        .delete_row_keyed("items", &sqlite::RowKey::Rowid(rowid_a))
+        .unwrap();
     assert_eq!(store.count("items").unwrap(), 2);
     let view = store.rows("items", 100, 0, None, "").unwrap();
     assert!(view.rows.iter().all(|r| r[0] != "a"));
@@ -779,7 +783,7 @@ fn frequency_ranks_values_by_count() {
 }
 
 /// A blob cell has no text form, so it is read and written as bytes. Editing it
-/// through `update_cell` would store the description of the bytes instead.
+/// through the text path would store the description of the bytes instead.
 #[test]
 fn blob_cells_round_trip_as_bytes() {
     let path = tmp("blob.db");
@@ -795,22 +799,40 @@ fn blob_cells_round_trip_as_bytes() {
     drop(conn);
     let store = SqliteStore::open(&path).unwrap();
 
-    assert!(store.cell_is_blob("t", 1, "raw").unwrap());
+    assert!(store
+        .cell_is_blob_keyed("t", &sqlite::RowKey::Rowid(1), "raw")
+        .unwrap());
     assert!(
-        !store.cell_is_blob("t", 1, "txt").unwrap(),
+        !store
+            .cell_is_blob_keyed("t", &sqlite::RowKey::Rowid(1), "txt")
+            .unwrap(),
         "text stays with the line editor"
     );
-    assert_eq!(store.cell_bytes("t", 1, "raw").unwrap(), [0x00, 0xff, 0x41]);
+    assert_eq!(
+        store
+            .cell_bytes_keyed("t", &sqlite::RowKey::Rowid(1), "raw")
+            .unwrap(),
+        [0x00, 0xff, 0x41]
+    );
 
     store
-        .update_cell_blob("t", 1, "raw", &[0xde, 0xad, 0xbe, 0xef])
+        .update_cell_blob_keyed(
+            "t",
+            &sqlite::RowKey::Rowid(1),
+            "raw",
+            &[0xde, 0xad, 0xbe, 0xef],
+        )
         .unwrap();
     assert_eq!(
-        store.cell_bytes("t", 1, "raw").unwrap(),
+        store
+            .cell_bytes_keyed("t", &sqlite::RowKey::Rowid(1), "raw")
+            .unwrap(),
         [0xde, 0xad, 0xbe, 0xef]
     );
     assert!(
-        store.cell_is_blob("t", 1, "raw").unwrap(),
+        store
+            .cell_is_blob_keyed("t", &sqlite::RowKey::Rowid(1), "raw")
+            .unwrap(),
         "it must still be a blob, not a string of hex digits"
     );
     let _ = std::fs::remove_file(&path);
@@ -1215,7 +1237,10 @@ fn recover_reads_rows_a_corrupt_root_has_orphaned() {
     );
 
     // The values are the original ones, not just the right count.
-    let first = found.rows_for("t").find(|r| r.rowid == 1).expect("rowid 1");
+    let first = found
+        .rows_for("t")
+        .find(|r| r.rowid == Some(1))
+        .expect("rowid 1");
     assert_eq!(
         first.values[0],
         recover::Value::Text("row 0 with padding to fill the page".into())
@@ -1272,7 +1297,7 @@ fn recover_handles_a_truncated_file() {
         found.notes
     );
     // Rowids are contiguous from 1, which is what shows nothing was misdecoded.
-    let mut ids: Vec<i64> = found.rows_for("t").map(|r| r.rowid).collect();
+    let mut ids: Vec<i64> = found.rows_for("t").filter_map(|r| r.rowid).collect();
     ids.sort_unstable();
     assert_eq!(ids.first(), Some(&1));
     assert_eq!(
@@ -1373,4 +1398,152 @@ fn recover_refuses_what_is_not_a_database() {
         .to_string()
         .contains("too short"));
     let _ = std::fs::remove_file(&path);
+}
+
+/// A `WITHOUT ROWID` table has no rowid to address a row by, so edits go through
+/// its primary key — including a composite one. Before this it was listed
+/// read-only.
+#[test]
+fn a_table_without_rowid_is_edited_by_its_primary_key() {
+    let path = tmp("norowid.db");
+    let _ = std::fs::remove_file(&path);
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE kv (ns TEXT, k TEXT, v TEXT, PRIMARY KEY (ns, k)) WITHOUT ROWID;
+         INSERT INTO kv VALUES ('a', 'one', 'first'), ('a', 'two', 'second'), ('b', 'one', 'other');",
+    )
+    .unwrap();
+    drop(conn);
+    let store = SqliteStore::open(&path).unwrap();
+
+    // The view reports the key columns in key order, and no rowids.
+    let view = store.rows("kv", 10, 0, None, "").unwrap();
+    assert_eq!(view.primary_key, ["ns", "k"]);
+    assert!(
+        view.rowids.iter().all(Option::is_none),
+        "a WITHOUT ROWID table exposes none"
+    );
+    assert_eq!(store.primary_key_columns("kv").unwrap(), ["ns", "k"]);
+
+    // Both key columns are needed: ('a','two') must not touch ('b','one').
+    let key = sqlite::RowKey::Primary(vec![
+        ("ns".to_string(), "a".to_string()),
+        ("k".to_string(), "two".to_string()),
+    ]);
+    assert_eq!(
+        store.update_cell_keyed("kv", &key, "v", "edited").unwrap(),
+        1,
+        "exactly one row matches a full key"
+    );
+    let v = |ns: &str, k: &str| -> String {
+        let view = store.rows("kv", 10, 0, None, "").unwrap();
+        let i = view
+            .rows
+            .iter()
+            .position(|r| r[0] == ns && r[1] == k)
+            .unwrap();
+        view.rows[i][2].clone()
+    };
+    assert_eq!(v("a", "two"), "edited");
+    assert_eq!(v("b", "one"), "other", "the other row is untouched");
+    assert_eq!(v("a", "one"), "first");
+
+    // Bytes go in the same way, and come back as bytes.
+    store
+        .update_cell_blob_keyed("kv", &key, "v", &[0x00, 0xff])
+        .unwrap();
+    assert_eq!(
+        store.cell_bytes_keyed("kv", &key, "v").unwrap(),
+        [0x00, 0xff]
+    );
+    assert!(store.cell_is_blob_keyed("kv", &key, "v").unwrap());
+
+    // And delete addresses one row, not the whole namespace.
+    assert_eq!(store.delete_row_keyed("kv", &key).unwrap(), 1);
+    assert_eq!(store.count("kv").unwrap(), 2);
+    assert_eq!(v("a", "one"), "first");
+
+    // A key that matches nothing reports zero rather than erroring.
+    let gone = sqlite::RowKey::Primary(vec![
+        ("ns".to_string(), "zz".to_string()),
+        ("k".to_string(), "nope".to_string()),
+    ]);
+    assert_eq!(store.update_cell_keyed("kv", &gone, "v", "x").unwrap(), 0);
+    assert_eq!(store.delete_row_keyed("kv", &gone).unwrap(), 0);
+
+    // An ordinary table still reports its rowids and no key columns.
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute_batch("CREATE TABLE plain (a TEXT); INSERT INTO plain VALUES ('x')")
+        .unwrap();
+    drop(conn);
+    let store = SqliteStore::open(&path).unwrap();
+    let view = store.rows("plain", 10, 0, None, "").unwrap();
+    assert!(
+        view.primary_key.is_empty(),
+        "the rowid is the better handle"
+    );
+    assert_eq!(view.rowids[0], Some(1));
+    let _ = std::fs::remove_file(&path);
+}
+
+/// A `WITHOUT ROWID` table keeps its rows in an index b-tree, so a recovery that
+/// only read table-leaf pages could not bring back a single one of them.
+#[test]
+fn recover_reads_a_table_without_rowid() {
+    let path = tmp("recover_norowid.db");
+    let _ = std::fs::remove_file(&path);
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute_batch(
+        "PRAGMA page_size=512;
+         CREATE TABLE kv (k TEXT PRIMARY KEY, v TEXT) WITHOUT ROWID;",
+    )
+    .unwrap();
+    for i in 0..200 {
+        conn.execute(
+            "INSERT INTO kv VALUES (?1, ?2)",
+            [format!("key-{i:04}"), format!("value {i} with padding")],
+        )
+        .unwrap();
+    }
+    drop(conn);
+
+    let found = recover::recover(&path).unwrap();
+    assert_eq!(
+        found.rows_for("kv").count(),
+        200,
+        "every keyed row comes back: {:?}",
+        found.notes
+    );
+    assert!(
+        found.rows_for("kv").all(|r| r.rowid.is_none()),
+        "and none of them invents a rowid"
+    );
+    let one = found
+        .rows_for("kv")
+        .find(|r| r.values[0] == recover::Value::Text("key-0007".into()))
+        .expect("a known key");
+    assert_eq!(
+        one.values[1],
+        recover::Value::Text("value 7 with padding".into())
+    );
+
+    // The script must not name `_rowid_` for such a table, or the replay fails.
+    let sql = recover::to_sql(&found);
+    assert!(
+        !sql.contains("_rowid_"),
+        "a keyed table has no rowid column"
+    );
+    let replay = tmp("recover_norowid_replay.db");
+    let _ = std::fs::remove_file(&replay);
+    let conn = rusqlite::Connection::open(&replay).unwrap();
+    conn.execute_batch(&sql).expect("the recovery must replay");
+    let (n, first): (i64, String) = conn
+        .query_row("SELECT count(*), min(k) FROM kv", [], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .unwrap();
+    assert_eq!((n, first.as_str()), (200, "key-0000"));
+    for p in [path, replay] {
+        let _ = std::fs::remove_file(p);
+    }
 }

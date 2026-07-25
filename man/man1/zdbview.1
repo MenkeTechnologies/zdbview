@@ -74,7 +74,10 @@ followed by its rows, wrapped in
 reading values from the database rather than from the grid so a blob keeps its
 bytes as a
 .B x\(aq...\(aq
-literal.
+literal. The same is true of
+.BR insert :
+everything that writes SQL uses the exact values, since the string the grid shows
+for a blob is a description of it rather than the bytes.
 A virtual table is registered by writing its
 .B sqlite_schema
 row under
@@ -126,7 +129,20 @@ Salvage what the file still holds and print it as a replayable script, then exit
 Reads pages directly and never opens the database, so it works on a file SQLite
 refuses, and it walks every page rather than only those reachable from
 .BR sqlite_master ,
-which is what recovers rows an unreadable b\-tree root has orphaned. Values that
+which is what recovers rows an unreadable b\-tree root has orphaned. Three page
+kinds carry rows and all three are read: a table leaf, an index leaf \(em where a
+.B WITHOUT ROWID
+table keeps its rows, the key record being the row \(em and an index interior,
+which unlike a table interior carries key payloads of its own. An index cell keeps
+much less of its payload on the page than a table cell, and the two formulas are
+not interchangeable. Rows recovered from an index leaf carry no rowid, so their
+.B INSERT
+does not name
+.BR _rowid_ .
+An ordinary index is skipped rather than read as data, since its entries duplicate
+columns of a table already being recovered; the script replays its
+.B CREATE INDEX
+instead. Values that
 span overflow pages are followed to their end. Rows on pages that cannot be
 attributed to one table go to a
 .B lost_and_found
@@ -209,6 +225,24 @@ opens it in the hex editor instead and
 writes the bytes back as a blob \(em editing one as a string would store the
 description of the bytes.
 .TP
+.B E
+Edit the selected cell as bytes whatever it holds, which is the only way to put
+binary into a cell that is not already a blob: a string starts as its own bytes, a
+number as its digits, a
+.B NULL
+as nothing, and
+.B Ctrl\-s
+writes the result back as a blob.
+.PP
+Rows are addressed by
+.B rowid
+where there is one and by the primary key otherwise, so a
+.B WITHOUT ROWID
+table is editable too, including one with a composite key \(em every key column has
+to match, so editing one row cannot touch another that shares part of its key. A
+table with neither a rowid nor a primary key stays read-only, as does a row whose
+key column holds a blob, since the key is matched as text.
+.TP
 .B a
 Insert one row with
 .BR "INSERT INTO <table> DEFAULT VALUES" .
@@ -270,7 +304,10 @@ uses.
 .B .output
 and
 .B .once
-send results to a file instead of the transcript, all of them or just the next one.
+send results to a file instead of the transcript. The file is opened fresh and then
+collected into, as the shell does it, so two statements under one
+.B .output
+both land in it rather than the second erasing the first.
 .B .expert
 is not
 .BR sqlite3_expert ,

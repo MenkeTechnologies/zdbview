@@ -181,13 +181,29 @@ pub struct RowQuery<'a> {
     pub filter: &'a str,
 }
 
+/// How a row is addressed for an in-place write.
+///
+/// An ordinary table has a `rowid`, which is stable and unique whatever the row
+/// holds. A `WITHOUT ROWID` table has none, so its primary key is the handle — and
+/// that key can be several columns.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RowKey {
+    Rowid(i64),
+    /// `(column, value as text)` pairs that together identify one row.
+    Primary(Vec<(String, String)>),
+}
+
 /// A page of rows for one table, stringified for display.
 pub struct RowsView {
     pub columns: Vec<String>,
     pub rows: Vec<Vec<String>>,
     /// `rowid` for each row, used to target edit/delete. `None` when the table
-    /// has no accessible rowid (a `WITHOUT ROWID` table).
+    /// has no accessible rowid (a `WITHOUT ROWID` table), where the primary key
+    /// below is the handle instead.
     pub rowids: Vec<Option<i64>>,
+    /// Primary-key columns, in key order, for a table with no rowid. Empty when
+    /// the table has one, since then the rowid is the better handle.
+    pub primary_key: Vec<String>,
     pub total: i64,
 }
 
@@ -348,6 +364,13 @@ impl SqliteStore {
             columns,
             rows: rows_out,
             rowids,
+            // A table with a rowid needs no key columns; one without them is
+            // addressed by its primary key, so the view carries it.
+            primary_key: if with_rowid {
+                Vec::new()
+            } else {
+                self.primary_key_columns(table)?
+            },
             total,
         })
     }
@@ -498,29 +521,6 @@ impl SqliteStore {
         Ok(n)
     }
 
-    /// Raw bytes of a single cell (blob or text) for the detail/value view.
-    pub fn cell_bytes(&self, table: &str, rowid: i64, col: &str) -> Result<Vec<u8>> {
-        let v: Vec<u8> = self.conn.query_row(
-            &format!(
-                "SELECT \"{}\" FROM \"{}\" WHERE rowid = ?1",
-                esc(col),
-                esc(table)
-            ),
-            params![rowid],
-            |r| {
-                use rusqlite::types::ValueRef;
-                Ok(match r.get_ref(0)? {
-                    ValueRef::Blob(b) => b.to_vec(),
-                    ValueRef::Text(t) => t.to_vec(),
-                    ValueRef::Integer(i) => i.to_string().into_bytes(),
-                    ValueRef::Real(f) => f.to_string().into_bytes(),
-                    ValueRef::Null => Vec::new(),
-                })
-            },
-        )?;
-        Ok(v)
-    }
-
     /// Schema objects: `(type, name, sql)` for tables, views, and indexes.
     pub fn schema(&self) -> Result<Vec<(String, String, String)>> {
         let mut stmt = self.conn.prepare(
@@ -539,24 +539,108 @@ impl SqliteStore {
         Ok(out)
     }
 
-    pub fn update_cell(&self, table: &str, rowid: i64, col: &str, val: &str) -> Result<()> {
-        self.conn.execute(
-            &format!(
-                "UPDATE \"{}\" SET \"{}\" = ?1 WHERE rowid = ?2",
-                esc(table),
-                esc(col)
-            ),
-            params![val, rowid],
-        )?;
-        Ok(())
+    /// ` WHERE …` addressing one row by `key`, with the values to bind. Text
+    /// comparison, because the caller has the row as the grid displays it — which
+    /// is also why a key column holding a blob cannot be addressed this way.
+    fn where_key(key: &RowKey) -> (String, Vec<String>) {
+        match key {
+            RowKey::Rowid(id) => ("rowid = ?1".to_string(), vec![id.to_string()]),
+            RowKey::Primary(pairs) => {
+                let clause = pairs
+                    .iter()
+                    .enumerate()
+                    .map(|(i, (c, _))| format!("CAST(\"{}\" AS TEXT) = ?{}", esc(c), i + 1))
+                    .collect::<Vec<_>>()
+                    .join(" AND ");
+                (clause, pairs.iter().map(|(_, v)| v.clone()).collect())
+            }
+        }
     }
 
-    pub fn delete_row(&self, table: &str, rowid: i64) -> Result<()> {
-        self.conn.execute(
-            &format!("DELETE FROM \"{}\" WHERE rowid = ?1", esc(table)),
-            params![rowid],
-        )?;
-        Ok(())
+    /// Update one cell of the row `key` addresses. Values bind as parameters, so a
+    /// quote or a newline in the data is not a syntax problem.
+    pub fn update_cell_keyed(
+        &self,
+        table: &str,
+        key: &RowKey,
+        col: &str,
+        val: &str,
+    ) -> Result<usize> {
+        let (clause, mut binds) = Self::where_key(key);
+        let sql = format!(
+            "UPDATE \"{}\" SET \"{}\" = ?{} WHERE {}",
+            esc(table),
+            esc(col),
+            binds.len() + 1,
+            clause
+        );
+        binds.push(val.to_string());
+        Ok(self.conn.execute(&sql, rusqlite::params_from_iter(binds))?)
+    }
+
+    /// The same, writing bytes — which `update_cell_keyed` cannot express.
+    pub fn update_cell_blob_keyed(
+        &self,
+        table: &str,
+        key: &RowKey,
+        col: &str,
+        bytes: &[u8],
+    ) -> Result<usize> {
+        let (clause, binds) = Self::where_key(key);
+        let sql = format!(
+            "UPDATE \"{}\" SET \"{}\" = ?{} WHERE {}",
+            esc(table),
+            esc(col),
+            binds.len() + 1,
+            clause
+        );
+        let mut params: Vec<&dyn rusqlite::ToSql> =
+            binds.iter().map(|b| b as &dyn rusqlite::ToSql).collect();
+        params.push(&bytes);
+        Ok(self.conn.execute(&sql, params.as_slice())?)
+    }
+
+    pub fn delete_row_keyed(&self, table: &str, key: &RowKey) -> Result<usize> {
+        let (clause, binds) = Self::where_key(key);
+        let sql = format!("DELETE FROM \"{}\" WHERE {}", esc(table), clause);
+        Ok(self.conn.execute(&sql, rusqlite::params_from_iter(binds))?)
+    }
+
+    /// One cell's bytes, addressed by `key` — the read side of a keyed edit.
+    pub fn cell_bytes_keyed(&self, table: &str, key: &RowKey, col: &str) -> Result<Vec<u8>> {
+        let (clause, binds) = Self::where_key(key);
+        let sql = format!(
+            "SELECT \"{}\" FROM \"{}\" WHERE {} LIMIT 1",
+            esc(col),
+            esc(table),
+            clause
+        );
+        Ok(self
+            .conn
+            .query_row(&sql, rusqlite::params_from_iter(binds), |r| {
+                Ok(match r.get_ref(0)? {
+                    ValueRef::Blob(b) => b.to_vec(),
+                    ValueRef::Text(t) => t.to_vec(),
+                    ValueRef::Integer(i) => i.to_string().into_bytes(),
+                    ValueRef::Real(f) => f.to_string().into_bytes(),
+                    ValueRef::Null => Vec::new(),
+                })
+            })?)
+    }
+
+    /// Whether the cell `key` addresses holds a blob.
+    pub fn cell_is_blob_keyed(&self, table: &str, key: &RowKey, col: &str) -> Result<bool> {
+        let (clause, binds) = Self::where_key(key);
+        let sql = format!(
+            "SELECT typeof(\"{}\") FROM \"{}\" WHERE {} LIMIT 1",
+            esc(col),
+            esc(table),
+            clause
+        );
+        let t: String = self
+            .conn
+            .query_row(&sql, rusqlite::params_from_iter(binds), |r| r.get(0))?;
+        Ok(t == "blob")
     }
 
     /// Insert one row using each column's default value.
@@ -591,6 +675,7 @@ impl SqliteStore {
             .collect();
         let ncols = columns.len();
         let mut rows = Vec::new();
+        let mut literals = Vec::new();
         let mut truncated = false;
         let mut q = stmt.query([])?;
         while let Some(row) = q.next()? {
@@ -598,11 +683,16 @@ impl SqliteStore {
                 truncated = true;
                 break;
             }
+            // Both forms in one pass: the grid needs the display strings and any
+            // SQL output needs the literals, and re-running the query to get the
+            // other would not even be the same rows.
             rows.push((0..ncols).map(|i| value_to_string(row, i)).collect());
+            literals.push((0..ncols).map(|i| value_to_literal(row, i)).collect());
         }
         Ok(Outcome::Rows {
             columns,
             rows,
+            literals,
             truncated,
         })
     }
@@ -843,7 +933,7 @@ impl SqliteStore {
 
     /// Every row of `table` as SQL literals — the form a dump needs, where a blob
     /// is `x'…'` rather than a description of itself.
-    fn literal_rows(&self, table: &str) -> Result<Vec<Vec<String>>> {
+    pub fn literal_rows(&self, table: &str) -> Result<Vec<Vec<String>>> {
         let mut stmt = self
             .conn
             .prepare(&format!("SELECT * FROM {}", quoted_name(table)))?;
@@ -1021,6 +1111,22 @@ impl SqliteStore {
         Ok(out)
     }
 
+    /// The primary-key columns of `table`, in key order. Empty when it has none.
+    pub fn primary_key_columns(&self, table: &str) -> Result<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare(&format!("PRAGMA table_info(\"{}\")", esc(table)))?;
+        let mut keyed: Vec<(i64, String)> = stmt
+            .query_map([], |r| Ok((r.get::<_, i64>(5)?, r.get::<_, String>(1)?)))?
+            .filter_map(|r| r.ok())
+            .filter(|(pk, _)| *pk > 0)
+            .collect();
+        // `pk` is the 1-based position within the key, so ordering by it gives the
+        // key's own column order rather than the table's.
+        keyed.sort_by_key(|(pk, _)| *pk);
+        Ok(keyed.into_iter().map(|(_, name)| name).collect())
+    }
+
     /// The single-column primary key of `table`, if it has one.
     fn primary_key(&self, table: &str) -> Result<Option<String>> {
         let mut stmt = self
@@ -1122,32 +1228,6 @@ impl SqliteStore {
         Ok(out)
     }
 
-    /// Write a cell as a blob. `update_cell` binds a string, which cannot express
-    /// arbitrary bytes; this is what the hex editor commits through.
-    pub fn update_cell_blob(&self, table: &str, rowid: i64, col: &str, bytes: &[u8]) -> Result<()> {
-        self.conn.execute(
-            &format!(
-                "UPDATE \"{}\" SET \"{}\" = ?1 WHERE rowid = ?2",
-                esc(table),
-                esc(col)
-            ),
-            params![bytes, rowid],
-        )?;
-        Ok(())
-    }
-
-    /// Whether a cell is stored as a blob, which is what decides between the text
-    /// editor and the hex editor.
-    pub fn cell_is_blob(&self, table: &str, rowid: i64, col: &str) -> Result<bool> {
-        let sql = format!(
-            "SELECT typeof(\"{}\") FROM \"{}\" WHERE rowid = ?1",
-            esc(col),
-            esc(table)
-        );
-        let t: String = self.conn.query_row(&sql, params![rowid], |r| r.get(0))?;
-        Ok(t == "blob")
-    }
-
     /// `VACUUM`, `ANALYZE` or `REINDEX` — the maintenance DB Browser calls
     /// "Compact Database" and sqlite-utils exposes as its own subcommands. Returns
     /// the change in file size, which is the only visible result of a vacuum.
@@ -1243,6 +1323,11 @@ pub enum Outcome {
     Rows {
         columns: Vec<String>,
         rows: Vec<Vec<String>>,
+        /// The same cells as SQL literals. The display strings above describe a
+        /// blob (`<blob 3 bytes>`) rather than carrying it, so anything writing SQL
+        /// — `.mode insert`, a redirect — has to use these or it emits a quoted
+        /// description of the bytes instead of the bytes.
+        literals: Vec<Vec<String>>,
         /// More rows were available than `limit` allowed.
         truncated: bool,
     },

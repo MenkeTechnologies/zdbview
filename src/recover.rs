@@ -71,7 +71,10 @@ pub struct Row {
     pub table: Option<String>,
     /// The page it was read from, which is what makes a recovery auditable.
     pub page: u32,
-    pub rowid: i64,
+    /// `None` for a row off an index-leaf page — a `WITHOUT ROWID` table keeps its
+    /// rows in an index b-tree, where the primary key is the handle and there is no
+    /// rowid to record.
+    pub rowid: Option<i64>,
     pub values: Vec<Value>,
 }
 
@@ -187,39 +190,70 @@ impl Db {
             .get(start..(start + self.page_size).min(self.bytes.len()))
     }
 
-    /// Cells of a table-leaf page, decoded. `None` when the page is not one.
-    fn leaf_cells(&self, n: u32) -> Option<Vec<(i64, Vec<Value>)>> {
+    /// Every row a page holds. Three page kinds carry them:
+    ///
+    /// * a **table leaf** (`0x0d`), whose cells are `(payload, rowid)`;
+    /// * an **index leaf** (`0x0a`), whose cells are the key record alone — which
+    ///   for a `WITHOUT ROWID` table is the whole row;
+    /// * an **index interior** (`0x02`), which unlike a table interior carries key
+    ///   payloads of its own after each child pointer, so a `WITHOUT ROWID` table
+    ///   keeps some of its rows there.
+    ///
+    /// `None` for anything else, including a table interior — that holds only child
+    /// pointers and rowids.
+    fn leaf_cells(&self, n: u32) -> Option<Vec<(Option<i64>, Vec<Value>)>> {
         let page = self.page(n)?;
         // Page 1 carries the database header before its b-tree header.
         let base = if n == 1 { 100 } else { 0 };
-        if *page.get(base)? != 0x0d {
-            return None;
-        }
+        // (payload carries a rowid, header length, bytes before the payload)
+        let (with_rowid, header, skip) = match *page.get(base)? {
+            0x0d => (true, 8, 0),
+            0x0a => (false, 8, 0),
+            0x02 => (false, 12, 4),
+            _ => return None,
+        };
         let ncells = be16(page, base + 3) as usize;
         let mut out = Vec::with_capacity(ncells);
         for i in 0..ncells {
-            let ptr = base + 8 + i * 2;
+            let ptr = base + header + i * 2;
             let off = be16(page, ptr) as usize;
             if off == 0 || off >= page.len() {
                 continue;
             }
-            if let Some(cell) = self.leaf_cell(page, off) {
+            if let Some(cell) = self.leaf_cell(page, off + skip, with_rowid) {
                 out.push(cell);
             }
         }
         Some(out)
     }
 
-    /// One table-leaf cell: payload length, rowid, then the record — following the
-    /// overflow chain when the payload does not fit on the page.
-    fn leaf_cell(&self, page: &[u8], off: usize) -> Option<(i64, Vec<Value>)> {
+    /// One leaf cell: payload length, a rowid on a table leaf, then the record —
+    /// following the overflow chain when the payload does not fit on the page.
+    fn leaf_cell(
+        &self,
+        page: &[u8],
+        off: usize,
+        with_rowid: bool,
+    ) -> Option<(Option<i64>, Vec<Value>)> {
         let (payload_len, n1) = varint(page, off)?;
-        let (rowid, n2) = varint(page, off + n1)?;
+        let (rowid, n2) = if with_rowid {
+            let (r, n) = varint(page, off + n1)?;
+            (Some(r), n)
+        } else {
+            (None, 0)
+        };
         let head = off + n1 + n2;
         let payload_len = payload_len as usize;
 
-        // How much of the payload lives on this page (fileformat2.html §1.6).
-        let max_local = self.usable - 35;
+        // How much of the payload lives on this page (fileformat2.html §1.6). A
+        // table leaf keeps far more of it locally than an index leaf does, so using
+        // the table formula on an index cell reads the wrong number of bytes and
+        // decodes a short record.
+        let max_local = if with_rowid {
+            self.usable - 35
+        } else {
+            ((self.usable - 12) * 64 / 255) - 23
+        };
         let min_local = ((self.usable - 12) * 32 / 255) - 23;
         let local = if payload_len <= max_local {
             payload_len
@@ -288,8 +322,11 @@ impl Db {
                 None => continue,
             };
             let base = if n == 1 { 100 } else { 0 };
-            if page.get(base).copied() != Some(0x05) {
-                continue; // a leaf, or not a table page at all
+            // `0x05` is a table interior, `0x02` an index interior — and a
+            // `WITHOUT ROWID` table's rows live in an index b-tree, so both have to
+            // be walked or its pages are never reached.
+            if !matches!(page.get(base).copied(), Some(0x05) | Some(0x02)) {
+                continue; // a leaf, or not a b-tree page at all
             }
             let ncells = be16(page, base + 3) as usize;
             for i in 0..ncells {
@@ -309,7 +346,9 @@ impl Db {
 /// — reading a WAL frame's payload, which is a page as of one write.
 #[derive(Debug, Default)]
 pub struct PageRows {
-    pub rows: Vec<(i64, Vec<Value>)>,
+    /// `(rowid, values)` — no rowid for a row off an index leaf, where the key is
+    /// the handle.
+    pub rows: Vec<(Option<i64>, Vec<Value>)>,
     /// A cell's payload continued onto an overflow page. Those pages are separate
     /// frames, so the value here stops where the page does and is reported rather
     /// than silently truncated.
@@ -356,26 +395,41 @@ pub fn decode_page_image(image: &[u8], page_no: u32) -> PageRows {
         kind,
         ..Default::default()
     };
-    if kind != PageKind::TableLeaf {
-        return out;
-    }
+    // Three kinds hold rows, and they differ in what precedes the payload — see
+    // `Db::leaf_cells`, which reads them from a whole file.
+    let (with_rowid, header, skip) = match kind {
+        PageKind::TableLeaf => (true, 8, 0),
+        PageKind::IndexLeaf => (false, 8, 0),
+        PageKind::IndexInterior => (false, 12, 4),
+        _ => return out,
+    };
     // Payload sizing uses the usable size; a page image carries no reserved-bytes
     // field, so the whole page is assumed usable — which is true unless the
     // database was built with a reserved trailer.
     let usable = image.len();
-    let max_local = usable.saturating_sub(35);
+    let max_local = if with_rowid {
+        usable.saturating_sub(35)
+    } else {
+        // An index cell keeps much less of its payload locally than a table cell.
+        ((usable.saturating_sub(12)) * 64 / 255).saturating_sub(23)
+    };
     let min_local = ((usable.saturating_sub(12)) * 32 / 255).saturating_sub(23);
     let ncells = be16(image, base + 3) as usize;
     for i in 0..ncells {
-        let off = be16(image, base + 8 + i * 2) as usize;
+        let off = be16(image, base + header + i * 2) as usize + skip;
         if off == 0 || off >= image.len() {
             continue;
         }
         let Some((payload_len, n1)) = varint(image, off) else {
             continue;
         };
-        let Some((rowid, n2)) = varint(image, off + n1) else {
-            continue;
+        let (rowid, n2) = if with_rowid {
+            match varint(image, off + n1) {
+                Some((r, n)) => (Some(r), n),
+                None => continue,
+            }
+        } else {
+            (None, 0)
         };
         let head = off + n1 + n2;
         let payload_len = payload_len as usize;
@@ -480,8 +534,20 @@ pub fn recover(path: &Path) -> Result<Recovered> {
         }
     }
 
-    // Which table each page belongs to, from the b-trees that are still walkable.
+    // Which table each page belongs to, from the b-trees that are still walkable,
+    // and which pages belong to an index instead — an index leaf holds key entries,
+    // not rows, so those pages must not be read as data.
     let mut owner: HashMap<u32, String> = HashMap::new();
+    let mut index_pages: std::collections::HashSet<u32> = Default::default();
+    for (kind, name, rootpage) in db.schema_objects() {
+        if kind != "index" || rootpage == 0 {
+            continue;
+        }
+        let _ = name;
+        for p in db.walk(rootpage) {
+            index_pages.insert(p);
+        }
+    }
     for t in &out.tables {
         if t.rootpage == 0 {
             out.notes.push(format!(
@@ -513,6 +579,12 @@ pub fn recover(path: &Path) -> Result<Recovered> {
         };
         if n == 1 {
             continue; // the schema itself, already read
+        }
+        // An index's own pages carry `(key…, rowid)` entries that duplicate columns
+        // of a table already being read. Recovering them as rows would invent rows
+        // that never existed; the index is rebuilt by replaying its CREATE instead.
+        if index_pages.contains(&n) && !owner.contains_key(&n) {
+            continue;
         }
         let table = match owner.get(&n) {
             Some(t) => Some(t.clone()),
@@ -586,24 +658,26 @@ pub fn to_sql(r: &Recovered) -> String {
         out.push_str(";\n");
     }
     for t in &r.tables {
-        let cols = if t.columns.is_empty() {
-            String::new()
-        } else {
-            format!(
-                "(_rowid_, {})",
-                t.columns
-                    .iter()
-                    .map(|c| format!("\"{}\"", c.replace('"', "\"\"")))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )
-        };
+        let named = t
+            .columns
+            .iter()
+            .map(|c| format!("\"{}\"", c.replace('"', "\"\"")))
+            .collect::<Vec<_>>()
+            .join(", ");
         for row in r.rows_for(&t.name) {
+            // A row off a table leaf carries its rowid, and restoring it keeps
+            // references to it valid. One off an index leaf — a `WITHOUT ROWID`
+            // table — has none, and naming `_rowid_` there is an error.
+            let (cols, lead) = match (row.rowid, t.columns.is_empty()) {
+                (_, true) => (String::new(), String::new()),
+                (Some(id), false) => (format!("(_rowid_, {named})"), format!("{id}, ")),
+                (None, false) => (format!("({named})"), String::new()),
+            };
             out.push_str(&format!(
-                "INSERT OR IGNORE INTO \"{}\"{} VALUES ({}, {});\n",
+                "INSERT OR IGNORE INTO \"{}\"{} VALUES ({}{});\n",
                 t.name.replace('"', "\"\""),
                 cols,
-                row.rowid,
+                lead,
                 row.values
                     .iter()
                     .map(Value::literal)
@@ -625,7 +699,9 @@ pub fn to_sql(r: &Recovered) -> String {
             let mut values: Vec<String> = vec![
                 row.page.to_string(),
                 row.values.len().to_string(),
-                row.rowid.to_string(),
+                row.rowid
+                    .map(|r| r.to_string())
+                    .unwrap_or_else(|| "NULL".into()),
             ];
             values.extend(row.values.iter().map(Value::literal));
             for _ in row.values.len()..widest {

@@ -801,6 +801,7 @@ fn help_sections(ctx: HelpCtx) -> Vec<HelpSection> {
                 keys: &[
                     ("j/k ↑↓", "Step one frame"),
                     ("] / [", "Older / newer commit"),
+                    ("/", "Filter by table or commit"),
                     ("g / G", "Newest / oldest"),
                     ("PgUp/PgDn", "Page"),
                     ("Esc / F", "Back to the monitor"),
@@ -981,6 +982,7 @@ fn help_sections(ctx: HelpCtx) -> Vec<HelpSection> {
             title: "SQLITE",
             keys: &[
                 ("e", "Edit cell"),
+                ("E", "Edit cell as bytes"),
                 ("a", "Add row"),
                 ("d", "Delete row"),
                 (":", "Raw SQL"),

@@ -151,6 +151,9 @@ pub struct Target {
     /// the page it rewrote, and the page map says whose page that is. Empty for a
     /// rkyv shard, and for a database in rollback-journal mode.
     pub by_table: Vec<(String, u64)>,
+    /// Bytes attributed to each table in the last sample, so the pane can show a
+    /// rate beside the total — which is what says who is busy *now*.
+    pub table_delta: Vec<(String, u64)>,
     /// Frames already accounted for, so a frame is counted once.
     seen_frames: u32,
     /// The log's salts when it was last read; a change means it restarted.
@@ -176,6 +179,7 @@ impl Target {
             history: VecDeque::new(),
             present,
             by_table: Vec::new(),
+            table_delta: Vec::new(),
             seen_frames: 0,
             salts: None,
             owners: std::collections::HashMap::new(),
@@ -219,14 +223,17 @@ impl Target {
         }
         let mut acc: std::collections::HashMap<String, u64> =
             self.by_table.iter().cloned().collect();
+        let mut delta: std::collections::HashMap<String, u64> = Default::default();
         for f in new.frames.iter().filter(|f| f.live) {
             let owner = self
                 .owners
                 .get(&f.page)
                 .cloned()
                 .unwrap_or_else(|| format!("page {} (unmapped)", f.page));
-            *acc.entry(owner).or_insert(0) += new.page_size as u64;
+            *acc.entry(owner.clone()).or_insert(0) += new.page_size as u64;
+            *delta.entry(owner).or_insert(0) += new.page_size as u64;
         }
+        self.table_delta = delta.into_iter().collect();
         self.seen_frames = new.total_frames;
         let mut out: Vec<(String, u64)> = acc.into_iter().collect();
         // Busiest first, name breaking ties so the order never wobbles.
@@ -249,6 +256,18 @@ impl Target {
     /// Was this file written within `window`?
     pub fn active(&self, window: Duration) -> bool {
         self.last_write.is_some_and(|t| t.elapsed() < window)
+    }
+
+    /// Bytes per second attributed to `table` in the last sample.
+    pub fn table_rate(&self, table: &str, interval: Duration) -> f64 {
+        if interval.is_zero() {
+            return 0.0;
+        }
+        self.table_delta
+            .iter()
+            .find(|(n, _)| n == table)
+            .map(|(_, b)| *b as f64 / interval.as_secs_f64())
+            .unwrap_or(0.0)
     }
 
     /// A copy of the page map, for a view that wants to label pages by owner.

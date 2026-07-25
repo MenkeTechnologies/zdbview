@@ -481,11 +481,13 @@ impl Monitor {
         let header = Row::new(vec![
             Cell::from("table"),
             Cell::from("written"),
+            Cell::from("rate"),
             Cell::from("share"),
             Cell::from(""),
         ])
         .style(Style::default().fg(t.label).add_modifier(Modifier::BOLD));
-        let width = (area.width as usize).saturating_sub(40).clamp(4, 40);
+        let width = (area.width as usize).saturating_sub(52).clamp(4, 40);
+        let interval = self.watcher.interval;
         let body = target.by_table.iter().map(|(name, bytes)| {
             let share = if total == 0 {
                 0.0
@@ -493,9 +495,17 @@ impl Monitor {
                 *bytes as f64 / total as f64
             };
             let bar = "#".repeat((share * width as f64).round() as usize);
+            // The rate is what the last sample attributed, so a table that has
+            // stopped reads as idle even though its total stays.
+            let rate = target.table_rate(name, interval);
             Row::new(vec![
                 Cell::from(truncate(name, 28)),
                 Cell::from(human_size(*bytes)),
+                Cell::from(if rate > 0.0 {
+                    format!("{}/s", human_size(rate as u64))
+                } else {
+                    "—".to_string()
+                }),
                 Cell::from(format!("{:>4.0}%", share * 100.0)),
                 Cell::from(bar),
             ])
@@ -507,6 +517,7 @@ impl Monitor {
                 [
                     Constraint::Length(28),
                     Constraint::Length(10),
+                    Constraint::Length(11),
                     Constraint::Length(6),
                     Constraint::Min(4),
                 ],

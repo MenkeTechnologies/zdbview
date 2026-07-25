@@ -111,20 +111,36 @@ fn json_str(s: &str) -> String {
     o
 }
 
-/// One row as an `INSERT`, quoted the way SQLite quotes text. Used by the SQL dump
-/// and by the `insert` output mode, which is the shell's `.mode insert`.
+/// One row as an `INSERT`, quoted the way SQLite quotes text. Used where only the
+/// grid's display strings are available — see [`sql_literal`] for what that costs.
 pub fn insert_statement(table: &str, columns: &[String], row: &[String]) -> String {
+    let vals: Vec<String> = row.iter().map(|v| sql_literal(v)).collect();
+    insert_statement_literals(table, columns, &vals)
+}
+
+/// One row as an `INSERT` from values that are already SQL literals — a blob as
+/// `x'…'`, a string already quoted. This is the exact form: nothing here has to
+/// guess what a cell meant.
+pub fn insert_statement_literals(table: &str, columns: &[String], values: &[String]) -> String {
     let cols: Vec<String> = columns
         .iter()
         .map(|c| format!("\"{}\"", c.replace('"', "\"\"")))
         .collect();
-    let vals: Vec<String> = row.iter().map(|v| sql_literal(v)).collect();
     format!(
         "INSERT INTO \"{}\" ({}) VALUES ({});",
         table.replace('"', "\"\""),
         cols.join(", "),
-        vals.join(", ")
+        values.join(", ")
     )
+}
+
+/// Every row as an `INSERT` from literal values, which is what both the dump and
+/// `insert` mode write.
+pub fn rows_to_inserts_exact(table: &str, columns: &[String], literals: &[Vec<String>]) -> String {
+    literals
+        .iter()
+        .map(|r| format!("{}\n", insert_statement_literals(table, columns, r)))
+        .collect()
 }
 
 /// A cell as a SQL literal: `NULL` unquoted, a number bare, anything else quoted
@@ -218,13 +234,6 @@ pub fn rows_to_lines(columns: &[String], rows: &[Vec<String>]) -> String {
     out
 }
 
-/// Every row as an `INSERT`, the shell's `.mode insert`.
-pub fn rows_to_inserts(table: &str, columns: &[String], rows: &[Vec<String>]) -> String {
-    rows.iter()
-        .map(|r| format!("{}\n", insert_statement(table, columns, r)))
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -302,12 +311,12 @@ mod tests {
     #[test]
     fn insert_mode_quotes_like_sqlite() {
         let cols = vec!["id".to_string(), "note".to_string(), "gone".to_string()];
-        let rows = vec![vec![
-            "1".to_string(),
-            "it's here".to_string(),
-            "NULL".to_string(),
-        ]];
-        let out = rows_to_inserts("my table", &cols, &rows);
+        let rows = [["1".to_string(), "it's here".to_string(), "NULL".to_string()]];
+        // The display-string path, for callers that have nothing better.
+        let out: String = rows
+            .iter()
+            .map(|r| format!("{}\n", insert_statement("my table", &cols, r)))
+            .collect();
         assert_eq!(
             out.trim_end(),
             r#"INSERT INTO "my table" ("id", "note", "gone") VALUES (1, 'it''s here', NULL);"#
@@ -317,6 +326,25 @@ mod tests {
         assert!(
             insert_statement("t", &odd, &["v".to_string()]).contains("\"we\"\"ird\""),
             "quotes double inside identifiers"
+        );
+    }
+
+    /// The exact path takes values that are already literals, so a blob survives
+    /// as bytes. The display path cannot express one at all, which is why every
+    /// caller that has real values uses this one.
+    #[test]
+    fn insert_mode_from_literals_carries_a_blob() {
+        let cols = vec!["id".to_string(), "raw".to_string()];
+        let literals = vec![vec!["1".to_string(), "x'00ff'".to_string()]];
+        assert_eq!(
+            rows_to_inserts_exact("t", &cols, &literals).trim_end(),
+            r#"INSERT INTO "t" ("id", "raw") VALUES (1, x'00ff');"#
+        );
+        // What the display path would have produced instead: a quoted description.
+        let displayed = vec!["1".to_string(), "<blob 2 bytes>".to_string()];
+        assert!(
+            insert_statement("t", &cols, &displayed).contains("'<blob 2 bytes>'"),
+            "the lossy form is why the exact one exists"
         );
     }
 

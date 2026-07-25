@@ -494,11 +494,15 @@ fn export_store(store: &Store, fmt: &str, only: Option<&str>) -> Result<String> 
                     let v = page(&tables[0])?;
                     Ok(export::rows_to_lines(&v.columns, &v.rows))
                 }
+                // Read as literals, not as the strings the grid shows: `insert`
+                // mode is meant to round-trip, and a display string describes a
+                // blob rather than carrying it.
                 "insert" => {
                     let mut out = String::new();
                     for t in &tables {
-                        let v = page(t)?;
-                        out.push_str(&export::rows_to_inserts(t, &v.columns, &v.rows));
+                        let columns = s.columns(t)?;
+                        let literals = s.literal_rows(t)?;
+                        out.push_str(&export::rows_to_inserts_exact(t, &columns, &literals));
                     }
                     Ok(out)
                 }
@@ -694,9 +698,13 @@ fn open_and_run(
 
 #[cfg(test)]
 mod tests {
-    use super::{drive, Session};
+    use super::{
+        drive, export_store, run_backup, run_export, run_import, run_recover, store, Cli, Session,
+    };
     use crate::app::{Outcome, Picked};
     use crate::theme::{Theme, ThemeName};
+    use clap::Parser;
+    use std::path::Path;
     use std::path::PathBuf;
 
     /// What the loop did, with the two terminal steps scripted.
@@ -730,6 +738,157 @@ mod tests {
 
     fn theme(name: ThemeName) -> Theme {
         Theme::from_name(name)
+    }
+
+    /// A database with one of everything the writers have to quote.
+    fn fixture(name: &str) -> PathBuf {
+        static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let seq = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path =
+            std::env::temp_dir().join(format!("zdbview_cli_{}_{seq}_{name}", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch("CREATE TABLE t (a TEXT, raw BLOB, n REAL)")
+            .unwrap();
+        conn.execute(
+            "INSERT INTO t VALUES (?1, ?2, ?3)",
+            rusqlite::params!["it's here", vec![0x00u8, 0xff], 1.5f64],
+        )
+        .unwrap();
+        drop(conn);
+        path
+    }
+
+    fn cli(args: &[&str]) -> Cli {
+        let mut all = vec!["zdbview"];
+        all.extend_from_slice(args);
+        Cli::parse_from(all)
+    }
+
+    /// Every `--export` format, over the store rather than over stdout. The blob is
+    /// the case that separates them: only the two SQL forms can carry it.
+    #[test]
+    fn export_formats_render_what_they_claim() {
+        let path = fixture("export.db");
+        let kind = store::detect(&path, false, false).unwrap();
+        let (st, _) = store::Store::open(&path, kind).unwrap();
+
+        let csv = export_store(&st, "csv", None).unwrap();
+        assert!(csv.starts_with("a,raw,n\n"), "{csv}");
+        assert!(
+            csv.contains("<blob 2 bytes>"),
+            "the grid describes a blob: {csv}"
+        );
+
+        let tsv = export_store(&st, "tsv", None).unwrap();
+        assert!(tsv.contains('\t') && !tsv.contains(",<blob"), "{tsv}");
+
+        let md = export_store(&st, "markdown", None).unwrap();
+        assert!(md.lines().nth(1).unwrap().starts_with("|--"), "{md}");
+
+        let line = export_store(&st, "line", None).unwrap();
+        assert!(line.contains("  a = it's here"), "{line}");
+
+        // `insert` reads literals, so the blob survives as bytes and the quote is
+        // doubled — this is what the display-string path used to get wrong.
+        let ins = export_store(&st, "insert", None).unwrap();
+        assert!(ins.contains("x'00ff'"), "insert must carry the blob: {ins}");
+        assert!(ins.contains("'it''s here'"), "{ins}");
+        assert!(!ins.contains("<blob"), "no descriptions in SQL: {ins}");
+
+        let dump = export_store(&st, "sql", None).unwrap();
+        assert!(
+            dump.contains("CREATE TABLE t") && dump.contains("x'00ff'"),
+            "{dump}"
+        );
+
+        let json = export_store(&st, "json", None).unwrap();
+        assert!(json.starts_with("{\"t\":[{"), "{json}");
+
+        // `--table` narrows, and an unknown name is an error rather than nothing.
+        assert!(export_store(&st, "csv", Some("t")).is_ok());
+        assert!(export_store(&st, "csv", Some("nope"))
+            .unwrap_err()
+            .to_string()
+            .contains("no such table"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// The four non-interactive entry points refuse what they cannot do, with a
+    /// message that says which requirement was missed.
+    #[test]
+    fn the_cli_entry_points_report_what_they_need() {
+        let db = fixture("entry.db");
+        let db_arg = db.to_str().unwrap();
+        let text =
+            std::env::temp_dir().join(format!("zdbview_cli_text_{}.txt", std::process::id()));
+        std::fs::write(&text, "not a database, just words\n".repeat(6)).unwrap();
+        let text_arg = text.to_str().unwrap();
+
+        // --export
+        let err = run_export(&cli(&[db_arg, "--export", "yaml"]), "yaml")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("--export expects one of"), "{err}");
+        let err = run_export(&cli(&["--export", "csv"]), "csv")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("requires a file"), "{err}");
+
+        // --backup: needs a file, refuses a non-database, refuses to overwrite.
+        let err = run_backup(&cli(&["--backup", "/tmp/x.db"]), Path::new("/tmp/x.db"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("requires a file"), "{err}");
+        let dest = std::env::temp_dir().join(format!("zdbview_cli_bk_{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&dest);
+        run_backup(&cli(&[db_arg, "--backup", dest.to_str().unwrap()]), &dest).unwrap();
+        assert!(dest.exists(), "the copy is written");
+        let err = run_backup(&cli(&[db_arg, "--backup", dest.to_str().unwrap()]), &dest)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("already exists"), "{err}");
+
+        // --import: needs a file, a table, and a real database.
+        let csv = std::env::temp_dir().join(format!("zdbview_cli_in_{}.csv", std::process::id()));
+        std::fs::write(&csv, "a\nfrom the file\n").unwrap();
+        let csv_arg = csv.to_str().unwrap();
+        let err = run_import(&cli(&[db_arg, "--import", csv_arg]), &csv)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("--table"), "{err}");
+        let err = run_import(
+            &cli(&[text_arg, "--import", csv_arg, "--table", "t", "--sqlite"]),
+            &csv,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(!err.is_empty(), "a text file is not importable into: {err}");
+        run_import(&cli(&[db_arg, "--import", csv_arg, "--table", "t"]), &csv).unwrap();
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        let n: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM t WHERE a = 'from the file'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 1, "the row landed");
+        drop(conn);
+
+        // --recover: needs a file, and refuses what is not a database.
+        let err = run_recover(&cli(&["--recover"])).unwrap_err().to_string();
+        assert!(err.contains("requires a file"), "{err}");
+        let err = run_recover(&cli(&[text_arg, "--recover", "--sqlite"]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not a SQLite database"), "{err}");
+        // And on a real one it succeeds.
+        run_recover(&cli(&[db_arg, "--recover"])).unwrap();
+
+        for p in [db, text, dest, csv] {
+            let _ = std::fs::remove_file(p);
+        }
     }
 
     /// An explicit FILE opens first and quitting there ends the session without

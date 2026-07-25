@@ -147,7 +147,12 @@ SQLite files are self-describing, so every operation works on any database:
 - `e` on a blob cell opens the **hex editor**; text cells edit inline.
 - `e` also works on the **detail screen**, on the field the arrows select there.
 
-Rows are addressed by `rowid`; `WITHOUT ROWID` tables are listed read-only.
+Rows are addressed by `rowid` where there is one, and by the **primary key**
+otherwise — so a `WITHOUT ROWID` table is editable too, including one with a
+composite key. A keyed row is matched on every key column, so editing `('a','two')`
+cannot touch `('b','one')`. Two cases stay read-only and say so: a table with
+neither a rowid nor a primary key, and a key column holding a blob (the key is
+matched as text).
 Identifiers are double-quoted with internal quotes doubled, and edited values are
 bound as parameters, so schemas with spaces, keywords or quotes in their names
 work unmodified.
@@ -241,6 +246,7 @@ is published on crates.io); disable with `--no-default-features`.
 | `n` / `N` | next / previous match — inside the active filter, in display order |
 | `Ctrl-f` / `Ctrl-b`, `PgUp` / `PgDn` | page by a screenful (every view) |
 | `e` `a` `d` `:` | edit / add / delete / SQL (SQLite) |
+| `E` | edit the cell **as bytes**, whatever it holds (SQLite) |
 | `s` | sort by the cursor column (ascending → descending → off) |
 | `<` / `>` | move the sort to the previous / next column |
 | `a` `e` `r` `d` | create / hex-edit value / rename / delete record (rkyv) |
@@ -418,7 +424,7 @@ and `.help` lists exactly what is implemented:
 | `.databases` / `.attach FILE ALIAS` / `.detach ALIAS` | attached databases, so a statement can join across files |
 | `.mode list\|csv\|tsv\|markdown\|line\|insert\|json` | how a result set is rendered; `list` is the grid |
 | `.headers on\|off` | column names in redirected output |
-| `.output FILE` / `.once FILE` | send results to a file — all of them, or just the next one |
+| `.output FILE` / `.once FILE` | send results to a file — every result until reset, or just the next one |
 | `.timer on\|off` / `.eqp on\|off` | statement timing; plan before each statement |
 | `.import FILE TABLE` | load a CSV or TSV (the same reader as `--import`) |
 | `.read FILE` | run a file's statements, each one as if typed |
@@ -515,6 +521,10 @@ A blob cell has no text form, so `e` on one opens the **hex editor** over its by
 instead of the line editor, and `^s` writes them back as a blob parameter. Editing
 a blob as a string would replace the bytes with their own description. Text,
 integer and real cells still edit inline.
+
+`E` forces the hex editor on **any** cell, which is the only way to put binary into
+one that is not already a blob: a string starts as its own bytes, a number as its
+digits, a `NULL` as nothing at all, and `^s` writes the result back as a blob.
 
 ## Import
 
@@ -672,10 +682,10 @@ dropped so the table stays readable.
 
 ```
 ┌ tables — 1.1 M across 3 objects of history.db · t for frames ─────────────────┐
-│table                        written    share                                   │
-│history                      724 K       64%  ########################          │
-│index history_ts_idx         352 K       31%  ###########                       │
-│sqlite_schema                 12 K        1%                                    │
+│table                        written    rate         share                      │
+│history                      724 K      148 K/s        64%  ################    │
+│index history_ts_idx         352 K      72 K/s         31%  ########            │
+│sqlite_schema                 12 K      —               1%                      │
 └────────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -693,6 +703,10 @@ the page number it rewrote, and a page can be traced to the b-tree that owns it:
    does not grow with the log's length.
 4. The map is re-read when the log restarts (a checkpoint moves pages) or when a
    frame names a page the map does not cover (the file grew).
+
+`written` is the total since the monitor opened; `rate` is what the *last* sample
+attributed, so a table that has stopped reads as idle while its total stays. That
+pair is the answer to "which table is being written fastest right now".
 
 Indexes are named as indexes, and a page the map cannot place is shown as
 `page N (unmapped)` rather than being folded into a table it might not belong to.
@@ -719,6 +733,11 @@ shown:
 `j`/`k` step one frame (down is *back* in time), `[` and `]` jump a whole
 transaction, `g`/`G` go to the newest and oldest frame. Frames belonging to a log a
 checkpoint has already folded away are marked `stale`.
+
+`/` filters the log — by a table or index name, by a page number, or by `commit` /
+`stale` — and stepping then walks only what is listed, which is what makes a log
+with tens of thousands of frames usable. The title carries the count
+(`412/9184 frames`), `Esc` clears the filter and a second `Esc` leaves.
 
 The right pane decodes that one page image with the same record reader the recovery
 pass uses, labelling values with the table's column names. A value that continues
@@ -763,16 +782,19 @@ zdbview data.db --export csv                # first table as CSV
 zdbview data.db --export tsv                # .mode tabs (tabs/newlines escaped)
 zdbview data.db --export markdown           # .mode markdown, columns padded
 zdbview data.db --export line               # .mode line, one column per line
-zdbview data.db --export insert             # .mode insert, one INSERT per row
+zdbview data.db --export insert             # .mode insert, one INSERT per row (type-exact)
 zdbview data.db --export sql                # .dump — schema and data, replayable
 zdbview data.db --export csv --table users  # just that table
 zdbview cache.rkyv --export json            # recognized records, value blob as hex
 ```
 
 `--export sql` is `.dump`: every `CREATE` followed by its rows, wrapped in
-`PRAGMA foreign_keys=OFF` / `BEGIN` / `COMMIT`, and it reads values from the
-database rather than from the grid, so a blob comes out as `x'…'` and a real keeps
-its decimal point. Virtual tables are the case that makes a naive dump
+`PRAGMA foreign_keys=OFF` / `BEGIN` / `COMMIT`. It and `insert` mode both read
+values from the database rather than from the grid, so a blob comes out as `x'…'`
+and a real keeps its decimal point — the display string for a blob is a
+*description* of it (`<blob 2 bytes>`), which is useless in SQL. Everything that
+writes SQL uses the exact form; `csv`, `tsv`, `markdown` and `line` show what the
+grid shows. Virtual tables are the case that makes a naive dump
 unreplayable: `CREATE VIRTUAL TABLE` runs the module's constructor and builds the
 shadow tables, which the dump would then try to create a second time. Like the
 shell, zdbview registers the virtual table by writing its `sqlite_schema` row
@@ -818,8 +840,21 @@ assumption the pass made is written into the script as a comment:
 -- 33 pages unreachable from any root matched t by column count alone
 ```
 
-It does not recover indexes (the script replays their `CREATE INDEX` statements
-instead), read `WITHOUT ROWID` index-leaf pages, or repair the file in place.
+A `WITHOUT ROWID` table keeps its rows in an **index b-tree** rather than a table
+b-tree, so recovering it needs three page kinds, not one: table leaves (cells carry
+a rowid), index leaves (the key record *is* the row), and index interiors — which,
+unlike table interiors, carry key payloads of their own, so some rows live there.
+Index cells also keep much less of their payload on the page than table cells do
+(`((usable-12)*64/255)-23` against `usable-35`), and using the wrong formula
+decodes a short record. Measured on a 300-row keyed table with its root zeroed:
+`sqlite3 .recover` brings back 298 rows and so does this, replaying to
+`key-0000`…`key-0299`.
+
+Rows recovered from an index leaf carry no rowid, so their `INSERT` does not name
+`_rowid_` — naming it for a keyed table is an error and the replay would stop.
+Ordinary indexes are skipped rather than read as data: their entries duplicate
+columns of a table already being recovered, and emitting them would invent rows.
+The script replays each `CREATE INDEX` instead. The file is never modified.
 
 ## Backup
 

@@ -98,11 +98,14 @@ impl OutputMode {
         }
     }
 
-    /// Render a result set. `table` names the target of `insert` mode.
+    /// Render a result set. `table` names the target of `insert` mode, and
+    /// `literals` are the same cells as SQL literals — `insert` mode has to use
+    /// those, since a display string describes a blob rather than carrying it.
     fn render(
         self,
         columns: &[String],
         rows: &[Vec<String>],
+        literals: &[Vec<String>],
         table: &str,
         headers: bool,
     ) -> String {
@@ -130,7 +133,7 @@ impl OutputMode {
             }
             OutputMode::Markdown => rows_to_markdown(columns, rows),
             OutputMode::Line => rows_to_lines(columns, rows),
-            OutputMode::Insert => rows_to_inserts(table, columns, rows),
+            OutputMode::Insert => rows_to_inserts_exact(table, columns, literals),
             OutputMode::Json => rows_to_json(columns, rows),
             // The grid has no text form; a redirect falls back to CSV, which is
             // what the shell's default list mode is closest to.
@@ -145,10 +148,11 @@ enum HexTarget {
     /// A rkyv record's value, written through the archive's re-serialization.
     Record,
     /// A SQLite cell, written back as a blob parameter. Blob cells have no text
-    /// form, so the line editor cannot express them.
+    /// form, so the line editor cannot express them. Addressed by key, so a
+    /// `WITHOUT ROWID` table's cells are editable too.
     Cell {
         table: String,
-        rowid: i64,
+        key: crate::sqlite::RowKey,
         column: String,
     },
 }
@@ -794,6 +798,7 @@ impl App {
             // change it — `e` edits the highlighted field without going back, and
             // the arrows pick which field that is.
             KeyCode::Char('e') => self.edit_current_value(),
+            KeyCode::Char('E') => self.edit_cell_as_bytes(),
             KeyCode::Right => {
                 let n = self
                     .rows
@@ -873,7 +878,10 @@ impl App {
                             .and_then(|r| r.columns.get(self.col_idx).cloned())
                             .unwrap_or_default();
                         self.sqlite()
-                            .and_then(|s| s.cell_bytes(&t, rid, &col).ok())
+                            .and_then(|s| {
+                                s.cell_bytes_keyed(&t, &crate::sqlite::RowKey::Rowid(rid), &col)
+                                    .ok()
+                            })
                             .unwrap_or_default()
                     }
                     _ => self
@@ -1086,6 +1094,9 @@ impl App {
             KeyCode::PageDown => self.page_sqlite(true),
             KeyCode::PageUp => self.page_sqlite(false),
             KeyCode::Char('e') => self.begin_edit_cell(),
+            // `E` edits any cell as bytes, which is the only way to put binary
+            // into one that does not already hold a blob.
+            KeyCode::Char('E') => self.edit_cell_as_bytes(),
             KeyCode::Char('a') => self.insert_row(),
             KeyCode::Char('d') => {
                 if self.focus == Focus::Right && self.current_rowid().is_some() {
@@ -1607,19 +1618,15 @@ impl App {
             Some(ed) => ed.bytes.clone(),
             None => return,
         };
-        if let HexTarget::Cell {
-            table,
-            rowid,
-            column,
-        } = self.hex_target.clone()
-        {
+        if let HexTarget::Cell { table, key, column } = self.hex_target.clone() {
             let n = value.len();
             let written = match self.sqlite() {
-                Some(s) => s.update_cell_blob(&table, rowid, &column, &value),
+                Some(s) => s.update_cell_blob_keyed(&table, &key, &column, &value),
                 None => return,
             };
             match written {
-                Ok(()) => {
+                Ok(0) => self.notify("the row that cell belonged to is gone".to_string()),
+                Ok(_) => {
                     self.load_table();
                     self.notify(format!("{column} set ({n} bytes)"));
                     if let Some(ed) = self.hex.as_mut() {
@@ -1696,6 +1703,43 @@ impl App {
         self.rows
             .as_ref()
             .and_then(|r| r.rowids.get(self.row_idx).copied().flatten())
+    }
+
+    /// How to address the selected row for a write: its rowid where the table has
+    /// one, else its primary key read from the row on screen. `None` when neither
+    /// exists — a `WITHOUT ROWID` table with no primary key cannot be edited in
+    /// place at all, and neither can one whose key column holds a blob, since the
+    /// key is matched as text.
+    fn current_key(&self) -> Option<crate::sqlite::RowKey> {
+        if let Some(id) = self.current_rowid() {
+            return Some(crate::sqlite::RowKey::Rowid(id));
+        }
+        let view = self.rows.as_ref()?;
+        if view.primary_key.is_empty() {
+            return None;
+        }
+        let row = view.rows.get(self.row_idx)?;
+        let mut pairs = Vec::with_capacity(view.primary_key.len());
+        for name in &view.primary_key {
+            let i = view.columns.iter().position(|c| c == name)?;
+            let value = row.get(i)?;
+            if value.starts_with("<blob ") {
+                return None;
+            }
+            pairs.push((name.clone(), value.clone()));
+        }
+        Some(crate::sqlite::RowKey::Primary(pairs))
+    }
+
+    /// Why the selected row cannot be written to, for a message that says which of
+    /// the two reasons it is.
+    fn no_key_reason(&self) -> &'static str {
+        match self.rows.as_ref() {
+            Some(v) if v.primary_key.is_empty() => {
+                "row has no rowid and the table has no primary key — cannot edit in place"
+            }
+            _ => "the primary key of this row holds a blob — cannot address it as text",
+        }
     }
 
     fn select_table(&mut self, idx: usize) {
@@ -1960,6 +2004,47 @@ impl App {
         self.edit_current_value()
     }
 
+    /// `E`: open the selected cell in the hex editor whatever it holds. `e` only
+    /// does that for a cell that is already a blob, so without this there is no way
+    /// to turn a NULL or a string into bytes.
+    fn edit_cell_as_bytes(&mut self) {
+        if matches!(self.store, Store::Rkyv(_)) {
+            return self.open_hex_editor();
+        }
+        let column = self
+            .rows
+            .as_ref()
+            .and_then(|r| r.columns.get(self.col_idx).cloned());
+        let (table, column, key) = match (self.current_table(), column, self.current_key()) {
+            (Some(t), Some(c), Some(k)) => (t, c, k),
+            _ => {
+                let why = self.no_key_reason();
+                self.notify(why);
+                return;
+            }
+        };
+        // Whatever the cell holds becomes the starting bytes: a string's own bytes,
+        // a number's digits, nothing at all for NULL.
+        let bytes = match self.sqlite() {
+            Some(s) => s
+                .cell_bytes_keyed(&table, &key, &column)
+                .unwrap_or_default(),
+            None => return,
+        };
+        let n = bytes.len();
+        self.hex = Some(HexEdit::new(format!("{table}.{column}"), bytes));
+        self.hex_from = self.screen;
+        self.hex_target = HexTarget::Cell {
+            table,
+            key,
+            column: column.clone(),
+        };
+        self.screen = Screen::HexEdit;
+        self.notify(format!(
+            "{column} as bytes — {n} to start, ^s writes it back as a blob"
+        ));
+    }
+
     /// Edit whatever is selected: a SQLite cell (in the hex editor when it holds a
     /// blob, inline otherwise) or a rkyv record's value. Reached from the grid via
     /// `e` and from the detail screen, which has no pane focus of its own.
@@ -1975,10 +2060,11 @@ impl App {
             .and_then(|row| row.get(self.col_idx))
             .cloned()
             .unwrap_or_default();
-        let rowid = match self.current_rowid() {
-            Some(r) => r,
+        let key = match self.current_key() {
+            Some(k) => k,
             None => {
-                self.notify("row has no rowid — cannot edit (WITHOUT ROWID table)");
+                let why = self.no_key_reason();
+                self.notify(why);
                 return;
             }
         };
@@ -1992,17 +2078,16 @@ impl App {
         if let (Some(table), Some(column), Some(store)) =
             (self.current_table(), column, self.sqlite())
         {
-            if store.cell_is_blob(&table, rowid, &column).unwrap_or(false) {
-                match store.cell_bytes(&table, rowid, &column) {
+            if store
+                .cell_is_blob_keyed(&table, &key, &column)
+                .unwrap_or(false)
+            {
+                match store.cell_bytes_keyed(&table, &key, &column) {
                     Ok(bytes) => {
                         let n = bytes.len();
                         self.hex = Some(HexEdit::new(format!("{table}.{column}"), bytes));
                         self.hex_from = self.screen;
-                        self.hex_target = HexTarget::Cell {
-                            table,
-                            rowid,
-                            column,
-                        };
+                        self.hex_target = HexTarget::Cell { table, key, column };
                         self.screen = Screen::HexEdit;
                         self.notify(format!("blob cell — {n} bytes in the hex editor"));
                         return;
@@ -2018,9 +2103,9 @@ impl App {
     }
 
     fn commit_edit_cell(&mut self, val: &str) {
-        let (table, rowid, col) = match (
+        let (table, key, col) = match (
             self.current_table(),
-            self.current_rowid(),
+            self.current_key(),
             self.rows
                 .as_ref()
                 .and_then(|r| r.columns.get(self.col_idx).cloned()),
@@ -2028,9 +2113,13 @@ impl App {
             (Some(t), Some(rid), Some(c)) => (t, rid, c),
             _ => return,
         };
-        let res = self.sqlite().unwrap().update_cell(&table, rowid, &col, val);
+        let res = self
+            .sqlite()
+            .unwrap()
+            .update_cell_keyed(&table, &key, &col, val);
         match res {
-            Ok(()) => {
+            Ok(0) => self.notify("that row is no longer there".to_string()),
+            Ok(_) => {
                 self.notify(format!("updated {}.{}", table, col));
                 self.load_table();
                 // Edited from the detail screen: it is still showing the old bytes.
@@ -2057,13 +2146,26 @@ impl App {
     }
 
     fn delete_current_row(&mut self) {
-        let (table, rowid) = match (self.current_table(), self.current_rowid()) {
-            (Some(t), Some(r)) => (t, r),
-            _ => return,
+        let (table, key) = match (self.current_table(), self.current_key()) {
+            (Some(t), Some(k)) => (t, k),
+            _ => {
+                let why = self.no_key_reason();
+                self.notify(why);
+                return;
+            }
         };
-        match self.sqlite().unwrap().delete_row(&table, rowid) {
-            Ok(()) => {
-                self.notify(format!("deleted row {} from {}", rowid, table));
+        let what = match &key {
+            crate::sqlite::RowKey::Rowid(id) => format!("row {id}"),
+            crate::sqlite::RowKey::Primary(pairs) => pairs
+                .iter()
+                .map(|(c, v)| format!("{c}={v}"))
+                .collect::<Vec<_>>()
+                .join(", "),
+        };
+        match self.sqlite().unwrap().delete_row_keyed(&table, &key) {
+            Ok(0) => self.notify("that row is no longer there".to_string()),
+            Ok(_) => {
+                self.notify(format!("deleted {what} from {table}"));
                 self.row_idx = self.row_idx.saturating_sub(1);
                 self.load_table();
             }
@@ -2978,11 +3080,12 @@ impl App {
             Ok(Outcome::Rows {
                 columns,
                 rows,
+                literals,
                 truncated,
             }) => {
                 // `.output` / `.once` send the result to a file instead, and
                 // `.mode` decides how anything but the grid is written.
-                match self.write_result(&columns, &rows) {
+                match self.write_result(&columns, &rows, &literals) {
                     Some(note) => Entry::Note(vec![note]),
                     None if self.sql_mode == OutputMode::List => Entry::Rows {
                         columns,
@@ -2993,6 +3096,7 @@ impl App {
                         let text = self.sql_mode.render(
                             &columns,
                             &rows,
+                            &literals,
                             &self.current_table().unwrap_or_else(|| "table".into()),
                             self.sql_headers,
                         );
@@ -3136,11 +3240,19 @@ impl App {
             }
             ".output" | ".once" => match arg(0) {
                 Some(file) => {
-                    self.sql_out = Some((PathBuf::from(file), cmd == ".once"));
-                    vec![format!(
-                        "{} results to {file}",
-                        if cmd == ".once" { "next" } else { "all" }
-                    )]
+                    let path = PathBuf::from(file);
+                    // The shell opens the file fresh and then collects into it, so
+                    // truncate here and append per result.
+                    match std::fs::write(&path, b"") {
+                        Ok(()) => {
+                            self.sql_out = Some((path, cmd == ".once"));
+                            vec![format!(
+                                "{} results to {file}",
+                                if cmd == ".once" { "next" } else { "all" }
+                            )]
+                        }
+                        Err(e) => vec![format!("cannot write {file}: {e}")],
+                    }
                 }
                 None => {
                     self.sql_out = None;
@@ -3307,15 +3419,23 @@ impl App {
     /// Write a result set to wherever `.output` / `.once` points, returning what to
     /// report. `None` when no redirect is active, which leaves the transcript to
     /// show the result itself.
-    fn write_result(&mut self, columns: &[String], rows: &[Vec<String>]) -> Option<String> {
+    fn write_result(
+        &mut self,
+        columns: &[String],
+        rows: &[Vec<String>],
+        literals: &[Vec<String>],
+    ) -> Option<String> {
         let (path, once) = self.sql_out.clone()?;
         let text = self.sql_mode.render(
             columns,
             rows,
+            literals,
             &self.current_table().unwrap_or_else(|| "table".into()),
             self.sql_headers,
         );
-        let note = match std::fs::write(&path, text.as_bytes()) {
+        // A redirect collects every result until it is reset, as the shell's
+        // `.output` does — so the second statement must not erase the first.
+        let note = match append_to(&path, text.as_bytes()) {
             Ok(()) => format!(
                 "wrote {} row{} to {} as {}",
                 rows.len(),
@@ -4277,6 +4397,18 @@ pub fn pick_mru(terminal: &mut DefaultTerminal, mut p: Picker<'_>) -> Result<Opt
 /// point where a person would notice the wait.
 const DECODE_INLINE_MAX: usize = 4 * 1024 * 1024;
 
+/// Append `bytes` to `path`, creating it if it is not there. `.output` collects
+/// results until it is reset, and `.once` writes exactly one — which is the same
+/// operation, since the file it writes to is fresh.
+fn append_to(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    f.write_all(bytes)
+}
+
 /// What a background statistics pass returns: the columns, or why it could not.
 type StatsResult = std::result::Result<Vec<crate::sqlite::ColumnStat>, String>;
 
@@ -5000,6 +5132,29 @@ mod tests {
             "a once redirect ends after one result"
         );
 
+        // `.output` collects every result until it is reset, as the shell does — the
+        // second statement must not erase the first.
+        let all = scratch("all.csv");
+        app.execute_sql(&format!(".output {}", all.display()));
+        app.execute_sql("SELECT a FROM t WHERE a = 'x'");
+        app.execute_sql("SELECT a FROM t WHERE a = 'y'");
+        let collected = std::fs::read_to_string(&all).unwrap();
+        assert_eq!(
+            collected, "a\nx\na\ny\n",
+            "both results are in the file, in order"
+        );
+        // Pointing it at the same file again starts fresh rather than appending to
+        // what was there.
+        app.execute_sql(&format!(".output {}", all.display()));
+        app.execute_sql("SELECT a FROM t WHERE a = 'x'");
+        assert_eq!(std::fs::read_to_string(&all).unwrap(), "a\nx\n");
+        app.execute_sql(".output");
+        assert!(
+            app.sql_out.is_none(),
+            "bare .output goes back to the transcript"
+        );
+        let _ = std::fs::remove_file(&all);
+
         // `.import` shares the reader with --import; `.read` runs a script.
         let csv = scratch("in.csv");
         std::fs::write(&csv, "a,b\nz,3\n").unwrap();
@@ -5255,6 +5410,69 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
+    /// `E` opens any cell as bytes, which is the only way to put binary into a cell
+    /// that is not already a blob — `e` alone would edit it as text.
+    #[test]
+    fn shift_e_turns_a_text_or_null_cell_into_bytes() {
+        let path = scratch("db");
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE t (txt TEXT, empty BLOB);
+             INSERT INTO t VALUES ('hi', NULL);",
+        )
+        .unwrap();
+        drop(conn);
+        let mut app = App::with_theme(
+            Store::Sqlite(SqliteStore::open(&path).unwrap()),
+            Theme::from_name(ThemeName::NeonSprawl),
+        );
+        app.on_key(KeyEvent::from(KeyCode::Tab)); // the row grid
+
+        // `e` on a text cell still edits text.
+        press(&mut app, 'e');
+        assert!(matches!(app.mode, super::Mode::EditCell(_)));
+        app.on_key(KeyEvent::from(KeyCode::Esc));
+
+        // `E` on the same cell opens its bytes instead.
+        press(&mut app, 'E');
+        assert_eq!(app.screen, super::Screen::HexEdit);
+        assert_eq!(
+            app.hex.as_ref().unwrap().bytes,
+            b"hi",
+            "a string starts as its own bytes"
+        );
+        press(&mut app, 'i');
+        press(&mut app, '4');
+        press(&mut app, '1');
+        app.on_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+        let store = SqliteStore::open(&path).unwrap();
+        let key = crate::sqlite::RowKey::Rowid(1);
+        assert_eq!(store.cell_bytes_keyed("t", &key, "txt").unwrap(), b"Ai");
+        assert!(
+            store.cell_is_blob_keyed("t", &key, "txt").unwrap(),
+            "it is a blob now, not a string"
+        );
+        app.on_key(KeyEvent::from(KeyCode::Esc));
+        press(&mut app, 'q');
+
+        // And a NULL cell starts empty, so bytes can be authored from nothing.
+        app.on_key(KeyEvent::from(KeyCode::Right));
+        press(&mut app, 'E');
+        assert_eq!(app.screen, super::Screen::HexEdit);
+        assert!(
+            app.hex.as_ref().unwrap().bytes.is_empty(),
+            "NULL has no bytes"
+        );
+        press(&mut app, 'o'); // insert a byte to have something to write
+        app.on_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+        let store = SqliteStore::open(&path).unwrap();
+        assert!(
+            store.cell_is_blob_keyed("t", &key, "empty").unwrap(),
+            "a NULL became a blob"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
     /// A blob field edited from the detail screen goes through the hex editor and
     /// comes back to the detail screen, not to the grid.
     #[test]
@@ -5447,12 +5665,16 @@ mod tests {
         app.on_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
         let store = SqliteStore::open(&path).unwrap();
         assert_eq!(
-            store.cell_bytes("t", 1, "raw").unwrap(),
+            store
+                .cell_bytes_keyed("t", &crate::sqlite::RowKey::Rowid(1), "raw")
+                .unwrap(),
             [0x41, 0xff],
             "the edited byte reached the database"
         );
         assert!(
-            store.cell_is_blob("t", 1, "raw").unwrap(),
+            store
+                .cell_is_blob_keyed("t", &crate::sqlite::RowKey::Rowid(1), "raw")
+                .unwrap(),
             "still a blob, not text"
         );
 
