@@ -390,7 +390,31 @@ impl App {
             }
             Modal::Cmd(buf) => return self.key_input(key, buf, Mode::Command, App::commit_command),
             Modal::Search(buf) => {
-                return self.key_input(key, buf, Mode::Search, App::commit_search)
+                // The arrows (and paging) move through the filtered list while the
+                // prompt stays open — the pattern only takes Left/Right for its
+                // own cursor.
+                match code {
+                    KeyCode::Up => {
+                        self.move_selection(-1);
+                        return;
+                    }
+                    KeyCode::Down => {
+                        self.move_selection(1);
+                        return;
+                    }
+                    KeyCode::PageUp => {
+                        let step = self.page_step() as isize;
+                        self.move_selection(-step);
+                        return;
+                    }
+                    KeyCode::PageDown => {
+                        let step = self.page_step() as isize;
+                        self.move_selection(step);
+                        return;
+                    }
+                    _ => {}
+                }
+                return self.key_input(key, buf, Mode::Search, App::commit_search);
             }
             Modal::Add(buf) => {
                 return self.key_input(key, buf, Mode::AddRecord, App::commit_add_record)
@@ -1546,6 +1570,30 @@ impl App {
         }
     }
 
+    /// Move the selection by `delta` listed rows, whichever screen is showing.
+    /// Used by the filter prompt, where the list stays navigable while typing.
+    fn move_selection(&mut self, delta: isize) {
+        match &self.store {
+            Store::Sqlite(_) => match self.focus {
+                Focus::Left => {
+                    let visible = self.visible_tables();
+                    if let Some(i) = Self::step_visible(&visible, self.table_idx, delta) {
+                        self.select_table(i);
+                    }
+                }
+                Focus::Right => {
+                    let loaded = self.rows.as_ref().map(|r| r.rows.len()).unwrap_or(0);
+                    if loaded == 0 {
+                        return;
+                    }
+                    let next = (self.row_idx as isize + delta).clamp(0, loaded as isize - 1);
+                    self.row_idx = next as usize;
+                }
+            },
+            Store::Rkyv(_) => self.move_rkyv(delta),
+        }
+    }
+
     /// Move the rkyv selection by `delta` listed rows (the Hex view scrolls
     /// instead, since bytes are not filtered).
     fn move_rkyv(&mut self, delta: isize) {
@@ -2680,24 +2728,15 @@ pub fn pick_mru(terminal: &mut DefaultTerminal, mut p: Picker<'_>) -> Result<Opt
             // While the `/` prompt is open every key edits the filter, and the
             // list shrinks to the matches as it is typed.
             if typing {
-                match key.code {
-                    KeyCode::Esc => {
-                        // Cancel: drop the filter and go back to the row `/` was
-                        // pressed on.
+                match filter_prompt_key(key.code, &mut filter, &mut sel, last, page) {
+                    Prompt::Open => {}
+                    Prompt::Accept => typing = false,
+                    Prompt::Cancel => {
+                        // Drop the filter and go back to the row `/` was pressed on.
                         typing = false;
                         filter.clear();
                         sel = before_filter;
                     }
-                    KeyCode::Enter => typing = false,
-                    KeyCode::Backspace => {
-                        filter.pop();
-                        sel = 0;
-                    }
-                    KeyCode::Char(c) => {
-                        filter.push(c);
-                        sel = 0;
-                    }
-                    _ => {}
                 }
                 continue;
             }
@@ -2787,6 +2826,50 @@ fn spawn_decode(bytes: Vec<u8>) -> std::sync::mpsc::Receiver<Option<Decoded>> {
         let _ = tx.send(formats::try_decode(&bytes));
     });
     rx
+}
+
+/// What a key did to the picker's filter prompt.
+#[derive(Debug, PartialEq, Eq)]
+enum Prompt {
+    /// Still typing.
+    Open,
+    /// Enter: keep the filter and close the prompt.
+    Accept,
+    /// Esc: discard it.
+    Cancel,
+}
+
+/// Handle one key of the picker's `/` prompt. The list stays navigable while the
+/// pattern is typed, so the arrows and paging move the selection instead of being
+/// swallowed; only Left/Right belong to the pattern itself.
+fn filter_prompt_key(
+    code: KeyCode,
+    filter: &mut String,
+    sel: &mut usize,
+    last: usize,
+    page: usize,
+) -> Prompt {
+    match code {
+        KeyCode::Esc => return Prompt::Cancel,
+        KeyCode::Enter => return Prompt::Accept,
+        KeyCode::Backspace => {
+            filter.pop();
+            *sel = 0;
+        }
+        KeyCode::Up => *sel = sel.saturating_sub(1),
+        KeyCode::Down => *sel = (*sel + 1).min(last),
+        KeyCode::PageUp => *sel = sel.saturating_sub(page),
+        KeyCode::PageDown => *sel = (*sel + page).min(last),
+        KeyCode::Home => *sel = 0,
+        KeyCode::End => *sel = last,
+        KeyCode::Char(c) => {
+            filter.push(c);
+            // A changed pattern means a different list; start at its top.
+            *sel = 0;
+        }
+        _ => {}
+    }
+    Prompt::Open
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3967,6 +4050,118 @@ mod tests {
         assert!(!app.reopen, "the editor keeps o for inserting a byte");
         assert_eq!(app.hex.as_ref().unwrap().bytes.len(), before + 1);
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// The arrows must keep working while a filter prompt is open — they were
+    /// swallowed by the prompt, so the list froze as soon as `/` was pressed.
+    #[test]
+    fn arrows_navigate_while_the_filter_prompt_is_open() {
+        // rkyv Records: three of five keys match, and Up/Down walk those three.
+        let path = scratch("rkyv");
+        let recs: Vec<(String, Vec<u8>)> = ["a_one", "b_skip", "a_two", "c_skip", "a_three"]
+            .iter()
+            .map(|n| (format!("/tmp/{n}.sh"), vec![b'x']))
+            .collect();
+        std::fs::write(&path, crate::formats::test_script_shard_bytes_many(&recs)).unwrap();
+        let store = Store::Rkyv(RkyvStore::open(&path).unwrap());
+        let mut app = App::new(store, Some(ThemeName::NeonSprawl));
+        press(&mut app, '/');
+        for c in "a_".chars() {
+            press(&mut app, c);
+        }
+        let visible = app.visible_records();
+        assert_eq!(visible.len(), 3);
+        assert!(
+            matches!(app.mode, super::Mode::Search(_)),
+            "prompt must stay open"
+        );
+
+        app.on_key(KeyEvent::from(KeyCode::Down));
+        assert!(
+            matches!(app.mode, super::Mode::Search(_)),
+            "Down must not close it"
+        );
+        assert_eq!(app.record_idx, visible[1], "Down moves within the matches");
+        app.on_key(KeyEvent::from(KeyCode::Down));
+        assert_eq!(app.record_idx, visible[2]);
+        app.on_key(KeyEvent::from(KeyCode::Down));
+        assert_eq!(app.record_idx, visible[2], "clamps at the last match");
+        app.on_key(KeyEvent::from(KeyCode::Up));
+        assert_eq!(app.record_idx, visible[1]);
+
+        // Typing more still narrows from the top.
+        press(&mut app, 't');
+        assert_eq!(app.visible_records().len(), 2, "a_two and a_three");
+        let _ = std::fs::remove_file(&path);
+
+        // SQLite rows: Down moves inside the filtered page.
+        let (mut app, path) = sqlite_app_rows(60);
+        app.on_key(KeyEvent::from(KeyCode::Tab));
+        press(&mut app, '/');
+        press(&mut app, '4');
+        assert_eq!(app.row_idx, 0);
+        app.on_key(KeyEvent::from(KeyCode::Down));
+        assert_eq!(app.row_idx, 1, "Down must move the filtered grid");
+        app.on_key(KeyEvent::from(KeyCode::Up));
+        assert_eq!(app.row_idx, 0);
+        // Paging works from the prompt too.
+        frame_rows(&mut app, 80, 24);
+        app.on_key(KeyEvent::from(KeyCode::PageDown));
+        assert!(app.row_idx > 0);
+        assert!(matches!(app.mode, super::Mode::Search(_)), "still typing");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The picker's prompt behaves the same way.
+    #[test]
+    fn picker_prompt_keys_navigate_and_edit() {
+        use super::{filter_prompt_key, Prompt};
+        let mut filter = String::new();
+        let mut sel = 0usize;
+        let (last, page) = (9usize, 4usize);
+
+        // Typing narrows and resets to the top of the new list.
+        assert_eq!(
+            filter_prompt_key(KeyCode::Char('z'), &mut filter, &mut sel, last, page),
+            Prompt::Open
+        );
+        assert_eq!(filter, "z");
+        assert_eq!(sel, 0);
+
+        // Arrows move the selection without touching the pattern.
+        filter_prompt_key(KeyCode::Down, &mut filter, &mut sel, last, page);
+        filter_prompt_key(KeyCode::Down, &mut filter, &mut sel, last, page);
+        assert_eq!((sel, filter.as_str()), (2, "z"));
+        filter_prompt_key(KeyCode::Up, &mut filter, &mut sel, last, page);
+        assert_eq!(sel, 1);
+        filter_prompt_key(KeyCode::PageDown, &mut filter, &mut sel, last, page);
+        assert_eq!(sel, 5);
+        filter_prompt_key(KeyCode::PageUp, &mut filter, &mut sel, last, page);
+        assert_eq!(sel, 1);
+        filter_prompt_key(KeyCode::End, &mut filter, &mut sel, last, page);
+        assert_eq!(sel, last, "End goes to the last match");
+        filter_prompt_key(KeyCode::Home, &mut filter, &mut sel, last, page);
+        assert_eq!(sel, 0);
+        // Clamped at both ends.
+        filter_prompt_key(KeyCode::Up, &mut filter, &mut sel, last, page);
+        assert_eq!(sel, 0);
+        sel = last;
+        filter_prompt_key(KeyCode::Down, &mut filter, &mut sel, last, page);
+        assert_eq!(sel, last);
+
+        // Backspace edits and returns to the top.
+        filter_prompt_key(KeyCode::Backspace, &mut filter, &mut sel, last, page);
+        assert!(filter.is_empty());
+        assert_eq!(sel, 0);
+
+        assert_eq!(
+            filter_prompt_key(KeyCode::Enter, &mut filter, &mut sel, last, page),
+            Prompt::Accept
+        );
+        assert_eq!(
+            filter_prompt_key(KeyCode::Esc, &mut filter, &mut sel, last, page),
+            Prompt::Cancel
+        );
     }
 
     /// The picker's `/` must remove rows, not just move the cursor.

@@ -796,7 +796,7 @@ fn help_sections(ctx: HelpCtx) -> Vec<HelpSection> {
             },
             HelpSection {
                 title: "SEARCH",
-                keys: &[("/", "Filter by path"), ("n / N", "Next / prev")],
+                keys: &[("/", "Filter by path"), ("↑ / ↓", "Move while typing")],
             },
             HelpSection {
                 title: "SCAN",
@@ -858,9 +858,9 @@ fn help_sections(ctx: HelpCtx) -> Vec<HelpSection> {
             title: "FILTER",
             keys: &[
                 ("/", "Filter as you type"),
+                ("↑ / ↓", "Move while typing"),
                 ("Enter", "Keep the filter"),
                 ("Esc", "Clear it"),
-                ("n / N", "Next / prev match"),
             ],
         },
         store,

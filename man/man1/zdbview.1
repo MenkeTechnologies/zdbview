@@ -262,7 +262,16 @@ and the pane title carries the count.
 .B Enter
 keeps the filter,
 .B Esc
-clears it and restores the position. The pattern is matched against table names,
+clears it and restores the position. While the pattern is being typed the list
+stays navigable:
+.BR \(ua / \(da ,
+.BR PageUp / PageDown ,
+.BR Home / End
+and
+.BR Ctrl\-f / Ctrl\-b
+move through the matches with the prompt open, and
+.BR \(<- / \(->
+edit the pattern itself. The pattern is matched against table names,
 or \(em with the row grid focused \(em every column of the table via a SQL
 .BR WHERE ,
 so it covers the whole table rather than the loaded page; also against record

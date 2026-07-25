@@ -338,6 +338,11 @@ matching rows stay listed, the title carries the count (`tables 2/3  /user`,
 cursor back where `/` was pressed. Navigation walks the filtered list, so `j`/`k`
 never land on a hidden row.
 
+The list stays live while the pattern is being typed: `↑`/`↓`, `PgUp`/`PgDn`,
+`Home`/`End` and `Ctrl-f`/`Ctrl-b` move through the matches with the prompt still
+open, so you can narrow and pick in one go. `←`/`→` belong to the pattern's own
+text cursor.
+
 For SQLite the filter is a SQL `WHERE` across every column, so it covers the
 **whole table** — the row count and paging follow the filter, not just the loaded
 page. The table list, the rkyv Records and Strings views, and the file picker
