@@ -124,7 +124,10 @@ fn list_themes() {
     const B_MAGENTA: &str = "\x1b[1;35m";
     const B_YELLOW: &str = "\x1b[1;33m";
 
-    println!("\n{B_CYAN}  ── COLOR SCHEMES ({}) ────────────────────────{RST}\n", ThemeName::ALL.len());
+    println!(
+        "\n{B_CYAN}  ── COLOR SCHEMES ({}) ────────────────────────{RST}\n",
+        ThemeName::ALL.len()
+    );
     for &name in ThemeName::ALL {
         let swatch: String = Theme::swatch(name)
             .iter()
@@ -218,11 +221,7 @@ fn export_store(store: &Store, fmt: &str) -> Result<String> {
     }
 }
 
-fn run(
-    cli: &Cli,
-    terminal: &mut DefaultTerminal,
-    theme: Option<theme::ThemeName>,
-) -> Result<()> {
+fn run(cli: &Cli, terminal: &mut DefaultTerminal, theme: Option<theme::ThemeName>) -> Result<()> {
     // Resolve the file to open: explicit argument, or a pick from the MRU list.
     let file = match &cli.file {
         Some(f) => f.clone(),

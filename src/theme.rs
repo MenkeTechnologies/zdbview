@@ -293,8 +293,14 @@ mod tests {
     /// `iftoprs/src/config/theme.rs` so a typo in either file is caught.
     #[test]
     fn palettes_match_iftoprs() {
-        assert_eq!(base_palette(ThemeName::NeonSprawl), [27, 48, 135, 141, 63, 99]);
-        assert_eq!(base_palette(ThemeName::BladeRunner), [208, 37, 166, 73, 130, 23]);
+        assert_eq!(
+            base_palette(ThemeName::NeonSprawl),
+            [27, 48, 135, 141, 63, 99]
+        );
+        assert_eq!(
+            base_palette(ThemeName::BladeRunner),
+            [208, 37, 166, 73, 130, 23]
+        );
     }
 
     /// Every scheme must resolve all six overlay roles to indexed colors —
@@ -352,7 +358,11 @@ mod tests {
     fn tokens_are_unique_and_roundtrip() {
         let mut seen = std::collections::HashSet::new();
         for &name in ThemeName::ALL {
-            assert!(seen.insert(name.token()), "duplicate token {}", name.token());
+            assert!(
+                seen.insert(name.token()),
+                "duplicate token {}",
+                name.token()
+            );
             assert_eq!(ThemeName::from_token(name.token()), Some(name));
         }
         assert_eq!(ThemeName::from_token("no_such_scheme"), None);
@@ -364,7 +374,11 @@ mod tests {
         let mut seen = std::collections::HashSet::new();
         for &name in ThemeName::ALL {
             assert!(!name.display().is_empty());
-            assert!(seen.insert(name.display()), "duplicate name {}", name.display());
+            assert!(
+                seen.insert(name.display()),
+                "duplicate name {}",
+                name.display()
+            );
         }
     }
 }

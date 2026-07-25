@@ -103,7 +103,13 @@ impl SqliteStore {
 
     /// Fetch one page of rows. Includes `rowid` for edit/delete addressing when
     /// the table exposes it.
-    pub fn rows(&self, table: &str, limit: i64, offset: i64, sort: Option<&Sort>) -> Result<RowsView> {
+    pub fn rows(
+        &self,
+        table: &str,
+        limit: i64,
+        offset: i64,
+        sort: Option<&Sort>,
+    ) -> Result<RowsView> {
         let columns = self.columns(table)?;
         let total = self.count(table)?;
         let ncols = columns.len();

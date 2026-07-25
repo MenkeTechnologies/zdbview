@@ -219,21 +219,33 @@ fn rows_sort_ascending_descending_and_natural_order() {
     let v = store.rows("t", 100, 0, None).unwrap();
     assert_eq!(col(&v, 0), ["pear", "apple", "fig", "date"]);
 
-    let asc = Sort { column: "name".into(), desc: false };
+    let asc = Sort {
+        column: "name".into(),
+        desc: false,
+    };
     let v = store.rows("t", 100, 0, Some(&asc)).unwrap();
     assert_eq!(col(&v, 0), ["apple", "date", "fig", "pear"]);
 
-    let desc = Sort { column: "name".into(), desc: true };
+    let desc = Sort {
+        column: "name".into(),
+        desc: true,
+    };
     let v = store.rows("t", 100, 0, Some(&desc)).unwrap();
     assert_eq!(col(&v, 0), ["pear", "fig", "date", "apple"]);
 
     // Numeric column must sort numerically, not lexically (10 after 7).
-    let qty = Sort { column: "qty".into(), desc: false };
+    let qty = Sort {
+        column: "qty".into(),
+        desc: false,
+    };
     let v = store.rows("t", 100, 0, Some(&qty)).unwrap();
     assert_eq!(col(&v, 1), ["3", "3", "7", "10"]);
 
     // An unknown column falls back to rowid order instead of failing the query.
-    let bogus = Sort { column: "nope".into(), desc: false };
+    let bogus = Sort {
+        column: "nope".into(),
+        desc: false,
+    };
     let v = store.rows("t", 100, 0, Some(&bogus)).unwrap();
     assert_eq!(col(&v, 0), ["pear", "apple", "fig", "date"]);
 
@@ -245,7 +257,10 @@ fn rows_sort_ascending_descending_and_natural_order() {
 #[test]
 fn sorted_paging_is_stable_across_duplicate_keys() {
     let (path, store) = sortable_db("sort_page.db");
-    let qty = Sort { column: "qty".into(), desc: false };
+    let qty = Sort {
+        column: "qty".into(),
+        desc: false,
+    };
 
     let mut seen = Vec::new();
     for offset in [0, 2] {
@@ -264,7 +279,10 @@ fn sorted_paging_is_stable_across_duplicate_keys() {
 fn search_and_ordinals_follow_the_sorted_order() {
     let (path, store) = sortable_db("sort_search.db");
     let cols = store.columns("t").unwrap();
-    let asc = Sort { column: "name".into(), desc: false };
+    let asc = Sort {
+        column: "name".into(),
+        desc: false,
+    };
 
     // Sorted ascending: apple(2) date(4) fig(3) pear(1) by rowid.
     let sorted = store.rows("t", 100, 0, Some(&asc)).unwrap();
@@ -309,18 +327,25 @@ fn search_and_ordinals_follow_the_sorted_order() {
 
     // Ordinals are positions in the sorted view: apple is 1st, pear 4th.
     assert_eq!(
-        store.rowid_ordinal("t", rowid_of("apple"), Some(&asc)).unwrap(),
+        store
+            .rowid_ordinal("t", rowid_of("apple"), Some(&asc))
+            .unwrap(),
         1
     );
     assert_eq!(
-        store.rowid_ordinal("t", rowid_of("pear"), Some(&asc)).unwrap(),
+        store
+            .rowid_ordinal("t", rowid_of("pear"), Some(&asc))
+            .unwrap(),
         4
     );
     // Without a sort the same rowid is placed by rowid instead.
     assert_eq!(store.rowid_ordinal("t", rowid_of("pear"), None).unwrap(), 1);
 
     // Descending flips both the stepping direction and the ordinals.
-    let desc = Sort { column: "name".into(), desc: true };
+    let desc = Sort {
+        column: "name".into(),
+        desc: true,
+    };
     assert_eq!(
         store
             .find_row("t", &cols, "e", rowid_of("pear"), true, Some(&desc))
@@ -328,7 +353,9 @@ fn search_and_ordinals_follow_the_sorted_order() {
         Some(rowid_of("date"))
     );
     assert_eq!(
-        store.rowid_ordinal("t", rowid_of("pear"), Some(&desc)).unwrap(),
+        store
+            .rowid_ordinal("t", rowid_of("pear"), Some(&desc))
+            .unwrap(),
         1
     );
 
@@ -341,13 +368,18 @@ fn sort_column_names_are_escaped() {
     let path = tmp("sort_quote.db");
     let _ = std::fs::remove_file(&path);
     let conn = rusqlite::Connection::open(&path).unwrap();
-    conn.execute(r#"CREATE TABLE t ("od""d" TEXT)"#, []).unwrap();
-    conn.execute(r#"INSERT INTO t VALUES ('b'), ('a')"#, []).unwrap();
+    conn.execute(r#"CREATE TABLE t ("od""d" TEXT)"#, [])
+        .unwrap();
+    conn.execute(r#"INSERT INTO t VALUES ('b'), ('a')"#, [])
+        .unwrap();
     drop(conn);
     let store = SqliteStore::open(&path).unwrap();
     let cols = store.columns("t").unwrap();
     assert_eq!(cols, vec![r#"od"d"#.to_string()]);
-    let sort = Sort { column: cols[0].clone(), desc: false };
+    let sort = Sort {
+        column: cols[0].clone(),
+        desc: false,
+    };
     let v = store.rows("t", 100, 0, Some(&sort)).unwrap();
     assert_eq!(col(&v, 0), ["a", "b"]);
     assert_eq!(store.rowid_ordinal("t", 2, Some(&sort)).unwrap(), 1);

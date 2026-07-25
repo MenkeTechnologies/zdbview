@@ -1428,7 +1428,9 @@ impl App {
             let s = self.sqlite().unwrap();
             // From the selected row, else from the edge the scan comes in from.
             let first = match self.current_rowid() {
-                Some(from) => s.find_row(&table, &columns, &self.search, from, forward, sort.as_ref()),
+                Some(from) => {
+                    s.find_row(&table, &columns, &self.search, from, forward, sort.as_ref())
+                }
                 None => s.find_row_edge(&table, &columns, &self.search, forward, sort.as_ref()),
             };
             let rid = match first {
@@ -1817,7 +1819,10 @@ impl App {
         if let Some(rec) = d.records.get(self.record_idx) {
             for (name, val) in &rec.fields {
                 lines.push(Line::from(vec![
-                    Span::styled(format!("{:<22}", name), Style::default().fg(self.ov.theme.dim)),
+                    Span::styled(
+                        format!("{:<22}", name),
+                        Style::default().fg(self.ov.theme.dim),
+                    ),
                     Span::raw(val.clone()),
                 ]));
             }
@@ -2161,13 +2166,7 @@ fn picker_find(entries: &[Entry], from: usize, forward: bool, q: &str) -> Option
     })
 }
 
-fn render_picker(
-    f: &mut Frame,
-    entries: &[Entry],
-    idx: usize,
-    query: Option<&str>,
-    t: &Theme,
-) {
+fn render_picker(f: &mut Frame, entries: &[Entry], idx: usize, query: Option<&str>, t: &Theme) {
     let outer = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(f.area());
 
     if entries.is_empty() {
@@ -2201,9 +2200,7 @@ fn render_picker(
                     Span::styled(format!(" {} ", badge), Style::default().fg(color)),
                     Span::styled(
                         format!("{:<28}", truncate(name, 28)),
-                        Style::default()
-                            .fg(t.accent)
-                            .add_modifier(Modifier::BOLD),
+                        Style::default().fg(t.accent).add_modifier(Modifier::BOLD),
                     ),
                     Span::styled(
                         format!("{:>10}  ", mru::rel_age(e.opened)),
@@ -2227,8 +2224,9 @@ fn render_picker(
     }
 
     let help = match query {
-        Some(q) => Paragraph::new(format!("/{}_", q))
-            .style(Style::default().fg(Color::Black).bg(t.accent)),
+        Some(q) => {
+            Paragraph::new(format!("/{}_", q)).style(Style::default().fg(Color::Black).bg(t.accent))
+        }
         None => Paragraph::new(
             "j/k move · / search · n/N next/prev · Enter open · c scheme · h help · q quit",
         )
@@ -2430,7 +2428,6 @@ fn disasm_lines(_bytes: &[u8], _scroll: usize, _height: usize) -> Vec<Line<'stat
     )]
 }
 
-
 /// Truncate a display string to `max` chars, appending an ellipsis.
 /// Sort-direction marker for a column header.
 fn arrow(desc: bool) -> &'static str {
@@ -2482,7 +2479,12 @@ mod tests {
         static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let seq = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut path = std::env::temp_dir();
-        path.push(format!("zdbview_app_{}_{}.{}", std::process::id(), seq, ext));
+        path.push(format!(
+            "zdbview_app_{}_{}.{}",
+            std::process::id(),
+            seq,
+            ext
+        ));
         let _ = std::fs::remove_file(&path);
         path
     }
@@ -2501,8 +2503,10 @@ mod tests {
     fn sqlite_app() -> (App, std::path::PathBuf) {
         let path = scratch("db");
         let conn = rusqlite::Connection::open(&path).unwrap();
-        conn.execute("CREATE TABLE t (a TEXT, b TEXT, c TEXT)", []).unwrap();
-        conn.execute("INSERT INTO t VALUES ('x', 'y', 'z')", []).unwrap();
+        conn.execute("CREATE TABLE t (a TEXT, b TEXT, c TEXT)", [])
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES ('x', 'y', 'z')", [])
+            .unwrap();
         drop(conn);
         let store = Store::Sqlite(SqliteStore::open(&path).unwrap());
         (App::new(store, Some(ThemeName::NeonSprawl)), path)
@@ -2696,7 +2700,10 @@ mod tests {
 
         press(&mut app, 'i');
         press(&mut app, 'c'); // a hex digit, not the chooser
-        assert!(!app.ov.chooser, "c must not open the chooser inside the editor");
+        assert!(
+            !app.ov.chooser,
+            "c must not open the chooser inside the editor"
+        );
         // 'c' set the high nibble of 'o' (0x6f), keeping the low one.
         assert_eq!(app.hex.as_ref().unwrap().bytes[0], 0xcf);
         let _ = std::fs::remove_file(&path);
@@ -2742,7 +2749,10 @@ mod tests {
         app.screen = super::Screen::Detail;
         app.ov.toast("copied 12 bytes to clipboard");
         let rows = frame_rows(&mut app, 100, 40);
-        assert!(contains(&rows, "copied 12 bytes"), "toast missing on detail");
+        assert!(
+            contains(&rows, "copied 12 bytes"),
+            "toast missing on detail"
+        );
     }
 
     #[test]

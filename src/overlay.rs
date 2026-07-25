@@ -599,7 +599,14 @@ fn set_str(buf: &mut Buffer, x: u16, y: u16, s: &str, st: Style, mw: u16) {
 
 /// Fill a centered `bw`×`bh` box with `bg` and draw a double-line border.
 /// Returns the box's top-left corner.
-fn draw_box(buf: &mut Buffer, area: Rect, bw: u16, bh: u16, bg: Color, border: Style) -> (u16, u16) {
+fn draw_box(
+    buf: &mut Buffer,
+    area: Rect,
+    bw: u16,
+    bh: u16,
+    bg: Color,
+    border: Style,
+) -> (u16, u16) {
     let x0 = area.x + (area.width.saturating_sub(bw)) / 2;
     let y0 = area.y + (area.height.saturating_sub(bh)) / 2;
     let x1 = x0 + bw.saturating_sub(1);
@@ -706,17 +713,11 @@ fn help_sections(ctx: HelpCtx) -> Vec<HelpSection> {
             },
             HelpSection {
                 title: "LENGTH",
-                keys: &[
-                    ("o / O", "Insert 00 after/before"),
-                    ("x", "Delete byte"),
-                ],
+                keys: &[("o / O", "Insert 00 after/before"), ("x", "Delete byte")],
             },
             HelpSection {
                 title: "SAVE",
-                keys: &[
-                    ("^s", "Write value back"),
-                    ("q", "Back (twice if dirty)"),
-                ],
+                keys: &[("^s", "Write value back"), ("q", "Back (twice if dirty)")],
             },
         ];
     }
@@ -1132,7 +1133,9 @@ mod tests {
         assert_eq!(ov.theme.name, previewed);
         assert!(!ov.chooser);
         assert!(
-            ov.toast.as_ref().is_some_and(|t| t.text.starts_with("scheme:")),
+            ov.toast
+                .as_ref()
+                .is_some_and(|t| t.text.starts_with("scheme:")),
             "saving a scheme must toast"
         );
     }

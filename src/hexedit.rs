@@ -383,9 +383,7 @@ impl HexEdit {
         let mut lines: Vec<Line> = vec![
             Line::from(Span::styled(
                 header,
-                Style::default()
-                    .fg(t.accent)
-                    .add_modifier(Modifier::BOLD),
+                Style::default().fg(t.accent).add_modifier(Modifier::BOLD),
             )),
             Line::from(Span::styled(hint, Style::default().fg(t.dim))),
         ];
@@ -399,7 +397,9 @@ impl HexEdit {
         let hex_style = Style::default().fg(t.label);
         let text_style = Style::default().fg(t.primary);
         // The focused column gets the real cursor; the other one a dim mirror.
-        let focused = Style::default().fg(t.accent).add_modifier(Modifier::REVERSED);
+        let focused = Style::default()
+            .fg(t.accent)
+            .add_modifier(Modifier::REVERSED);
         let mirror = Style::default().fg(t.dim).add_modifier(Modifier::REVERSED);
         let (hex_cursor, ascii_cursor) = match self.focus {
             Column::Hex => (focused, mirror),
