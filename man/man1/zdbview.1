@@ -739,28 +739,43 @@ argument the picker is filled from two sources: the recent-files list, and a sca
 that runs on a background thread so the picker is usable immediately and fills in
 as results arrive.
 .PP
-The default roots are the dot-directories of
+The walk covers the whole machine, ending at
+.IR / .
+The roots before it are there for ordering, not reach: the dot-directories of
 .BR $HOME ,
 most-recently-modified first \(em the producers keep their stores in their own
 home directory, as in
 .IR ~/.zshrs/scripts.rkyv " and " ~/.zshrs/compsys.db
 \(em followed by
-.BR $XDG_CACHE_HOME , $XDG_DATA_HOME ,
+.BR $XDG_CACHE_HOME ", " $XDG_DATA_HOME ,
 the working directory, the files directly in
 .BR $HOME ,
-and finally
+and
 .IR "~/Library/Application Support" ,
-where a macOS application keeps its databases. That root is walked last because
-it is by far the largest, so the cheaper roots are never starved by it.
+where a macOS application keeps its databases. Those take milliseconds, so the
+rows most likely to be wanted are listed before the walk of
+.I /
+has gone far. A file reachable from two roots is listed once.
+.PP
+The walk descends only into directories on the same devices as
+.I /
+and
+.BR $HOME ,
+so a mounted volume \(em a USB disk, or an SMB or NFS share \(em is never walked.
+.I /System/Volumes
+is skipped for the same reason: on macOS it is a second mount of the disk being
+walked, and descending it lists everything a second time.
+.IR /dev ", " /proc ", " /sys ", " /net ", " /private/var/folders
+and the Spotlight indexes are skipped as holding nothing openable.
 Version-control, package-manager and toolchain caches, Chromium profile stores,
 and the rest of
 .I ~/Library
-are skipped; pass
+are skipped as noise; pass
 .B \-\-scan
-to look there anyway. The walk descends at most five levels and stops after 20
-seconds, with a one-million-entry backstop for a pathological tree, and is
-cancelled as soon as a file is chosen. The number of hits is not capped \(em a
-cap there would cut the walk mid-root and lose every root after it.
+to look there anyway. A ten-minute clock and a twenty-million-entry count are
+hang backstops rather than budgets, and the walk is cancelled as soon as a file
+is chosen. The number of hits is not capped \(em a cap there would cut the walk
+mid-root and lose every root after it.
 .PP
 A file is offered only when its contents say so: the SQLite header magic, a known
 rkyv shard magic, or a
@@ -770,17 +785,31 @@ their extension makes them a candidate. Recognized shards are listed first, then
 other rkyv archives, then databases, newest-first within each group; a file that
 is already in the recent list is not repeated.
 .PP
-A completed walk is saved to
+A walk is saved to
 .I $XDG_CACHE_HOME/zdbview/scan
-and reused for 24 hours, so a later start lists the files without walking again.
-The picker's title gives the saved list's age;
+and kept until the filesystem invalidates it. There is no expiry: an index of a
+disk nobody has touched still describes that disk, whatever its age. The index
+records the mtime of every directory that held a hit, and a start compares them.
+Unchanged means no walk at all.
+.PP
+What changed is walked again \(em those directories, not the disk. A machine
+being worked on always has something moving, and re-walking
+.I /
+for it would put the full walk back on every start, which is what keeping an
+index removes. The full walk runs on the first start, when the previous one did
+not finish, and when asked for. Quitting while a walk is running keeps what it
+found: an interrupted refresh re-flags only the directories it was reading, so
+opening a file two seconds in never costs a walk of the disk.
+.PP
+A database created in a directory that held none before is the case this cannot
+detect;
 .B r
 walks again,
 .B R
 walks again after discarding the saved list, and
 .B \-\-rescan
 does the same at startup. Entries whose file has disappeared are dropped when the
-list is loaded. Roots given with
+list is loaded, and their directory is walked again. Roots given with
 .B \-\-scan
 neither read nor write the saved scan, being a different set from the default
 roots.
@@ -910,9 +939,14 @@ longer exists are filtered out of the picker.
 .SH FILES
 .TP
 .I $XDG_CACHE_HOME/zdbview/scan
-The saved startup scan: a header line with a format version and the time of the
-walk, then one tab-separated record per file (kind, rank, size, mtime, format,
-path). Reused for 24 hours, rewritten whenever a walk completes.
+The saved startup scan: a header line with a format version, the time of the walk
+and whether it finished, then one tab-separated record per watched directory
+.RB ( d ,
+mtime, path) and one per file
+.RB ( f ,
+kind, rank, size, mtime, format, path). The directory records are what the
+staleness check reads; the file records are what the picker lists. Rewritten
+whenever a walk ends, finished or not.
 .TP
 .I $XDG_CACHE_HOME/zdbview/recent
 The recent-files list. Falls back to

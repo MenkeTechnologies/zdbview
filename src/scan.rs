@@ -19,6 +19,7 @@
 //!
 //! Anything else is dropped.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver};
@@ -30,15 +31,18 @@ use crate::store::Kind;
 /// Depth used for a producer's own directory (`~/.zshrs` and friends) and for
 /// the working directory: deep enough for `~/.zshrs/pkg/<plugin>/cache`.
 pub const DEEP: usize = 5;
-/// Give up after this long, so no filesystem can keep the scan running forever.
-/// This is the limit that is meant to bind, since it is the one the user feels.
-const TIME_BUDGET: Duration = Duration::from_secs(20);
-/// Backstop for a pathological tree, well above what [`TIME_BUDGET`] allows on
-/// any normal filesystem (a warm macOS home walks ~90k entries per second, so
-/// the clock runs out first). It used to be 60k, which a single machine's
-/// dot-directories exhausted in 0.6 s — the walk then stopped with 19 s of its
-/// budget unspent and never reached the later roots at all.
-const MAX_ENTRIES: usize = 1_000_000;
+/// Depth for the whole-filesystem root: what stops the walk there is the shape
+/// of the filesystem — the skip lists and the device boundary — not a level
+/// count, since a database can sit at any depth.
+pub const UNLIMITED: usize = usize::MAX;
+/// Hang backstop, not a budget: nothing may keep the walk running forever, but a
+/// full walk of `/` takes minutes and is meant to finish. It is affordable
+/// because the result is kept until the filesystem invalidates it (see
+/// [`Cached::refresh_roots`]) rather than re-walked on a clock.
+const TIME_BUDGET: Duration = Duration::from_secs(10 * 60);
+/// Backstop for a pathological tree, above what a whole-disk walk costs (a warm
+/// macOS root is a few million entries, and one walks ~90k entries per second).
+const MAX_ENTRIES: usize = 20_000_000;
 /// How much of a file is read when looking for a magic.
 const SNIFF: usize = 64 * 1024;
 /// Files larger than this are only sniffed at their head and tail.
@@ -103,16 +107,46 @@ const SKIP_DIRS: &[&str] = &[
     ".m2",
 ];
 
+/// Absolute directories never descended into once the walk reaches `/`. These
+/// are not "noise" like [`SKIP_DIRS`] — each one would break the walk outright:
+///
+/// * `/System/Volumes` holds the mount point of the data volume itself
+///   (`/System/Volumes/Data`), which is the same filesystem already reached
+///   through `/Users`; descending it walks the entire disk a second time under
+///   a second set of paths. `/Volumes` is the same for external and network
+///   disks, which the device check below also refuses.
+/// * `/net` and `/home` are automounter triggers: reading them mounts something.
+/// * `/dev`, `/proc`, `/sys` and `/run` are kernel-synthesized, and
+///   `/private/var/vm` is swap — files there are not databases in any sense.
+/// * `/private/var/folders` is the per-user temporary store: thousands of
+///   short-lived SQLite files that are gone before the picker could open them.
+const SKIP_PATHS: &[&str] = &[
+    "/System/Volumes",
+    "/Volumes",
+    "/net",
+    "/home",
+    "/cores",
+    "/dev",
+    "/proc",
+    "/sys",
+    "/run",
+    "/private/var/vm",
+    "/private/var/folders",
+    "/.Spotlight-V100",
+    "/.fseventsd",
+    "/.DocumentRevisions-V100",
+];
+
 /// Extensions worth sniffing. Everything else is skipped without being read,
 /// which is what keeps the scan cheap.
 const CANDIDATE_EXTS: &[&str] = &[
     "db", "sqlite", "sqlite3", "sqlitedb", "rkyv", "bin", "cache", "shard", "dat", "zwc",
 ];
 
-/// How long a saved scan is reused before the walk runs again.
-pub const CACHE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
-/// Format marker for the cache file, bumped if its layout changes.
-const CACHE_VERSION: u32 = 1;
+/// Format marker for the cache file, bumped if its layout changes. Version 2
+/// added the completeness flag and the watched-directory rows that replaced the
+/// old 24-hour expiry.
+const CACHE_VERSION: u32 = 2;
 
 /// One place to look, and how far down.
 #[derive(Debug, Clone)]
@@ -182,6 +216,18 @@ impl Scan {
 pub struct Cached {
     pub hits: Vec<Hit>,
     pub scanned_at: SystemTime,
+    /// Whether the walk that wrote this ran to completion. A walk cut short by
+    /// quitting the picker saves what it had with this clear, so the work is not
+    /// thrown away and the next start still knows the index is partial.
+    pub complete: bool,
+    /// Every directory that held a hit, plus the roots, with the mtime it had
+    /// when the scan was saved. A directory's mtime moves when an entry is
+    /// added, removed or renamed in it, which is exactly what invalidates the
+    /// list of files found there.
+    dirs: Vec<(PathBuf, SystemTime)>,
+    /// Directories of hits whose file has gone away. The listing was dropped on
+    /// load; the directory still has to be looked at again.
+    gone: Vec<PathBuf>,
 }
 
 impl Cached {
@@ -191,8 +237,65 @@ impl Cached {
             .unwrap_or_default()
     }
 
-    pub fn fresh(&self) -> bool {
-        self.age() < CACHE_TTL
+    /// What has to be walked to bring this index up to date, given the roots a
+    /// full walk would use.
+    ///
+    /// There is deliberately no clock in this: an index of a disk nobody touched
+    /// is as good a year later as it was the day it was written, and re-walking
+    /// `/` on a timer is work that answers a question already answered. Empty
+    /// means no walk at all.
+    ///
+    /// The one thing it cannot see is a database created in a directory that
+    /// held none before, since no directory it recorded changed. `r` in the
+    /// picker and `--rescan` exist for that.
+    pub fn refresh_roots(&self, full: &[Root]) -> Vec<Root> {
+        if !self.complete {
+            // A walk that never finished never described the whole disk.
+            return full.to_vec();
+        }
+        self.changed_dirs()
+            .into_iter()
+            .map(|p| Root::new(p, DEEP))
+            .collect()
+    }
+
+    /// The watched directories that have changed since they were read.
+    ///
+    /// This is what a refresh walks, rather than the whole disk again. A machine
+    /// that is being worked on always has *something* changing — a cache
+    /// directory written a minute ago — and re-walking `/` for it would mean
+    /// walking `/` on every start, which is the behaviour keeping the index was
+    /// meant to remove. What changed is a handful of directories; what did not
+    /// is still described correctly by the index, so it is left alone.
+    pub fn changed_dirs(&self) -> Vec<PathBuf> {
+        let mut out: Vec<PathBuf> = self
+            .dirs
+            .iter()
+            .filter(|(p, t)| dir_changed(p, *t))
+            .map(|(p, _)| p.clone())
+            .collect();
+        out.extend(self.gone.iter().cloned());
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+}
+
+/// Whether `dir` has changed since it was read at `when`. An unreadable or
+/// missing directory counts as changed: whatever the index said about it can no
+/// longer be trusted.
+fn dir_changed(dir: &Path, when: SystemTime) -> bool {
+    // Whole seconds on both sides: the index stores seconds, and comparing a
+    // full-precision mtime against a truncated one reports every directory as
+    // changed the moment it is written.
+    let secs = |t: SystemTime| {
+        t.duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+    };
+    match std::fs::metadata(dir).and_then(|m| m.modified()) {
+        Ok(now) => secs(now) > secs(when),
+        Err(_) => true,
     }
 }
 
@@ -214,9 +317,9 @@ pub fn load_cache() -> Option<Cached> {
 pub(crate) fn load_cache_from(path: &Path) -> Option<Cached> {
     let text = std::fs::read_to_string(path).ok()?;
     let mut lines = text.lines();
-    // Header: `# zdbview scan <version> <unix-seconds>`
+    // Header: `# zdbview scan <version> <unix-seconds> <complete>`
     let header: Vec<&str> = lines.next()?.split_whitespace().collect();
-    if header.len() != 5 || header[1] != "zdbview" || header[2] != "scan" {
+    if header.len() != 6 || header[1] != "zdbview" || header[2] != "scan" {
         return None;
     }
     if header[3].parse::<u32>().ok()? != CACHE_VERSION {
@@ -224,70 +327,151 @@ pub(crate) fn load_cache_from(path: &Path) -> Option<Cached> {
     }
     let secs: u64 = header[4].parse().ok()?;
     let scanned_at = SystemTime::UNIX_EPOCH + Duration::from_secs(secs);
+    let complete = header[5] == "1";
 
     let mut hits = Vec::new();
+    let mut dirs = Vec::new();
+    let mut gone = Vec::new();
     for line in lines {
         let f: Vec<&str> = line.split('\t').collect();
-        if f.len() != 6 {
-            continue;
-        }
-        let kind = match f[0] {
-            "sqlite" => Kind::Sqlite,
-            "rkyv" => Kind::Rkyv,
+        match f.first() {
+            // A watched directory: `d <mtime> <path>`.
+            Some(&"d") if f.len() == 3 => {
+                let when = SystemTime::UNIX_EPOCH + Duration::from_secs(f[1].parse().unwrap_or(0));
+                dirs.push((PathBuf::from(f[2]), when));
+            }
+            // A file: `f <kind> <rank> <size> <mtime> <format> <path>`.
+            Some(&"f") if f.len() == 7 => {
+                let kind = match f[1] {
+                    "sqlite" => Kind::Sqlite,
+                    "rkyv" => Kind::Rkyv,
+                    _ => continue,
+                };
+                let path = PathBuf::from(f[6]);
+                // A cached path that no longer resolves is not offered, and its
+                // directory is one the index no longer describes.
+                if !path.is_file() {
+                    gone.extend(path.parent().map(Path::to_path_buf));
+                    continue;
+                }
+                hits.push(Hit {
+                    path,
+                    kind,
+                    format: crate::formats::magic_label(f[5]),
+                    size: f[3].parse().unwrap_or(0),
+                    modified: SystemTime::UNIX_EPOCH
+                        + Duration::from_secs(f[4].parse().unwrap_or(0)),
+                    rank: f[2].parse().unwrap_or(3),
+                });
+            }
             _ => continue,
-        };
-        let path = PathBuf::from(f[5]);
-        // A cached path that no longer resolves is not offered.
-        if !path.is_file() {
-            continue;
         }
-        hits.push(Hit {
-            path,
-            kind,
-            format: crate::formats::magic_label(f[4]),
-            size: f[2].parse().unwrap_or(0),
-            modified: SystemTime::UNIX_EPOCH + Duration::from_secs(f[3].parse().unwrap_or(0)),
-            rank: f[1].parse().unwrap_or(3),
-        });
     }
-    Some(Cached { hits, scanned_at })
+    Some(Cached {
+        hits,
+        scanned_at,
+        complete,
+        dirs,
+        gone,
+    })
 }
 
-/// Save a completed scan so the next start does not have to walk again.
-/// Best-effort: a failure here only costs a rescan next time.
-pub fn save_cache(hits: &[Hit]) {
+/// What a save records beside the rows themselves.
+pub struct Save<'a> {
+    /// Every file the index lists, cached rows and new hits together.
+    pub hits: &'a [Hit],
+    /// The full default root set, watched so a database dropped straight into
+    /// one is noticed.
+    pub roots: &'a [Root],
+    /// Whether the walk covered everything it set out to. A cleared flag means
+    /// the whole walk runs again next start.
+    pub complete: bool,
+    /// Directories an interrupted *refresh* never finished reading. They are
+    /// recorded as never-read, so the next start walks those directories again
+    /// without having to distrust the rest of the index — quitting the picker
+    /// two seconds in must not cost a walk of the disk.
+    pub unfinished: &'a [Root],
+}
+
+/// Save a scan so the next start does not have to walk again. Best-effort: a
+/// failure here only costs a walk next time.
+pub fn save_cache(save: Save<'_>) {
     if let Some(path) = cache_file() {
-        save_cache_to(&path, hits);
+        save_cache_to(&path, save);
     }
 }
 
-pub(crate) fn save_cache_to(path: &Path, hits: &[Hit]) {
-    let now = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    let mut body = format!("# zdbview scan {CACHE_VERSION} {now}\n");
-    for h in hits {
-        let mtime = h
-            .modified
-            .duration_since(SystemTime::UNIX_EPOCH)
+pub(crate) fn save_cache_to(path: &Path, save: Save<'_>) {
+    let Save {
+        hits,
+        roots,
+        complete,
+        unfinished,
+    } = save;
+    let secs = |t: SystemTime| {
+        t.duration_since(SystemTime::UNIX_EPOCH)
             .unwrap_or_default()
-            .as_secs();
-        // Tab-separated so a path may contain spaces; paths with tabs or
-        // newlines are skipped rather than corrupting the file.
-        let p = match h.path.to_str() {
-            Some(p) if !p.contains('\t') && !p.contains('\n') => p,
-            _ => continue,
+            .as_secs()
+    };
+    // A path that cannot survive the round trip is dropped rather than
+    // corrupting the file: rows are tab-separated so paths may contain spaces.
+    let writable = |p: &Path| -> Option<String> {
+        match p.to_str() {
+            Some(s) if !s.contains('\t') && !s.contains('\n') => Some(s.to_string()),
+            _ => None,
+        }
+    };
+    let now = secs(SystemTime::now());
+    let flag = u8::from(complete);
+    let mut body = format!("# zdbview scan {CACHE_VERSION} {now} {flag}\n");
+
+    // The directories whose contents the index claims to describe: every one
+    // that held a hit, plus the roots themselves so a database dropped straight
+    // into one is noticed. Their mtimes are read now rather than during the
+    // walk, so a change made while the walk was running is missed exactly once.
+    let mut dirs: Vec<&Path> = hits.iter().filter_map(|h| h.path.parent()).collect();
+    dirs.extend(roots.iter().chain(unfinished).map(|r| r.path.as_path()));
+    dirs.sort_unstable();
+    dirs.dedup();
+    // Never the directory the index itself lives in: writing the index moves
+    // that directory's mtime, so watching it would mean every saved scan
+    // invalidates itself the moment it is written.
+    let own = path.parent();
+    for dir in dirs {
+        if Some(dir) == own {
+            continue;
+        }
+        let Some(p) = writable(dir) else { continue };
+        // A directory the walk did not finish reading is written as never-read,
+        // which is what makes the next start pick it up again.
+        if unfinished.iter().any(|r| r.path == dir) {
+            body.push_str(&format!("d\t0\t{p}\n"));
+            continue;
+        }
+        let Ok(mtime) = std::fs::metadata(dir).and_then(|m| m.modified()) else {
+            continue;
         };
+        body.push_str(&format!("d\t{}\t{}\n", secs(mtime), p));
+    }
+
+    // A saved list may be the cached rows plus what a later walk added, and the
+    // same file can be in both — the walk only knows about its own hits. First
+    // row wins, so the index never grows a second copy of a path.
+    let mut listed = HashSet::new();
+    for h in hits {
+        let Some(p) = writable(&h.path) else { continue };
+        if !listed.insert(&h.path) {
+            continue;
+        }
         body.push_str(&format!(
-            "{}\t{}\t{}\t{}\t{}\t{}\n",
+            "f\t{}\t{}\t{}\t{}\t{}\t{}\n",
             match h.kind {
                 Kind::Sqlite => "sqlite",
                 Kind::Rkyv => "rkyv",
             },
             h.rank,
             h.size,
-            mtime,
+            secs(h.modified),
             h.format.unwrap_or(""),
             p
         ));
@@ -317,13 +501,17 @@ pub fn clear_cache() {
 /// first, followed by the XDG cache/data directories and the working directory.
 /// `$HOME` itself contributes its own files but is not descended into.
 ///
-/// `~/Library/Application Support` comes last. It is where every macOS
+/// `~/Library/Application Support` comes next-to-last. It is where every macOS
 /// application keeps its databases — Ableton's `Live Database`, a browser
 /// profile, a DAW's plugin index — so leaving it out meant the picker could not
-/// offer the databases most worth opening on a Mac. It is walked last because it
-/// is by far the largest root (~230k entries on a working machine), and only
-/// this one subdirectory of `~/Library` is walked; the rest (`Caches`,
-/// `Containers`, `Preferences`, …) still needs `--scan`.
+/// offer the databases most worth opening on a Mac.
+///
+/// `/` is last, and covers everything the roots above already did. Those roots
+/// are kept anyway because order is what the user feels: the dot-directories are
+/// read in milliseconds, so the picker has the rows that matter before the walk
+/// has left `/bin`. Duplicate hits are dropped by the walk, so listing a
+/// directory twice costs a second `read_dir` of a warm directory and nothing
+/// else.
 pub fn default_roots() -> Vec<Root> {
     let home = std::env::var_os("HOME").map(PathBuf::from);
     let mut roots: Vec<Root> = Vec::new();
@@ -367,9 +555,11 @@ pub fn default_roots() -> Vec<Root> {
     // not. It is one `read_dir`, so it goes before the expensive root below and
     // can never be starved by it.
     roots.extend(home.as_ref().map(|h| Root::new(h.clone(), 0)));
-    // Where macOS applications keep their databases. Last, being the largest.
-    // On Linux the path does not exist and the `is_dir` filter below drops it.
+    // Where macOS applications keep their databases. On Linux the path does not
+    // exist and the `is_dir` filter below drops it.
     roots.extend(home.map(|h| Root::new(h.join("Library/Application Support"), DEEP)));
+    // Everything else on this machine.
+    roots.push(Root::new(PathBuf::from("/"), UNLIMITED));
 
     roots.retain(|r| r.path.is_dir());
     // Drop roots already covered by an earlier (equal-or-deeper) one.
@@ -392,12 +582,19 @@ pub fn spawn(roots: Vec<Root>) -> Scan {
     let cancel = Arc::new(AtomicBool::new(false));
     let flag = Arc::clone(&cancel);
     std::thread::spawn(move || {
-        let mut budget = Budget {
+        let mut w = Walk {
+            tx,
+            cancel: flag,
             examined: 0,
             deadline: Instant::now() + TIME_BUDGET,
+            devs: local_devices(),
+            sent: HashSet::new(),
         };
         for root in roots {
-            if walk(&root.path, 0, root.depth, &tx, &flag, &mut budget).is_break() {
+            // A root the user named is walked whatever disk it is on; only what
+            // lies *below* it has to stay on a permitted device.
+            w.devs.extend(device(&root.path));
+            if w.walk(&root.path, 0, root.depth).is_break() {
                 break;
             }
         }
@@ -412,70 +609,125 @@ pub fn spawn(roots: Vec<Root>) -> Scan {
 
 use std::ops::ControlFlow;
 
-/// The limits that stop a walk: entries seen and wall clock. Both measure what
-/// the walk *costs*. The number of hits is deliberately not a limit: a hit is a
-/// path the user asked to be shown, and stopping on them truncated the walk
-/// mid-root, so the roots after it were never looked at at all.
-struct Budget {
+/// Hard ceiling on recursion, so no directory tree can run the walk thread out
+/// of stack. Nothing legitimate nests this far; what does (a runaway symlink
+/// farm, a corrupted tree) is not worth the crash.
+const MAX_DEPTH: usize = 64;
+
+/// One walk of one set of roots: what it costs so far, and what it has already
+/// reported.
+///
+/// The limits that stop it are entries seen and wall clock — both measure cost.
+/// The number of hits is deliberately not a limit: a hit is a path the user
+/// asked to be shown, and stopping on them truncated the walk mid-root, so the
+/// roots after it were never looked at at all.
+struct Walk {
+    tx: mpsc::Sender<Hit>,
+    cancel: Arc<AtomicBool>,
     examined: usize,
     deadline: Instant,
+    /// Device ids the walk may descend into. Anything else is another disk —
+    /// an SMB share, a USB drive, or the data volume seen a second time through
+    /// its own mount point — and is left alone.
+    devs: HashSet<u64>,
+    /// Paths already reported, so the roots overlapping `/` cannot list the same
+    /// database twice.
+    sent: HashSet<PathBuf>,
 }
 
-impl Budget {
+impl Walk {
     fn spent(&self) -> bool {
         self.examined > MAX_ENTRIES || Instant::now() > self.deadline
     }
-}
 
-fn walk(
-    dir: &Path,
-    depth: usize,
-    max_depth: usize,
-    tx: &mpsc::Sender<Hit>,
-    cancel: &AtomicBool,
-    budget: &mut Budget,
-) -> ControlFlow<()> {
-    if depth > max_depth || cancel.load(Ordering::Relaxed) {
-        return ControlFlow::Continue(());
-    }
-    let entries = match std::fs::read_dir(dir) {
-        Ok(e) => e,
-        // Unreadable directories are normal (permissions); just move on.
-        Err(_) => return ControlFlow::Continue(()),
-    };
-    let mut subdirs: Vec<PathBuf> = Vec::new();
-    for entry in entries.flatten() {
-        budget.examined += 1;
-        if budget.spent() || cancel.load(Ordering::Relaxed) {
-            return ControlFlow::Break(());
+    /// Whether `dir` may be descended into: not on the never-walk list, and on a
+    /// disk this walk is allowed to touch.
+    fn may_descend(&self, dir: &Path, name: &str) -> bool {
+        if SKIP_DIRS.contains(&name) || SKIP_PATHS.contains(&dir.to_string_lossy().as_ref()) {
+            return false;
         }
-        let path = entry.path();
-        // `file_type` comes from the directory entry, so it costs no extra stat
-        // and does not follow symlinks — which is also how directory cycles are
-        // avoided.
-        let ft = match entry.file_type() {
-            Ok(ft) => ft,
-            Err(_) => continue,
+        match device(dir) {
+            Some(d) => self.devs.contains(&d),
+            // Unreadable: descending it would fail anyway.
+            None => false,
+        }
+    }
+
+    fn walk(&mut self, dir: &Path, depth: usize, max_depth: usize) -> ControlFlow<()> {
+        if depth > max_depth || depth > MAX_DEPTH || self.cancel.load(Ordering::Relaxed) {
+            return ControlFlow::Continue(());
+        }
+        let entries = match std::fs::read_dir(dir) {
+            Ok(e) => e,
+            // Unreadable directories are normal (permissions); just move on.
+            Err(_) => return ControlFlow::Continue(()),
         };
-        if ft.is_dir() {
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            if !SKIP_DIRS.contains(&name.as_ref()) {
-                subdirs.push(path);
+        let mut subdirs: Vec<PathBuf> = Vec::new();
+        for entry in entries.flatten() {
+            self.examined += 1;
+            if self.spent() || self.cancel.load(Ordering::Relaxed) {
+                return ControlFlow::Break(());
             }
-        } else if ft.is_file() {
-            if let Some(hit) = classify(&path) {
-                if tx.send(hit).is_err() {
-                    // The picker closed.
-                    return ControlFlow::Break(());
+            let path = entry.path();
+            // `file_type` comes from the directory entry, so it costs no extra
+            // stat and does not follow symlinks — which is also how directory
+            // cycles are avoided.
+            let ft = match entry.file_type() {
+                Ok(ft) => ft,
+                Err(_) => continue,
+            };
+            if ft.is_dir() {
+                let name = entry.file_name();
+                if self.may_descend(&path, &name.to_string_lossy()) {
+                    subdirs.push(path);
+                }
+            } else if ft.is_file() && !self.sent.contains(&path) {
+                if let Some(hit) = classify(&path) {
+                    self.sent.insert(path);
+                    if self.tx.send(hit).is_err() {
+                        // The picker closed.
+                        return ControlFlow::Break(());
+                    }
                 }
             }
         }
+        for sub in subdirs {
+            self.walk(&sub, depth + 1, max_depth)?;
+        }
+        ControlFlow::Continue(())
     }
-    for sub in subdirs {
-        walk(&sub, depth + 1, max_depth, tx, cancel, budget)?;
+}
+
+/// The device id of `path`, or `None` when it cannot be read.
+#[cfg(unix)]
+fn device(path: &Path) -> Option<u64> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(path).ok().map(|m| m.dev())
+}
+
+#[cfg(not(unix))]
+fn device(_path: &Path) -> Option<u64> {
+    Some(0)
+}
+
+/// The disks a default walk is allowed on: the one `/` is on and the one `$HOME`
+/// is on. On macOS those differ — `/` is the sealed read-only system volume and
+/// the home directory lives on the data volume reached through firmlinks — so
+/// both are needed, and naming exactly these two is what keeps every other
+/// mounted disk (network shares included) out of the walk.
+#[cfg(unix)]
+fn local_devices() -> HashSet<u64> {
+    let mut devs = HashSet::new();
+    devs.extend(device(Path::new("/")));
+    if let Some(home) = std::env::var_os("HOME") {
+        devs.extend(device(Path::new(&home)));
     }
-    ControlFlow::Continue(())
+    devs
+}
+
+#[cfg(not(unix))]
+fn local_devices() -> HashSet<u64> {
+    HashSet::from([0])
 }
 
 /// Decide whether `path` is openable, reading as little as possible.
@@ -717,8 +969,16 @@ mod tests {
         let hits = collect(&dir);
         assert_eq!(hits.len(), 2);
 
-        let file = dir.join("scan-cache");
-        save_cache_to(&file, &hits);
+        let file = tmpdir("idx1").join("scan");
+        save_cache_to(
+            &file,
+            Save {
+                hits: &hits,
+                roots: &[Root::new(dir.clone(), DEEP)],
+                complete: true,
+                unfinished: &[],
+            },
+        );
         let back = load_cache_from(&file).expect("cache must load");
         assert_eq!(back.hits.len(), 2);
         for (a, b) in hits.iter().zip(&back.hits) {
@@ -735,7 +995,11 @@ mod tests {
             };
             assert_eq!(secs(a.modified), secs(b.modified));
         }
-        assert!(back.fresh(), "a scan saved just now is fresh");
+        assert!(
+            back.refresh_roots(&[]).is_empty(),
+            "nothing has been touched, so the scan still describes the disk"
+        );
+        assert!(back.complete);
         assert!(back.age() < Duration::from_secs(5));
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -748,23 +1012,192 @@ mod tests {
         write(&db, &sqlite_bytes());
         let hits = collect(&dir);
         assert_eq!(hits.len(), 1);
-        let file = dir.join("scan-cache");
-        save_cache_to(&file, &hits);
+        let file = tmpdir("idx2").join("scan");
+        save_cache_to(
+            &file,
+            Save {
+                hits: &hits,
+                roots: &[],
+                complete: true,
+                unfinished: &[],
+            },
+        );
         std::fs::remove_file(&db).unwrap();
         let back = load_cache_from(&file).expect("header still parses");
         assert!(back.hits.is_empty(), "a deleted file must be dropped");
+        assert!(
+            !back.refresh_roots(&[]).is_empty(),
+            "a file that went away invalidates its directory"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A stale saved scan is reported as such, so the caller walks again.
+    /// Age alone is not staleness: an index of a disk nobody touched is still a
+    /// correct description of it, so no walk runs however old it is. This is the
+    /// whole point of dropping the 24-hour expiry.
     #[test]
-    fn cache_older_than_the_ttl_is_not_fresh() {
-        let cached = Cached {
-            hits: Vec::new(),
-            scanned_at: SystemTime::now() - CACHE_TTL - Duration::from_secs(60),
-        };
-        assert!(!cached.fresh());
-        assert!(cached.age() > CACHE_TTL);
+    fn an_untouched_scan_never_goes_stale_with_age() {
+        let dir = tmpdir("cache_age");
+        write(&dir.join("real.db"), &sqlite_bytes());
+        let hits = collect(&dir);
+        let file = tmpdir("idx3").join("scan");
+        save_cache_to(
+            &file,
+            Save {
+                hits: &hits,
+                roots: &[Root::new(dir.clone(), DEEP)],
+                complete: true,
+                unfinished: &[],
+            },
+        );
+
+        let mut back = load_cache_from(&file).expect("cache must load");
+        // A scan from a year ago, over a directory that has not changed since.
+        back.scanned_at -= Duration::from_secs(365 * 24 * 60 * 60);
+        assert!(back.age() > Duration::from_secs(300 * 24 * 60 * 60));
+        assert!(
+            back.refresh_roots(&[]).is_empty(),
+            "age is not evidence of anything"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A refresh walks the directories that moved, not the disk: on a machine
+    /// being worked on something is always changing, and re-walking `/` for it
+    /// would put the walk back on every start.
+    #[test]
+    fn only_the_changed_directories_are_offered_for_a_rewalk() {
+        let dir = tmpdir("cache_changed");
+        write(&dir.join("a/first.db"), &sqlite_bytes());
+        write(&dir.join("b/second.db"), &sqlite_bytes());
+        let hits = collect(&dir);
+        assert_eq!(hits.len(), 2);
+        let file = tmpdir("idx7").join("scan");
+        save_cache_to(
+            &file,
+            Save {
+                hits: &hits,
+                roots: &[Root::new(dir.clone(), DEEP)],
+                complete: true,
+                unfinished: &[],
+            },
+        );
+        assert!(load_cache_from(&file)
+            .expect("loads")
+            .changed_dirs()
+            .is_empty());
+
+        std::thread::sleep(Duration::from_millis(1100)); // mtime is whole seconds
+        write(&dir.join("b/third.db"), &sqlite_bytes());
+        assert_eq!(
+            load_cache_from(&file).expect("loads").changed_dirs(),
+            vec![dir.join("b")],
+            "only the directory that gained a file is worth walking"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Quitting the picker while a refresh is running must cost the refresh, not
+    /// the index: the directories it did not finish reading come back as ones to
+    /// walk, and everything else is still trusted — otherwise every session that
+    /// opens a file in the first seconds pays for a walk of the disk.
+    #[test]
+    fn an_interrupted_refresh_costs_only_the_directories_it_was_reading() {
+        let dir = tmpdir("cache_interrupted");
+        write(&dir.join("kept/real.db"), &sqlite_bytes());
+        let busy = dir.join("busy");
+        std::fs::create_dir_all(&busy).unwrap();
+        let hits = collect(&dir);
+        let file = tmpdir("idx8").join("scan");
+
+        // What park_scan writes when a refresh of `busy` is cut short.
+        save_cache_to(
+            &file,
+            Save {
+                hits: &hits,
+                roots: &[Root::new(dir.clone(), DEEP)],
+                complete: true,
+                unfinished: &[Root::new(busy.clone(), DEEP)],
+            },
+        );
+
+        let back = load_cache_from(&file).expect("cache must load");
+        assert!(back.complete, "the index as a whole is still good");
+        assert_eq!(back.hits.len(), 1, "the rows are kept");
+        assert_eq!(
+            back.refresh_roots(&[Root::new(dir.clone(), DEEP)])
+                .iter()
+                .map(|r| r.path.clone())
+                .collect::<Vec<_>>(),
+            vec![busy],
+            "only the directory the refresh was reading comes back"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// What does invalidate it: a directory it described has gained or lost an
+    /// entry since it was read.
+    #[test]
+    fn a_changed_directory_makes_the_scan_stale() {
+        let dir = tmpdir("cache_dirty");
+        write(&dir.join("real.db"), &sqlite_bytes());
+        let hits = collect(&dir);
+        let file = tmpdir("idx4").join("scan");
+        save_cache_to(
+            &file,
+            Save {
+                hits: &hits,
+                roots: &[Root::new(dir.clone(), DEEP)],
+                complete: true,
+                unfinished: &[],
+            },
+        );
+        assert!(load_cache_from(&file)
+            .expect("loads")
+            .refresh_roots(&[])
+            .is_empty());
+
+        // A second database appears beside the first, which the index cannot
+        // know about — but the directory's mtime moves, which it can.
+        std::thread::sleep(Duration::from_millis(1100)); // mtime is whole seconds
+        write(&dir.join("later.db"), &sqlite_bytes());
+        assert!(
+            !load_cache_from(&file)
+                .expect("loads")
+                .refresh_roots(&[])
+                .is_empty(),
+            "a new file in a watched directory must trigger a walk"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A walk cut short saves what it had, and says so: the rows are worth
+    /// keeping, but the index is not a complete description of the disk.
+    #[test]
+    fn a_partial_scan_is_kept_but_stays_stale() {
+        let dir = tmpdir("cache_partial");
+        write(&dir.join("real.db"), &sqlite_bytes());
+        let hits = collect(&dir);
+        let file = tmpdir("idx5").join("scan");
+        save_cache_to(
+            &file,
+            Save {
+                hits: &hits,
+                roots: &[Root::new(dir.clone(), DEEP)],
+                complete: false,
+                unfinished: &[],
+            },
+        );
+
+        let back = load_cache_from(&file).expect("cache must load");
+        assert_eq!(back.hits.len(), 1, "the work is not thrown away");
+        assert!(!back.complete);
+        assert_eq!(
+            back.refresh_roots(&[Root::new(dir.clone(), DEEP)]).len(),
+            1,
+            "an unfinished walk has to be finished, whatever changed"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Garbage, a foreign version, or a missing file must all fall back to a walk
@@ -775,11 +1208,21 @@ mod tests {
         let f = dir.join("c");
         write(&f, b"not a zdbview cache\n");
         assert!(load_cache_from(&f).is_none());
-        write(&f, b"# zdbview scan 99 1700000000\n");
+        write(&f, b"# zdbview scan 99 1700000000 1\n");
         assert!(load_cache_from(&f).is_none(), "version must be checked");
+        // The pre-2 format, which had no completeness flag, is not read as if it
+        // had one — it is simply walked again.
+        write(
+            &f,
+            b"# zdbview scan 1 1700000000\nsqlite\t2\t4096\t1\t\t/x.db\n",
+        );
+        assert!(
+            load_cache_from(&f).is_none(),
+            "an older layout is not parsed"
+        );
         assert!(load_cache_from(&dir.join("absent")).is_none());
         // A valid header with a corrupt row keeps the header and skips the row.
-        write(&f, b"# zdbview scan 1 1700000000\nnonsense\n");
+        write(&f, b"# zdbview scan 2 1700000000 1\nnonsense\n");
         let back = load_cache_from(&f).expect("header parses");
         assert!(back.hits.is_empty());
         let _ = std::fs::remove_dir_all(&dir);
@@ -847,10 +1290,10 @@ mod tests {
 
     /// `~/Library/Application Support` is where a macOS application keeps its
     /// database — Ableton's `Live Database` being the case that exposed its
-    /// absence — so it must be a default root, and it must be the last one so
-    /// the cheap roots are never starved by the largest.
+    /// absence — so it must be a default root, and it must come after the cheap
+    /// ones, which it must never starve.
     #[test]
-    fn application_support_is_the_last_default_root() {
+    fn application_support_is_walked_after_the_cheap_roots() {
         let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
             return;
         };
@@ -858,14 +1301,159 @@ mod tests {
         if !want.is_dir() {
             return; // Not macOS.
         }
-        let roots = default_roots();
         let want = want.canonicalize().unwrap_or(want);
+        let roots = default_roots();
+        let at = roots.iter().position(|r| r.path == want);
         assert_eq!(
-            roots.last().map(|r| (r.path.clone(), r.depth)),
-            Some((want, DEEP)),
-            "roots: {:?}",
+            at,
+            Some(roots.len() - 2),
+            "expected it second-to-last, before `/`: {:?}",
             roots.iter().map(|r| &r.path).collect::<Vec<_>>()
         );
+    }
+
+    /// The whole disk is a root: a database is worth finding wherever it lives,
+    /// and the index that says where they all are is kept until the filesystem
+    /// invalidates it, so the walk is paid for about once.
+    #[test]
+    fn the_whole_filesystem_is_the_last_root() {
+        let roots = default_roots();
+        let last = roots.last().expect("there is always `/`");
+        assert_eq!(last.path, PathBuf::from("/"));
+        assert_eq!(last.depth, UNLIMITED, "a database can sit at any depth");
+    }
+
+    /// The mount points that would break a walk of `/`: the data volume seen a
+    /// second time through `/System/Volumes/Data` (the whole disk again, under
+    /// different paths), and anything under `/Volumes` — a USB disk or, worse, a
+    /// network share walked over SMB.
+    #[test]
+    fn the_walk_refuses_other_volumes_and_the_second_view_of_this_one() {
+        for p in [
+            "/System/Volumes",
+            "/Volumes",
+            "/net",
+            "/private/var/folders",
+        ] {
+            assert!(SKIP_PATHS.contains(&p), "{p} must never be descended into");
+        }
+        let w = Walk {
+            tx: mpsc::channel().0,
+            cancel: Arc::new(AtomicBool::new(false)),
+            examined: 0,
+            deadline: Instant::now() + TIME_BUDGET,
+            devs: local_devices(),
+            sent: HashSet::new(),
+        };
+        for p in SKIP_PATHS {
+            let path = Path::new(p);
+            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            assert!(!w.may_descend(path, &name), "{p} was descended into");
+        }
+        // A directory on a disk this walk was never told about stays out of it,
+        // whatever its name.
+        let alien = Walk {
+            devs: HashSet::new(),
+            ..w
+        };
+        assert!(!alien.may_descend(Path::new("/usr"), "usr"));
+    }
+
+    /// The real thing, on the machine it is run on: a walk of every default root
+    /// including `/`. Ignored by default because it reads the whole disk, which
+    /// belongs in a deliberate run rather than in every `cargo test`:
+    ///
+    /// ```text
+    /// cargo test --bin zdbview -- --ignored --nocapture whole_disk
+    /// ```
+    ///
+    /// What it holds to is the part that cannot be checked on a temp directory:
+    /// the walk finishes inside its own backstop, reports each path once, and
+    /// never leaves the disks it was given — no mounted volume, and no second
+    /// pass over this one through `/System/Volumes/Data`.
+    #[test]
+    #[ignore = "reads the whole disk"]
+    fn a_whole_disk_walk_finishes_and_stays_on_its_own_disks() {
+        let started = Instant::now();
+        let allowed = local_devices();
+        let scan = spawn(default_roots());
+        let mut hits = Vec::new();
+        while let Ok(h) = scan.rx.recv() {
+            hits.push(h);
+        }
+        let took = started.elapsed();
+        eprintln!("{} files in {took:.1?}", hits.len());
+
+        assert!(
+            took < TIME_BUDGET,
+            "the walk hit its hang backstop instead of finishing"
+        );
+        let mut seen = HashSet::new();
+        for h in &hits {
+            assert!(seen.insert(h.path.clone()), "listed twice: {:?}", h.path);
+            assert!(
+                !h.path.starts_with("/System/Volumes"),
+                "the data volume was walked a second time: {:?}",
+                h.path
+            );
+            assert!(
+                !h.path.starts_with("/Volumes"),
+                "another volume was walked: {:?}",
+                h.path
+            );
+            let dev = h.path.parent().and_then(device).expect("readable parent");
+            assert!(
+                allowed.contains(&dev),
+                "{:?} is on device {dev}, which is not this machine's disk",
+                h.path
+            );
+        }
+    }
+
+    /// Saving the cached rows together with what a later walk found must not
+    /// leave two rows for one file: the walk cannot know what the cache already
+    /// listed, so the index is what has to hold the line.
+    #[test]
+    fn a_file_saved_twice_is_listed_once() {
+        let dir = tmpdir("cache_dup");
+        write(&dir.join("real.db"), &sqlite_bytes());
+        let hits = collect(&dir);
+        assert_eq!(hits.len(), 1);
+        // The shape park_scan writes: what was loaded, plus what the walk saw.
+        let both: Vec<Hit> = hits.iter().chain(hits.iter()).cloned().collect();
+        let file = tmpdir("idx6").join("scan");
+        save_cache_to(
+            &file,
+            Save {
+                hits: &both,
+                roots: &[],
+                complete: true,
+                unfinished: &[],
+            },
+        );
+
+        let back = load_cache_from(&file).expect("cache must load");
+        assert_eq!(back.hits.len(), 1, "got {:?}", back.hits);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `/` covers what the earlier roots already walked, so the same database is
+    /// reachable twice — it must still be reported once.
+    #[test]
+    fn a_file_under_two_roots_is_reported_once() {
+        let root = tmpdir("overlap");
+        write(&root.join("sub/dup.db"), &sqlite_bytes());
+        // The same tree as two roots, the way `~/.cache` and `/` overlap.
+        let scan = spawn(vec![
+            Root::new(root.join("sub"), DEEP),
+            Root::new(root.clone(), DEEP),
+        ]);
+        let mut hits = Vec::new();
+        while let Ok(h) = scan.rx.recv() {
+            hits.push(h);
+        }
+        assert_eq!(hits.len(), 1, "got {hits:?}");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// A hit is not a cost, so producing one must never stop the walk: a cap on

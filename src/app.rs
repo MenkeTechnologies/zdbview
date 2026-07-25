@@ -4294,8 +4294,13 @@ pub struct Picker<'a> {
     pub cached: Vec<crate::scan::Hit>,
     /// How old those rows are, for the title.
     pub cache_age: Option<std::time::Duration>,
-    /// A walk already in progress, when the cache was missing or stale.
+    /// A walk already in progress, when the index was missing or out of date.
     pub scan: Option<crate::scan::Scan>,
+    /// The roots that walk was given: the changed directories when it is a
+    /// refresh, the default set otherwise.
+    pub walking: Vec<crate::scan::Root>,
+    /// Whether that walk is a refresh of an index that is otherwise complete.
+    pub refresh: bool,
     /// Roots to walk when the user asks for a rescan with `r`.
     pub roots: Vec<crate::scan::Root>,
     /// Whether a finished walk may be written to appdata (not for `--scan`,
@@ -4303,9 +4308,68 @@ pub struct Picker<'a> {
     pub persist: bool,
 }
 
+/// The walk currently running, and what kind it is.
+struct Walking {
+    scan: Option<crate::scan::Scan>,
+    /// The roots this walk was given: the changed directories for a refresh, the
+    /// default set for a full walk.
+    roots: Vec<crate::scan::Root>,
+    /// Whether the index being updated is otherwise complete, i.e. this walk is
+    /// a refresh rather than a walk of everything.
+    refresh: bool,
+    /// The default root set, watched by the index whatever this walk covers.
+    default: Vec<crate::scan::Root>,
+}
+
+impl Walking {
+    /// Every directory the saved index watches: the default roots, plus whatever
+    /// this walk covered.
+    fn watched(&self) -> Vec<crate::scan::Root> {
+        let mut all = self.default.clone();
+        all.extend(self.roots.iter().cloned());
+        all
+    }
+
+    /// Write the index as it stands after a walk that ran to the end.
+    fn save_finished(&self, hits: &[crate::scan::Hit]) {
+        crate::scan::save_cache(crate::scan::Save {
+            hits,
+            roots: &self.watched(),
+            complete: true,
+            unfinished: &[],
+        });
+    }
+}
+
+/// Stop a walk that is still running and keep what it found so far.
+///
+/// A walk of the whole filesystem takes minutes, so throwing it away because a
+/// file was picked in the first second means paying for all of it again on the
+/// next start. What the save records depends on which walk was cut short: a
+/// refresh leaves the index whole and re-flags only the directories it did not
+/// finish reading, while a full walk that never finished has to run again.
+fn park_scan(walk: &mut Walking, scanned: &mut Vec<crate::scan::Hit>, persist: bool) {
+    let Some(sc) = walk.scan.as_mut() else { return };
+    sc.cancel();
+    scanned.extend(sc.drain());
+    if persist && !scanned.is_empty() {
+        crate::scan::save_cache(crate::scan::Save {
+            hits: scanned,
+            roots: &walk.watched(),
+            complete: walk.refresh,
+            unfinished: if walk.refresh { &walk.roots } else { &[] },
+        });
+    }
+}
+
 pub fn pick_mru(terminal: &mut DefaultTerminal, mut p: Picker<'_>) -> Result<Option<Picked>> {
     let entries = p.recent;
-    let mut scan = p.scan.take();
+    let mut walk = Walking {
+        scan: p.scan.take(),
+        roots: std::mem::take(&mut p.walking),
+        refresh: p.refresh,
+        default: p.roots.clone(),
+    };
     let mut cache_age = p.cache_age;
     // Hits are kept as well as merged so a finished walk can be saved.
     let mut scanned: Vec<crate::scan::Hit> = std::mem::take(&mut p.cached);
@@ -4334,7 +4398,7 @@ pub fn pick_mru(terminal: &mut DefaultTerminal, mut p: Picker<'_>) -> Result<Opt
     loop {
         // Pull in whatever the scan thread produced since the last frame, and
         // save the finished list so the next start does not walk again.
-        let scanning = match scan.as_mut() {
+        let scanning = match walk.scan.as_mut() {
             Some(sc) => {
                 let hits = sc.drain();
                 scanned.extend(hits.iter().cloned());
@@ -4343,10 +4407,10 @@ pub fn pick_mru(terminal: &mut DefaultTerminal, mut p: Picker<'_>) -> Result<Opt
                     Some(sc.found)
                 } else {
                     if p.persist {
-                        crate::scan::save_cache(&scanned);
+                        walk.save_finished(&scanned);
                         cache_age = Some(std::time::Duration::ZERO);
                     }
-                    scan = None;
+                    walk.scan = None;
                     None
                 }
             }
@@ -4418,11 +4482,12 @@ pub fn pick_mru(terminal: &mut DefaultTerminal, mut p: Picker<'_>) -> Result<Opt
                     match action {
                         crate::monitor::Action::None => {}
                         crate::monitor::Action::Back => monitor = None,
-                        crate::monitor::Action::Quit => return Ok(None),
+                        crate::monitor::Action::Quit => {
+                            park_scan(&mut walk, &mut scanned, p.persist);
+                            return Ok(None);
+                        }
                         crate::monitor::Action::Open(path) => {
-                            if let Some(sc) = &scan {
-                                sc.cancel();
-                            }
+                            park_scan(&mut walk, &mut scanned, p.persist);
                             return Ok(Some(Picked {
                                 path,
                                 theme: ov.theme,
@@ -4432,9 +4497,7 @@ pub fn pick_mru(terminal: &mut DefaultTerminal, mut p: Picker<'_>) -> Result<Opt
                         // picker `F` opens the database and lands in the monitor
                         // there instead of walking from nowhere.
                         crate::monitor::Action::Frames(path) => {
-                            if let Some(sc) = &scan {
-                                sc.cancel();
-                            }
+                            park_scan(&mut walk, &mut scanned, p.persist);
                             return Ok(Some(Picked {
                                 path,
                                 theme: ov.theme,
@@ -4472,9 +4535,7 @@ pub fn pick_mru(terminal: &mut DefaultTerminal, mut p: Picker<'_>) -> Result<Opt
                     let row = (m.row as usize).saturating_sub(1);
                     let clicked = row + list_offset;
                     if row < page && clicked < view.len() {
-                        if let Some(sc) = &scan {
-                            sc.cancel();
-                        }
+                        park_scan(&mut walk, &mut scanned, p.persist);
                         // Hand over the scheme on screen, so the file opens in it.
                         return Ok(pick(clicked).map(|path| Picked {
                             path,
@@ -4538,9 +4599,7 @@ pub fn pick_mru(terminal: &mut DefaultTerminal, mut p: Picker<'_>) -> Result<Opt
                     sel = 0;
                 }
                 KeyCode::Char('q') | KeyCode::Esc => {
-                    if let Some(sc) = &scan {
-                        sc.cancel();
-                    }
+                    park_scan(&mut walk, &mut scanned, p.persist);
                     return Ok(None);
                 }
                 KeyCode::Char('/') => {
@@ -4574,14 +4633,20 @@ pub fn pick_mru(terminal: &mut DefaultTerminal, mut p: Picker<'_>) -> Result<Opt
                     if key.code == KeyCode::Char('R') {
                         crate::scan::clear_cache();
                     }
-                    if let Some(sc) = &scan {
+                    // Not parked: a rescan replaces the index rather than adding
+                    // to it, and `R` has just deleted the saved one on purpose.
+                    if let Some(sc) = &walk.scan {
                         sc.cancel();
                     }
                     scanned.clear();
                     choices.retain(|c| c.opened.is_some());
                     sel = 0;
                     cache_age = None;
-                    scan = Some(crate::scan::spawn(p.roots.clone()));
+                    // Everything again, from nothing: a walk of every root, whose
+                    // result is the whole index rather than a patch to one.
+                    walk.roots = p.roots.clone();
+                    walk.refresh = false;
+                    walk.scan = Some(crate::scan::spawn(p.roots.clone()));
                     ov.toast("rescanning");
                 }
                 KeyCode::Char('G') => sel = last,
@@ -4593,9 +4658,7 @@ pub fn pick_mru(terminal: &mut DefaultTerminal, mut p: Picker<'_>) -> Result<Opt
                 KeyCode::Enter => {
                     if let Some(path) = pick(sel) {
                         // Nothing more to walk once a file is chosen.
-                        if let Some(sc) = &scan {
-                            sc.cancel();
-                        }
+                        park_scan(&mut walk, &mut scanned, p.persist);
                         return Ok(Some(Picked {
                             path,
                             theme: ov.theme,

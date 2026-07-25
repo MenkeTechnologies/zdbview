@@ -629,8 +629,8 @@ fn drive(
     }
 }
 
-/// Show the picker: recent files, plus scan rows taken from appdata while they
-/// are still fresh, else from a walk started here.
+/// Show the picker: recent files, plus the saved scan rows, plus whatever a walk
+/// started here adds to them.
 fn pick(
     cli: &Cli,
     terminal: &mut DefaultTerminal,
@@ -656,15 +656,21 @@ fn pick(
     let saved = if cli.no_scan || cli.rescan || custom_roots {
         None
     } else {
-        scan::load_cache().filter(|c| c.fresh())
+        scan::load_cache()
     };
-    // A fresh saved scan is used as-is, so no walk runs on this start.
-    let (cached, cache_age, walk) = match saved {
+    // The saved rows are shown either way; what the check decides is how much of
+    // the disk is walked behind them. An index the filesystem has not
+    // invalidated means no walk at all, however old it is; one whose watched
+    // directories have moved means a walk of those directories, not of `/`; an
+    // index left unfinished means the full walk again.
+    let (cached, cache_age, todo, refresh) = match saved {
         Some(c) => {
             let age = c.age();
-            (c.hits, Some(age), false)
+            let todo = c.refresh_roots(&roots);
+            (c.hits, Some(age), todo, c.complete)
         }
-        None => (Vec::new(), None, !cli.no_scan),
+        None if cli.no_scan => (Vec::new(), None, Vec::new(), false),
+        None => (Vec::new(), None, roots.clone(), false),
     };
 
     app::pick_mru(
@@ -674,7 +680,10 @@ fn pick(
             theme: scheme,
             cached,
             cache_age,
-            scan: walk.then(|| scan::spawn(roots.clone())),
+            scan: (!todo.is_empty()).then(|| scan::spawn(todo.clone())),
+            walking: todo,
+            refresh,
+            // What `r` walks: the whole default set, never the refresh subset.
             roots,
             persist: !custom_roots,
         },

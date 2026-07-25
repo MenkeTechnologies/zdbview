@@ -97,29 +97,50 @@ by path as you type (`zdbview — 1/127 files  /compsys` with everything else go
 `Enter` keeps the filter, `Esc` clears it, and a second `Esc` quits. Recent rows show their age, scanned rows their size,
 and the bottom line names the recognized format of the selected row.
 
-**The walk does not repeat on every start.** A completed scan is saved to
-`$XDG_CACHE_HOME/zdbview/scan` (or `~/.cache/zdbview/scan`) and reused for 24
-hours, so later starts show the list immediately — measured here, 127 hits take
-~550 ms to walk and ~0.4 ms to load back from the 12 KB cache. The title says how
-old the saved list is (`scan 3h old · r rescans`); `r` walks again, `R` walks again
-after discarding the saved list, and `--rescan` does the same from the command
-line. Entries whose file has since disappeared are dropped on load, and `--scan`
-roots neither read nor write the cache since they are not the default set.
+**The walk is paid for once, not on a timer.** A scan is saved to
+`$XDG_CACHE_HOME/zdbview/scan` (or `~/.cache/zdbview/scan`) and kept until the
+filesystem invalidates it — there is no expiry, because an index of a disk nobody
+touched still describes that disk. The index records the mtime of every directory
+that held a hit, and a start compares them: unchanged means no walk at all,
+however old the index is.
 
-**Where it looks** — the producers keep their stores in their own home directory
-(`~/.zshrs/scripts.rkyv`, `~/.zshrs/compsys.db`, `~/.pythonrs/scripts.rkyv`), so
-the default roots are the dot-directories of `$HOME` (most-recently-touched
-first), the XDG cache and data directories, the working directory, `$HOME`'s own
-files, and finally `~/Library/Application Support` — where a macOS application
-keeps its databases (Ableton's `Live Database`, a browser profile, a plugin
-index). That last root is walked last because it is the largest, so the cheap
-roots are never starved by it. The rest of `~/Library`, VCS and package-manager
-caches, and Chromium profile stores are skipped — that is what keeps the list
-about your data; reach the rest with `--scan`. The walk is bounded by depth (5
-levels) and by a 20 s clock, with a 1M-entry backstop for a pathological tree,
-and stops as soon as you pick. Finding a file is never a reason to stop: the
-number of hits is not capped, since a cap there would cut the walk mid-root and
-lose every root after it.
+What did change is walked again — **those directories, not the disk.** A machine
+being worked on always has something moving (a cache written a minute ago), and
+re-walking `/` for it would put the full walk back on every start, which is the
+behavior keeping an index was meant to remove. A walk of everything happens on
+the first run, when the previous one never finished, and when asked for. Quitting
+mid-walk keeps what was found: an interrupted refresh re-flags only the
+directories it was reading, so opening a file two seconds in never costs a walk
+of the disk.
+
+The one case this cannot see is a database created in a directory that never held
+one; `r` in the picker and `--rescan` on the command line are for that. `R` walks
+again after discarding the saved list. `--scan` roots neither read nor write the
+saved scan, since they are not the default set.
+
+**Where it looks** — everything, ending at `/`. The earlier roots exist for
+ordering rather than reach: the producers keep their stores in their own home
+directory (`~/.zshrs/scripts.rkyv`, `~/.zshrs/compsys.db`,
+`~/.pythonrs/scripts.rkyv`), so the dot-directories of `$HOME`
+(most-recently-touched first), the XDG cache and data directories, the working
+directory, `$HOME`'s own files and `~/Library/Application Support` are read first
+— they take milliseconds, so the rows that matter are on screen before the walk
+has left `/bin`. Then `/` covers the rest of the machine at any depth. A file
+reachable from two roots is still listed once.
+
+What it stays out of is other disks: the walk descends only into what sits on the
+same devices as `/` and `$HOME`, so a mounted USB disk, and above all an SMB or
+NFS share, is never walked over the network. `/System/Volumes` is skipped for the
+same reason — on macOS it is a second door onto the disk you are already walking,
+and going through it walks everything twice. `/dev`, `/proc`, `/sys`, `/net`,
+`/private/var/folders` and the Spotlight indexes are skipped as never containing
+anything openable. VCS and package-manager caches, the rest of `~/Library`, and
+Chromium profile stores are skipped as noise — that is what keeps the list about
+your data. Measured on this machine, a full walk of `/` finds 553 files in ~96 s
+(debug build) and loads back from the saved index in under a millisecond.
+Finding a file is never a reason to stop: the number of hits is not capped, since
+a cap there would cut the walk mid-root and lose every root after it. A 10-minute
+clock and a 20M-entry count are hang backstops, not budgets.
 
 **What counts as a hit** — the SQLite header magic, or one of the rkyv shard
 magics, or a `.rkyv` name (the header-less hash-keyed shards carry no magic).
