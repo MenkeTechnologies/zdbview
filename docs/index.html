@@ -183,22 +183,24 @@ zdbview</pre>
             <tr><td>3 — Hex</td><td><code>xxd</code>-style dump: 16 bytes per line as <code>offset&nbsp;&nbsp;hex&nbsp;&nbsp;|ascii|</code>.</td></tr>
           </tbody>
         </table>
-        <p><strong>Recognized formats</strong> — the script and heap caches the fusevm-hosted languages write, all rkyv 0.7:</p>
+        <p><strong>Recognized formats</strong> — every magic the registry knows, with the little-endian <code>u32</code> as it appears in the header. The magic sits wherever rkyv placed the root, which is near the <em>end</em> of the file, not at offset 0:</p>
         <table class="doc-table">
-          <thead><tr><th>Format</th><th>Magic</th><th>Detected by</th><th>Record key</th></tr></thead>
+          <thead><tr><th>Format</th><th>Magic</th><th>u32 (LE)</th><th>Detected by</th><th>Record key</th></tr></thead>
           <tbody>
-            <tr><td>zshrs script cache</td><td><code>ZRSC</code></td><td>magic</td><td>script path</td></tr>
-            <tr><td>zshrs autoload cache</td><td><code>ZRAL</code></td><td>magic</td><td>function name</td></tr>
-            <tr><td>strykelang script cache</td><td><code>STRY</code></td><td>magic (native + compat layout)</td><td>script path</td></tr>
-            <tr><td>awkrs script cache</td><td><code>AWKR</code></td><td>magic</td><td>script path</td></tr>
-            <tr><td>vimlrs script cache</td><td><code>VIML</code></td><td>magic</td><td>script path</td></tr>
-            <tr><td>elisprs heap-image cache</td><td><code>ELSP</code></td><td>magic</td><td>script path</td></tr>
-            <tr><td>pythonrs bytecode cache</td><td><em>none</em></td><td>validated try-decode</td><td>source path</td></tr>
-            <tr><td>rubylang / arb script cache</td><td><em>none</em></td><td>validated try-decode</td><td>u64 content hash</td></tr>
+            <tr><td>zshrs script cache</td><td><code>ZRSC</code></td><td><code>0x5A525343</code></td><td>magic</td><td>script path</td></tr>
+            <tr><td>zshrs autoload cache</td><td><code>ZRAL</code></td><td><code>0x5A52414C</code></td><td>magic</td><td>function name</td></tr>
+            <tr><td>zshrs canonical shard</td><td><code>ZSHS</code></td><td><code>0x5A534853</code></td><td>magic, or a validated unstamped header (the recorder writes <code>magic = 0</code>)</td><td><code>section/key</code>, <code>section[i]</code>, <code>extras/&lt;sub&gt;/&lt;key&gt;</code></td></tr>
+            <tr><td>zshrs system shard</td><td><code>ZSHS</code></td><td><code>0x5A534853</code></td><td>magic — second layout under the same magic, a flat blob map</td><td>entry key</td></tr>
+            <tr><td>strykelang script cache</td><td><code>STRY</code></td><td><code>0x53545259</code></td><td>magic (native v4 + compat layout)</td><td>script path</td></tr>
+            <tr><td>awkrs script cache</td><td><code>AWKR</code></td><td><code>0x41574B52</code></td><td>magic</td><td>script path</td></tr>
+            <tr><td>vimlrs script cache</td><td><code>VIML</code></td><td><code>0x56494D4C</code></td><td>magic</td><td>script path</td></tr>
+            <tr><td>elisprs heap-image cache</td><td><code>ELSP</code></td><td><code>0x454C5350</code></td><td>magic</td><td>script path</td></tr>
+            <tr><td>pythonrs bytecode cache</td><td><em>none</em></td><td>—</td><td>validated try-decode</td><td>source path</td></tr>
+            <tr><td>rubylang / arb script cache</td><td><em>none</em></td><td>—</td><td>validated try-decode</td><td>u64 content hash</td></tr>
           </tbody>
         </table>
         <p>Magic-bearing formats are matched by header; the header-less hash-keyed shards are attempted last and gated by rkyv validation, so an unrelated archive falls through to the structural view instead of mis-decoding. Adding a format is a single registry entry: copy the producer's archive type — same rkyv version (0.7) and features (<code>validation</code>, <code>archive_le</code>, <code>size_32</code>), same field order and types — and map its magic, or add a validated try-decode for a header-less one.</p>
-        <p class="doc-note">The Records view is read-only in the UI. <code>formats.rs</code> already carries a validated delete-and-reserialize path with tests, but no key is bound to it — writing a shard back means reproducing the producer's exact layout, and a wrong write corrupts a cache the producer then mmaps.</p>
+        <p class="doc-note">The Records view is editable: <code>a</code> add, <code>e</code> edit, <code>r</code> rename, <code>d</code> delete. Each change deserializes the shard, mutates the owned value, re-serializes the whole archive and swaps it in atomically (temp + rename). Because the registry types are byte-compatible with the producer, the re-serialized archive is byte-identical to what the producing host would have written, so it keeps reading the shard normally — verified by round-tripping every real cache. Unrecognized archives stay structural and read-only, because guessing field boundaries in an untyped image would produce plausible, wrong output.</p>
       </section>
 
       <section class="tutorial-section">
