@@ -453,8 +453,9 @@ pub struct RowsView {
     /// Primary-key columns, in key order, for a table with no rowid. Empty when
     /// the table has one, since then the rowid is the better handle.
     pub primary_key: Vec<String>,
-    /// Rows the filter leaves. A lower bound unless `total_exact`, because the
-    /// exact figure costs a full scan — see [`SqliteStore::count_bounded`].
+    /// Rows the filter leaves. A lower bound unless `total_exact`, since the exact
+    /// figure costs a full scan: a page only proves what its one extra fetched row
+    /// shows, and the real total comes from [`SqliteStore::count_exact`].
     pub total: i64,
     /// `total` is the real total, not "at least this many".
     pub total_exact: bool,
@@ -610,11 +611,11 @@ impl SqliteStore {
     /// The exact number of rows the filter leaves, counted on every core.
     ///
     /// One SQLite statement runs on one thread, so the table is cut into rowid
-    /// ranges ([`ShardPlan`]) and each range counted on its own connection. On a
+    /// ranges (`rowid_ranges`) and each range counted on its own connection. On a
     /// 6.5M-row table with a filter that matches 270k rows this takes the count
-    /// from 4.16 s to well under a second; a table under
-    /// [`PARALLEL_COUNT_FLOOR`] rows, or one with no rowid to cut on, is counted
-    /// by a single statement because the setup would cost more than the scan.
+    /// from 9.2 s to 1.6 s; a table whose rowid span is under
+    /// `PARALLEL_COUNT_FLOOR`, or one with no rowid to cut on, is counted by a
+    /// single statement because the setup would cost more than the scan.
     pub fn count_exact(&self, table: &str, filter: &str) -> Result<i64> {
         let meta = self.meta(table)?;
         // The filter's parameters are `?1..`, so the two range bounds take the

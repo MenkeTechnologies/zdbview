@@ -582,8 +582,8 @@ impl SqlEdit {
         self.candidates_at(prefix, at)
     }
 
-    /// [`Self::candidates`] with the word's start given, for the completion path
-    /// that has already computed it.
+    /// `candidates` with the word's start given, for the completion path that has
+    /// already computed it.
     fn candidates_at(&self, prefix: &str, at: usize) -> Vec<String> {
         let p = prefix.to_lowercase();
         let mut out: Vec<String> = Vec::new();
