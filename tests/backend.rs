@@ -192,6 +192,22 @@ fn detect_sqlite_by_magic_and_extension() {
 
 /// Build a table whose natural rowid order differs from every column order, so a
 /// wrong ORDER BY cannot accidentally pass.
+/// A row query over table `t`, which is what every search test here searches.
+fn rq<'a>(
+    columns: &'a [String],
+    term: &'a str,
+    sort: Option<&'a Sort>,
+    filter: &'a str,
+) -> sqlite::RowQuery<'a> {
+    sqlite::RowQuery {
+        table: "t",
+        columns,
+        term,
+        sort,
+        filter,
+    }
+}
+
 fn sortable_db(name: &str) -> (std::path::PathBuf, SqliteStore) {
     let path = tmp(name);
     let _ = std::fs::remove_file(&path);
@@ -294,13 +310,13 @@ fn search_and_ordinals_follow_the_sorted_order() {
     // Every row matches "e"? No — apple, date, pear do. From apple, forward is
     // date (next in sorted order), not fig or the next rowid.
     let next = store
-        .find_row("t", &cols, "e", rowid_of("apple"), true, Some(&asc))
+        .find_row(&rq(&cols, "e", Some(&asc), ""), rowid_of("apple"), true)
         .unwrap();
     assert_eq!(next, Some(rowid_of("date")));
 
     // Backward from pear is date as well.
     let prev = store
-        .find_row("t", &cols, "e", rowid_of("pear"), false, Some(&asc))
+        .find_row(&rq(&cols, "e", Some(&asc), ""), rowid_of("pear"), false)
         .unwrap();
     assert_eq!(prev, Some(rowid_of("date")));
 
@@ -308,19 +324,19 @@ fn search_and_ordinals_follow_the_sorted_order() {
     // first match in display order.
     assert_eq!(
         store
-            .find_row("t", &cols, "e", rowid_of("pear"), true, Some(&asc))
+            .find_row(&rq(&cols, "e", Some(&asc), ""), rowid_of("pear"), true)
             .unwrap(),
         None
     );
     assert_eq!(
         store
-            .find_row_edge("t", &cols, "e", true, Some(&asc))
+            .find_row_edge(&rq(&cols, "e", Some(&asc), ""), true)
             .unwrap(),
         Some(rowid_of("apple"))
     );
     assert_eq!(
         store
-            .find_row_edge("t", &cols, "e", false, Some(&asc))
+            .find_row_edge(&rq(&cols, "e", Some(&asc), ""), false)
             .unwrap(),
         Some(rowid_of("pear"))
     );
@@ -328,18 +344,23 @@ fn search_and_ordinals_follow_the_sorted_order() {
     // Ordinals are positions in the sorted view: apple is 1st, pear 4th.
     assert_eq!(
         store
-            .rowid_ordinal("t", rowid_of("apple"), Some(&asc))
+            .rowid_ordinal("t", rowid_of("apple"), Some(&asc), "")
             .unwrap(),
         1
     );
     assert_eq!(
         store
-            .rowid_ordinal("t", rowid_of("pear"), Some(&asc))
+            .rowid_ordinal("t", rowid_of("pear"), Some(&asc), "")
             .unwrap(),
         4
     );
     // Without a sort the same rowid is placed by rowid instead.
-    assert_eq!(store.rowid_ordinal("t", rowid_of("pear"), None).unwrap(), 1);
+    assert_eq!(
+        store
+            .rowid_ordinal("t", rowid_of("pear"), None, "")
+            .unwrap(),
+        1
+    );
 
     // Descending flips both the stepping direction and the ordinals.
     let desc = Sort {
@@ -348,13 +369,13 @@ fn search_and_ordinals_follow_the_sorted_order() {
     };
     assert_eq!(
         store
-            .find_row("t", &cols, "e", rowid_of("pear"), true, Some(&desc))
+            .find_row(&rq(&cols, "e", Some(&desc), ""), rowid_of("pear"), true)
             .unwrap(),
         Some(rowid_of("date"))
     );
     assert_eq!(
         store
-            .rowid_ordinal("t", rowid_of("pear"), Some(&desc))
+            .rowid_ordinal("t", rowid_of("pear"), Some(&desc), "")
             .unwrap(),
         1
     );
@@ -382,7 +403,7 @@ fn sort_column_names_are_escaped() {
     };
     let v = store.rows("t", 100, 0, Some(&sort), "").unwrap();
     assert_eq!(col(&v, 0), ["a", "b"]);
-    assert_eq!(store.rowid_ordinal("t", 2, Some(&sort)).unwrap(), 1);
+    assert_eq!(store.rowid_ordinal("t", 2, Some(&sort), "").unwrap(), 1);
     let _ = std::fs::remove_file(&path);
 }
 
@@ -873,5 +894,82 @@ fn import_maps_columns_by_header_and_rolls_back_a_bad_file() {
         2,
         "the good row from the ragged file must not survive"
     );
+    let _ = std::fs::remove_file(&path);
+}
+
+/// A filtered grid lists a subset, so `n` has to walk that subset and the ordinal
+/// that positions the row has to count only what is listed. Before this, a search
+/// with a filter active jumped to a hidden row and scrolled to the wrong page.
+#[test]
+fn search_and_ordinals_stay_inside_the_filter() {
+    let path = tmp("filtered_search.db");
+    let _ = std::fs::remove_file(&path);
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE t (name TEXT, note TEXT);
+         INSERT INTO t VALUES
+            ('keep one',   'match'),
+            ('drop two',   'match'),
+            ('keep three', 'match'),
+            ('drop four',  'match');",
+    )
+    .unwrap();
+    drop(conn);
+    let store = SqliteStore::open(&path).unwrap();
+    let cols = store.columns("t").unwrap();
+    let name_of = |rid: i64| -> String {
+        let v = store.rows("t", 10, 0, None, "").unwrap();
+        let i = v.rowids.iter().position(|r| *r == Some(rid)).unwrap();
+        v.rows[i][0].clone()
+    };
+
+    // Unfiltered, stepping from row 1 finds row 2 — the one the filter hides.
+    let next = store
+        .find_row(&rq(&cols, "match", None, ""), 1, true)
+        .unwrap()
+        .unwrap();
+    assert_eq!(name_of(next), "drop two");
+
+    // With `keep` filtering the grid, the same step skips to the next listed row.
+    let next = store
+        .find_row(&rq(&cols, "match", None, "keep"), 1, true)
+        .unwrap()
+        .unwrap();
+    assert_eq!(name_of(next), "keep three");
+
+    // The wrap-around entry point is filtered too.
+    let first = store
+        .find_row_edge(&rq(&cols, "match", None, "keep"), true)
+        .unwrap()
+        .unwrap();
+    assert_eq!(name_of(first), "keep one");
+    let last = store
+        .find_row_edge(&rq(&cols, "match", None, "keep"), false)
+        .unwrap()
+        .unwrap();
+    assert_eq!(name_of(last), "keep three");
+
+    // And the ordinal counts listed rows only: `keep three` is the 3rd row of the
+    // table but the 2nd of the filtered view, which is what positions the page.
+    assert_eq!(store.rowid_ordinal("t", next, None, "").unwrap(), 3);
+    assert_eq!(store.rowid_ordinal("t", next, None, "keep").unwrap(), 2);
+
+    // A filter that hides everything finds nothing rather than falling back to the
+    // whole table.
+    assert!(store
+        .find_row_edge(&rq(&cols, "match", None, "nothing matches this"), true)
+        .unwrap()
+        .is_none());
+
+    // The same holds with a sort active, where display order is not rowid order.
+    let desc = Sort {
+        column: "name".into(),
+        desc: true,
+    };
+    let first = store
+        .find_row_edge(&rq(&cols, "match", Some(&desc), "keep"), true)
+        .unwrap()
+        .unwrap();
+    assert_eq!(name_of(first), "keep three", "descending by name, filtered");
     let _ = std::fs::remove_file(&path);
 }

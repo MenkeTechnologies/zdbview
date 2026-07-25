@@ -60,7 +60,6 @@ impl Sort {
     }
 }
 
-/// A page of rows for one table, stringified for display.
 /// What one column looks like, for the statistics screen.
 #[derive(Debug, Clone)]
 pub struct ColumnStat {
@@ -98,6 +97,18 @@ impl Maintenance {
     }
 }
 
+/// What a row search is looking for: the table and its columns, the term, and the
+/// two things that decide which rows are eligible and in what order — the active
+/// sort and the grid filter.
+pub struct RowQuery<'a> {
+    pub table: &'a str,
+    pub columns: &'a [String],
+    pub term: &'a str,
+    pub sort: Option<&'a Sort>,
+    pub filter: &'a str,
+}
+
+/// A page of rows for one table, stringified for display.
 pub struct RowsView {
     pub columns: Vec<String>,
     pub rows: Vec<Vec<String>>,
@@ -121,6 +132,17 @@ impl SqliteStore {
 
     /// `WHERE` body matching `term` against every column as text, plus the bound
     /// pattern. `None` when there is no filter.
+    /// `col LIKE ?N OR col LIKE ?N …` over every column, for the search term and
+    /// for the grid filter — which need different parameters in the same
+    /// statement, hence the index.
+    fn like_group(columns: &[String], param: usize) -> String {
+        columns
+            .iter()
+            .map(|c| format!("CAST(\"{}\" AS TEXT) LIKE ?{param} ESCAPE '\\'", esc(c)))
+            .collect::<Vec<_>>()
+            .join(" OR ")
+    }
+
     fn filter_clause(columns: &[String], term: &str) -> Option<(String, String)> {
         if term.is_empty() || columns.is_empty() {
             return None;
@@ -261,31 +283,31 @@ impl SqliteStore {
 
     /// Whole-table search: find the next/previous rowid (relative to
     /// `from_rowid`) whose textified columns contain `term`. Case-insensitive.
-    pub fn find_row(
-        &self,
-        table: &str,
-        columns: &[String],
-        term: &str,
-        from_rowid: i64,
-        forward: bool,
-        sort: Option<&Sort>,
-    ) -> Result<Option<i64>> {
+    pub fn find_row(&self, q: &RowQuery, from_rowid: i64, forward: bool) -> Result<Option<i64>> {
+        let RowQuery {
+            table,
+            columns,
+            term,
+            sort,
+            filter,
+        } = *q;
         if columns.is_empty() {
             return Ok(None);
         }
-        let likes = columns
-            .iter()
-            .map(|c| format!("CAST(\"{}\" AS TEXT) LIKE ?1 ESCAPE '\\'", esc(c)))
-            .collect::<Vec<_>>()
-            .join(" OR ");
+        let likes = Self::like_group(columns, 1);
+        // A filtered grid lists a subset, so the search has to walk that subset —
+        // otherwise `n` lands on a row the filter hides and the ordinal that
+        // positions it counts rows nobody can see.
+        let keep = Self::and_filter(columns, filter);
         // Search must step through the rows in the order they are displayed, so
         // both the comparison and the ORDER BY follow the active sort.
         let sql = match sort {
             Some(s) if columns.contains(&s.column) => format!(
-                "SELECT rowid FROM \"{}\" WHERE {} AND ({}) ORDER BY {} LIMIT 1",
+                "SELECT rowid FROM \"{}\" WHERE {} AND ({}){} ORDER BY {} LIMIT 1",
                 esc(table),
                 s.compare_to_marker(table, forward),
                 likes,
+                keep,
                 if forward {
                     s.order_by()
                 } else {
@@ -295,42 +317,54 @@ impl SqliteStore {
             _ => {
                 let (cmp, ord) = if forward { (">", "ASC") } else { ("<", "DESC") };
                 format!(
-                    "SELECT rowid FROM \"{}\" WHERE rowid {} ?2 AND ({}) ORDER BY rowid {} LIMIT 1",
+                    "SELECT rowid FROM \"{}\" WHERE rowid {} ?2 AND ({}){} ORDER BY rowid {} LIMIT 1",
                     esc(table),
                     cmp,
                     likes,
+                    keep,
                     ord
                 )
             }
         };
         let pattern = format!("%{}%", like_escape(term));
+        let keep_pattern = format!("%{}%", like_escape(filter));
+        let mut binds: Vec<&dyn rusqlite::ToSql> = vec![&pattern, &from_rowid];
+        if !keep.is_empty() {
+            binds.push(&keep_pattern);
+        }
         let mut stmt = self.conn.prepare(&sql)?;
         let rid = stmt
-            .query_row(params![pattern, from_rowid], |r| r.get::<_, i64>(0))
+            .query_row(binds.as_slice(), |r| r.get::<_, i64>(0))
             .optional()?;
         Ok(rid)
+    }
+
+    /// ` AND (filter…)` bound to `?3`, or nothing when no filter is active.
+    fn and_filter(columns: &[String], filter: &str) -> String {
+        if filter.is_empty() || columns.is_empty() {
+            String::new()
+        } else {
+            format!(" AND ({})", Self::like_group(columns, 3))
+        }
     }
 
     /// First (or last, when `forward` is false) matching row in display order —
     /// the wrap-around step of a search, and the entry point when nothing is
     /// selected yet. A marker-relative comparison cannot express this, because
     /// with a sort active there is no synthetic rowid that sits before every row.
-    pub fn find_row_edge(
-        &self,
-        table: &str,
-        columns: &[String],
-        term: &str,
-        forward: bool,
-        sort: Option<&Sort>,
-    ) -> Result<Option<i64>> {
+    pub fn find_row_edge(&self, q: &RowQuery, forward: bool) -> Result<Option<i64>> {
+        let RowQuery {
+            table,
+            columns,
+            term,
+            sort,
+            filter,
+        } = *q;
         if columns.is_empty() {
             return Ok(None);
         }
-        let likes = columns
-            .iter()
-            .map(|c| format!("CAST(\"{}\" AS TEXT) LIKE ?1 ESCAPE '\\'", esc(c)))
-            .collect::<Vec<_>>()
-            .join(" OR ");
+        let likes = Self::like_group(columns, 1);
+        let keep = Self::and_filter(columns, filter);
         let order = match sort {
             Some(s) if columns.contains(&s.column) => {
                 if forward {
@@ -341,34 +375,63 @@ impl SqliteStore {
             }
             _ => format!("rowid {}", if forward { "ASC" } else { "DESC" }),
         };
+        // `?2` is unused here, and binding a parameter a statement does not
+        // mention is an error, so the filter keeps its `?3` slot only when the
+        // marker form needs one: build it against `?2` instead.
+        let keep = keep.replace("?3", "?2");
         let sql = format!(
-            "SELECT rowid FROM \"{}\" WHERE ({}) ORDER BY {} LIMIT 1",
+            "SELECT rowid FROM \"{}\" WHERE ({}){} ORDER BY {} LIMIT 1",
             esc(table),
             likes,
+            keep,
             order
         );
         let pattern = format!("%{}%", like_escape(term));
+        let keep_pattern = format!("%{}%", like_escape(filter));
+        let mut binds: Vec<&dyn rusqlite::ToSql> = vec![&pattern];
+        if !keep.is_empty() {
+            binds.push(&keep_pattern);
+        }
         let mut stmt = self.conn.prepare(&sql)?;
         Ok(stmt
-            .query_row(params![pattern], |r| r.get::<_, i64>(0))
+            .query_row(binds.as_slice(), |r| r.get::<_, i64>(0))
             .optional()?)
     }
 
     /// 1-based ordinal position of `rowid` within the displayed ordering — which
     /// is the active sort when there is one, else `rowid`.
-    pub fn rowid_ordinal(&self, table: &str, rowid: i64, sort: Option<&Sort>) -> Result<i64> {
+    pub fn rowid_ordinal(
+        &self,
+        table: &str,
+        rowid: i64,
+        sort: Option<&Sort>,
+        filter: &str,
+    ) -> Result<i64> {
+        let columns = self.columns(table)?;
+        // The ordinal has to count the rows the grid actually lists, or a filtered
+        // search scrolls to a page the row is not on. `?1` and `?2` are both the
+        // marker rowid here, so the filter keeps its own `?3`.
+        let keep = Self::and_filter(&columns, filter);
         let sql = match sort {
             // Everything not strictly after the marker row is at or before it.
             Some(s) => format!(
-                "SELECT COUNT(*) FROM \"{}\" WHERE NOT ({})",
+                "SELECT COUNT(*) FROM \"{}\" WHERE NOT ({}){}",
                 esc(table),
-                s.compare_to_marker(table, true)
+                s.compare_to_marker(table, true),
+                keep
             ),
-            None => format!("SELECT COUNT(*) FROM \"{}\" WHERE rowid <= ?2", esc(table)),
+            None => format!(
+                "SELECT COUNT(*) FROM \"{}\" WHERE rowid <= ?2{}",
+                esc(table),
+                keep
+            ),
         };
-        let n: i64 = self
-            .conn
-            .query_row(&sql, params![rowid, rowid], |r| r.get(0))?;
+        let keep_pattern = format!("%{}%", like_escape(filter));
+        let mut binds: Vec<&dyn rusqlite::ToSql> = vec![&rowid, &rowid];
+        if !keep.is_empty() {
+            binds.push(&keep_pattern);
+        }
+        let n: i64 = self.conn.query_row(&sql, binds.as_slice(), |r| r.get(0))?;
         Ok(n)
     }
 

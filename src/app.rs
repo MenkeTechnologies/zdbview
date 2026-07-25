@@ -211,6 +211,9 @@ pub struct App {
     top_area: Rect,
     /// The SQL editor, while `screen` is `Screen::Sql`.
     sql: Option<crate::sqledit::SqlEdit>,
+    /// Which screen the hex editor was opened from, so closing it goes back there
+    /// rather than always to the grid.
+    hex_from: Screen,
     /// What the open hex editor writes back to. A rkyv record by default; a
     /// SQLite blob cell when the grid's cell could not be edited as text.
     hex_target: HexTarget,
@@ -300,6 +303,7 @@ impl App {
             top: None,
             top_area: Rect::ZERO,
             sql: None,
+            hex_from: Screen::Main,
             hex_target: HexTarget::Record,
             stats_pending: None,
             stats: Vec::new(),
@@ -656,6 +660,30 @@ impl App {
             }
             KeyCode::Char('v') => self.value_render = self.value_render.next(),
             KeyCode::Char('y') => self.copy_detail_value(),
+            // The detail screen shows the whole value, which is where you want to
+            // change it — `e` edits the highlighted field without going back, and
+            // the arrows pick which field that is.
+            KeyCode::Char('e') => self.edit_current_value(),
+            KeyCode::Right => {
+                let n = self
+                    .rows
+                    .as_ref()
+                    .map(|r| r.columns.len())
+                    .unwrap_or(0)
+                    .saturating_sub(1);
+                if self.col_idx < n {
+                    self.col_idx += 1;
+                    self.detail_scroll = 0;
+                    self.load_detail_value(false);
+                }
+            }
+            KeyCode::Left => {
+                if self.col_idx > 0 {
+                    self.col_idx -= 1;
+                    self.detail_scroll = 0;
+                    self.load_detail_value(false);
+                }
+            }
             KeyCode::Down | KeyCode::Char('j') => {
                 if self.detail_scroll < max_scroll {
                     self.detail_scroll += 1;
@@ -699,6 +727,12 @@ impl App {
     /// Enter the detail screen for the current SQLite row or rkyv record.
     fn enter_detail(&mut self) {
         self.detail_scroll = 0;
+        self.load_detail_value(true);
+    }
+
+    /// Read the selected cell / record value into `detail_value`. `enter` also
+    /// switches to the screen; a reload after an edit leaves the screen alone.
+    fn load_detail_value(&mut self, enter: bool) {
         match &self.store {
             Store::Sqlite(_) => {
                 let bytes = match (self.current_table(), self.current_rowid()) {
@@ -721,7 +755,9 @@ impl App {
                         .unwrap_or_default(),
                 };
                 self.detail_value = bytes;
-                self.screen = Screen::Detail;
+                if enter {
+                    self.screen = Screen::Detail;
+                }
             }
             Store::Rkyv(_) => {
                 if let Some(rec) = self
@@ -730,7 +766,9 @@ impl App {
                     .and_then(|d| d.records.get(self.record_idx))
                 {
                     self.detail_value = rec.value.clone();
-                    self.screen = Screen::Detail;
+                    if enter {
+                        self.screen = Screen::Detail;
+                    }
                 }
             }
         }
@@ -1313,8 +1351,9 @@ impl App {
             .is_some_and(|d| self.record_idx < d.records.len())
     }
 
-    /// (kind, shard bytes) for the current rkyv archive, if decoded.
-    fn rkyv_kind_bytes(&self) -> Option<(FormatKind, Vec<u8>)> {
+    /// (kind, shard bytes) for the current rkyv archive, if decoded. The bytes are
+    /// shared, not copied — see [`RkyvStore::bytes`].
+    fn rkyv_kind_bytes(&self) -> Option<(FormatKind, std::sync::Arc<[u8]>)> {
         let kind = self.decoded.as_ref().map(|d| d.kind)?;
         match &self.store {
             Store::Rkyv(r) => Some((kind, r.bytes.clone())),
@@ -1323,7 +1362,7 @@ impl App {
     }
 
     /// (display key, del_key, kind, shard bytes) for the selected record.
-    fn rkyv_ctx(&self) -> Option<(String, String, FormatKind, Vec<u8>)> {
+    fn rkyv_ctx(&self) -> Option<(String, String, FormatKind, std::sync::Arc<[u8]>)> {
         let (key, del_key, kind) = self.decoded.as_ref().and_then(|d| {
             d.records
                 .get(self.record_idx)
@@ -1356,7 +1395,7 @@ impl App {
             return;
         }
         if let Store::Rkyv(r) = &mut self.store {
-            r.bytes = new_bytes;
+            r.bytes = new_bytes.into();
         }
         self.reload_rkyv();
         self.notify(ok_msg);
@@ -1401,6 +1440,7 @@ impl App {
             None => return,
         };
         self.hex = Some(HexEdit::new(key, value));
+        self.hex_from = self.screen;
         self.hex_target = HexTarget::Record;
         self.screen = Screen::HexEdit;
     }
@@ -1418,7 +1458,11 @@ impl App {
             hexedit::Action::Save => self.commit_hex_value(),
             hexedit::Action::Close => {
                 self.hex = None;
-                self.screen = Screen::Main;
+                self.screen = self.hex_from;
+                if self.screen == Screen::Detail {
+                    // The value it was editing may have changed under it.
+                    self.load_detail_value(false);
+                }
             }
         }
     }
@@ -1780,6 +1824,17 @@ impl App {
         if self.focus != Focus::Right {
             return;
         }
+        self.edit_current_value()
+    }
+
+    /// Edit whatever is selected: a SQLite cell (in the hex editor when it holds a
+    /// blob, inline otherwise) or a rkyv record's value. Reached from the grid via
+    /// `e` and from the detail screen, which has no pane focus of its own.
+    fn edit_current_value(&mut self) {
+        if matches!(self.store, Store::Rkyv(_)) {
+            self.open_hex_editor();
+            return;
+        }
         let cur = self
             .rows
             .as_ref()
@@ -1809,6 +1864,7 @@ impl App {
                     Ok(bytes) => {
                         let n = bytes.len();
                         self.hex = Some(HexEdit::new(format!("{table}.{column}"), bytes));
+                        self.hex_from = self.screen;
                         self.hex_target = HexTarget::Cell {
                             table,
                             rowid,
@@ -1844,6 +1900,10 @@ impl App {
             Ok(()) => {
                 self.notify(format!("updated {}.{}", table, col));
                 self.load_table();
+                // Edited from the detail screen: it is still showing the old bytes.
+                if self.screen == Screen::Detail {
+                    self.load_detail_value(false);
+                }
             }
             Err(e) => self.status = format!("update failed: {}", e),
         }
@@ -1965,7 +2025,10 @@ impl App {
         match self.focus {
             Focus::Left => {
                 let tables = self.sqlite().map(|s| s.tables.clone()).unwrap_or_default();
-                match find_next(tables.len(), self.table_idx, forward, |i| {
+                // Only what the filter leaves listed: jumping to a hidden table
+                // would leave the pane showing a selection nobody can see.
+                let visible = self.visible_tables();
+                match find_next_visible(&visible, self.table_idx, forward, |i| {
                     tables[i].to_lowercase().contains(&term)
                 }) {
                     Some(i) => self.select_table(i),
@@ -1990,26 +2053,30 @@ impl App {
             let sort = self.sort.clone();
             let s = self.sqlite().unwrap();
             // From the selected row, else from the edge the scan comes in from.
+            let query = crate::sqlite::RowQuery {
+                table: &table,
+                columns: &columns,
+                term: &self.search,
+                sort: sort.as_ref(),
+                filter: &self.filter,
+            };
             let first = match self.current_rowid() {
-                Some(from) => {
-                    s.find_row(&table, &columns, &self.search, from, forward, sort.as_ref())
-                }
-                None => s.find_row_edge(&table, &columns, &self.search, forward, sort.as_ref()),
+                Some(from) => s.find_row(&query, from, forward),
+                None => s.find_row_edge(&query, forward),
             };
             let rid = match first {
                 Err(e) => Err(e.to_string()),
                 Ok(Some(r)) => Ok(Some(r)),
                 // Nothing ahead: wrap to the first/last match in display order.
-                Ok(None) => s
-                    .find_row_edge(&table, &columns, &self.search, forward, sort.as_ref())
-                    .map_err(|e| e.to_string()),
+                Ok(None) => s.find_row_edge(&query, forward).map_err(|e| e.to_string()),
             };
             match rid {
                 Err(e) => Err(e),
                 Ok(None) => Ok(None),
                 Ok(Some(r)) => Ok(Some((
                     r,
-                    s.rowid_ordinal(&table, r, sort.as_ref()).unwrap_or(1),
+                    s.rowid_ordinal(&table, r, sort.as_ref(), &self.filter)
+                        .unwrap_or(1),
                 ))),
             }
         };
@@ -2037,7 +2104,8 @@ impl App {
                     .as_ref()
                     .map(|d| d.records.iter().map(|r| r.key.to_lowercase()).collect())
                     .unwrap_or_default();
-                match find_next(keys.len(), self.record_idx, forward, |i| {
+                let visible = self.visible_records();
+                match find_next_visible(&visible, self.record_idx, forward, |i| {
                     keys[i].contains(&term)
                 }) {
                     Some(i) => self.record_idx = i,
@@ -2045,7 +2113,8 @@ impl App {
                 }
             }
             RkyvView::Strings => {
-                match find_next(self.strings.len(), self.string_idx, forward, |i| {
+                let visible = self.visible_strings();
+                match find_next_visible(&visible, self.string_idx, forward, |i| {
                     self.strings[i].text.to_lowercase().contains(&term)
                 }) {
                     Some(i) => self.string_idx = i,
@@ -3592,7 +3661,7 @@ fn spawn_stats(path: std::path::PathBuf, table: String) -> std::sync::mpsc::Rece
 }
 
 /// Validate and decode `bytes` on another thread.
-fn spawn_decode(bytes: Vec<u8>) -> std::sync::mpsc::Receiver<Option<Decoded>> {
+fn spawn_decode(bytes: std::sync::Arc<[u8]>) -> std::sync::mpsc::Receiver<Option<Decoded>> {
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let _ = tx.send(formats::try_decode(&bytes));
@@ -3827,6 +3896,29 @@ fn filter_passes(filter: &str, hay: &str) -> bool {
 
 /// Find the next index (wrapping) from `from` for which `pred` holds, scanning
 /// `forward` or backward. Returns `None` if nothing matches.
+/// `find_next` over a filtered list: `visible` holds the indices still listed, in
+/// display order, and the walk wraps inside it. `from` is an index into the full
+/// list — the cursor may sit on a row the filter has since hidden, in which case
+/// the walk starts from where that row would be.
+fn find_next_visible(
+    visible: &[usize],
+    from: usize,
+    forward: bool,
+    pred: impl Fn(usize) -> bool,
+) -> Option<usize> {
+    if visible.is_empty() {
+        return None;
+    }
+    let pos = match visible.binary_search(&from) {
+        Ok(p) => p,
+        // Not listed: `p` is where it would sit, so stepping forward from `p - 1`
+        // reaches it, and stepping back from `p` reaches the one before.
+        Err(p) if forward => p.saturating_sub(1),
+        Err(p) => p.min(visible.len() - 1),
+    };
+    find_next(visible.len(), pos, forward, |i| pred(visible[i])).map(|i| visible[i])
+}
+
 fn find_next(
     len: usize,
     from: usize,
@@ -4214,6 +4306,148 @@ mod tests {
         assert_eq!(
             sql,
             r#"INSERT INTO "t" ("a", "b", "c") VALUES ('x', 'y', 'z');"#
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// The detail screen shows the whole value, so it is where you edit it: `e`
+    /// opens the editor there, the arrows pick the field, and the pane shows the
+    /// new bytes without a trip back to the grid.
+    #[test]
+    fn the_detail_screen_edits_the_field_it_is_showing() {
+        let path = scratch("db");
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch("CREATE TABLE t (a TEXT, b TEXT)")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES ('one', 'two')", [])
+            .unwrap();
+        drop(conn);
+        let mut app = App::with_theme(
+            Store::Sqlite(SqliteStore::open(&path).unwrap()),
+            Theme::from_name(ThemeName::NeonSprawl),
+        );
+        app.on_key(KeyEvent::from(KeyCode::Tab)); // focus the row grid
+        app.on_key(KeyEvent::from(KeyCode::Enter)); // detail
+        assert_eq!(app.screen, super::Screen::Detail);
+        assert_eq!(app.detail_value, b"one");
+
+        // Right moves to the next field and reloads what the value pane shows.
+        app.on_key(KeyEvent::from(KeyCode::Right));
+        assert_eq!(app.col_idx, 1);
+        assert_eq!(app.detail_value, b"two");
+
+        // `e` edits that field in place, and the screen stays where it was.
+        press(&mut app, 'e');
+        assert!(matches!(app.mode, super::Mode::EditCell(_)));
+        assert_eq!(app.screen, super::Screen::Detail);
+        // The editor opens seeded with the current value, so clear it first.
+        app.on_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        for c in "TWO".chars() {
+            app.on_key(KeyEvent::from(KeyCode::Char(c)));
+        }
+        app.on_key(KeyEvent::from(KeyCode::Enter));
+        assert_eq!(
+            app.detail_value, b"TWO",
+            "the value pane must show what was just written"
+        );
+        let store = SqliteStore::open(&path).unwrap();
+        let view = store.rows("t", 10, 0, None, "").unwrap();
+        assert_eq!(view.rows[0], vec!["one".to_string(), "TWO".to_string()]);
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// A blob field edited from the detail screen goes through the hex editor and
+    /// comes back to the detail screen, not to the grid.
+    #[test]
+    fn a_blob_edited_from_the_detail_screen_returns_there() {
+        let path = scratch("db");
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch("CREATE TABLE t (raw BLOB)").unwrap();
+        conn.execute("INSERT INTO t VALUES (?1)", [&[0x01u8, 0x02][..]])
+            .unwrap();
+        drop(conn);
+        let mut app = App::with_theme(
+            Store::Sqlite(SqliteStore::open(&path).unwrap()),
+            Theme::from_name(ThemeName::NeonSprawl),
+        );
+        app.on_key(KeyEvent::from(KeyCode::Tab));
+        app.on_key(KeyEvent::from(KeyCode::Enter)); // detail
+        press(&mut app, 'e');
+        assert_eq!(app.screen, super::Screen::HexEdit);
+
+        press(&mut app, 'i');
+        press(&mut app, 'f');
+        press(&mut app, 'f');
+        app.on_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+        app.on_key(KeyEvent::from(KeyCode::Esc)); // leave EDIT mode
+        press(&mut app, 'q'); // close the editor
+        assert_eq!(
+            app.screen,
+            super::Screen::Detail,
+            "closing returns to where it opened from"
+        );
+        assert_eq!(app.detail_value, [0xff, 0x02], "with the new bytes");
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// Every rkyv edit path needs the whole archive while `self` is borrowed
+    /// mutably, which used to mean copying it — 382 MB per operation on a real
+    /// shard. The bytes are shared now, so handing them out must not copy.
+    #[test]
+    fn handing_out_the_archive_bytes_does_not_copy_them() {
+        let path = scratch("bin");
+        std::fs::write(&path, b"zdbview archive bytes, shared not copied").unwrap();
+        let store = RkyvStore::open(&path).unwrap();
+        let original = std::sync::Arc::clone(&store.bytes);
+        let app = App::with_theme(Store::Rkyv(store), Theme::from_name(ThemeName::NeonSprawl));
+
+        // What every edit path and the background decoder do to get the bytes.
+        let handed = match &app.store {
+            Store::Rkyv(r) => r.bytes.clone(),
+            _ => unreachable!(),
+        };
+        assert!(
+            std::sync::Arc::ptr_eq(&original, &handed),
+            "the same allocation must come back, not a copy of it"
+        );
+        assert_eq!(&*handed, b"zdbview archive bytes, shared not copied");
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// With a filter active, `n` must step through the listed rows only — in the
+    /// grid and in the table pane both.
+    #[test]
+    fn search_steps_through_filtered_lists_only() {
+        let path = scratch("db");
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE keep_a (v TEXT); CREATE TABLE drop_b (v TEXT);
+             CREATE TABLE keep_c (v TEXT);
+             INSERT INTO keep_a VALUES ('x');",
+        )
+        .unwrap();
+        drop(conn);
+        let mut app = App::with_theme(
+            Store::Sqlite(SqliteStore::open(&path).unwrap()),
+            Theme::from_name(ThemeName::NeonSprawl),
+        );
+
+        // Table pane: `/keep` hides drop_b, so searching for a name every table
+        // matches must still skip it.
+        app.set_filter("keep".to_string());
+        app.search = "_".to_string();
+        app.table_idx = 0;
+        app.search_next(true);
+        assert_eq!(
+            app.sqlite().unwrap().tables[app.table_idx],
+            "keep_c",
+            "n skipped the filtered-out table"
+        );
+        app.search_next(true);
+        assert_eq!(
+            app.sqlite().unwrap().tables[app.table_idx],
+            "keep_a",
+            "and wraps inside the filtered list"
         );
         let _ = std::fs::remove_file(path);
     }

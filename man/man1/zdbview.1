@@ -183,7 +183,9 @@ Edit the selected cell in place; Enter commits an
 .B UPDATE
 of that column for the row's
 .BR rowid ,
-Esc cancels. A
+Esc cancels. The same key works on the detail screen, on the field the arrows
+select there, and the value pane shows the new bytes without a trip back to the
+grid. A
 .B blob
 cell has no text form, so
 .B e
@@ -396,12 +398,25 @@ case-insensitive substring. The Hex view is not filtered: there
 searches for a byte sequence, case-sensitively.
 .TP
 .BR n ", " N
-Jump to the next / previous match of the active search.
+Jump to the next / previous match of the active search, within what the filter
+leaves listed: for the row grid the filter travels into the search statement and
+into the ordinal that decides which page to jump to, so a search under a filter
+cannot land on a hidden row.
 .TP
 .B Enter
 In the table list, move focus into the rows. In the row grid or the rkyv Records
 view, open the detail screen for the selected row / record. In the picker, open
 the file.
+.TP
+.B e
+On the detail screen, edit the field the arrows select there \(em inline for text,
+in the hex editor for a blob \(em and the value pane shows the new bytes without a
+trip back to the grid.
+.TP
+.BR \(<- ", " \(->
+On the detail screen, select which field the value pane shows and
+.B e
+edits.
 .TP
 .B v
 On the detail screen, cycle the value render mode: auto / hex / text / disasm

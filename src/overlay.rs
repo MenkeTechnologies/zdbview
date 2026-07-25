@@ -1002,6 +1002,8 @@ fn help_sections(ctx: HelpCtx) -> Vec<HelpSection> {
                 ("v", "Cycle render"),
                 ("y", "Copy (OSC 52)"),
                 ("x", "Export to file"),
+                ("e", "Edit (also on detail)"),
+                ("←/→", "Field, on detail"),
             ],
         },
         HelpSection {

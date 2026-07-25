@@ -9,10 +9,14 @@
 
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 pub struct RkyvStore {
     pub path: PathBuf,
-    pub bytes: Vec<u8>,
+    /// The whole archive. Shared rather than owned: every edit path and the
+    /// background decoder need the bytes at the same time, and a 382 MB shard
+    /// copied per operation is 382 MB per keystroke.
+    pub bytes: Arc<[u8]>,
 }
 
 /// Most printable runs collected from one archive. Past this the list is no
@@ -44,7 +48,7 @@ impl RkyvStore {
         let bytes = std::fs::read(path).with_context(|| format!("read {}", path.display()))?;
         Ok(Self {
             path: path.to_path_buf(),
-            bytes,
+            bytes: bytes.into(),
         })
     }
 

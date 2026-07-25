@@ -500,18 +500,65 @@ fn export_store(store: &Store, fmt: &str, only: Option<&str>) -> Result<String> 
     }
 }
 
+/// The two terminal-driven steps of a session, behind a trait so the loop that
+/// sequences them can be tested without a terminal.
+trait Session {
+    /// Ask the picker for a file. `None` means the user quit it.
+    fn pick(&mut self, scheme: theme::Theme) -> Result<Option<app::Picked>>;
+    /// Open a file and run the app over it, reporting the scheme it ended on and
+    /// any file it wants opened next.
+    fn open(
+        &mut self,
+        scheme: theme::Theme,
+        file: PathBuf,
+    ) -> Result<(app::Outcome, theme::Theme, Option<PathBuf>)>;
+}
+
+/// The real session: a picker and an app over the terminal.
+struct TerminalSession<'a> {
+    cli: &'a Cli,
+    terminal: &'a mut DefaultTerminal,
+}
+
+impl Session for TerminalSession<'_> {
+    fn pick(&mut self, scheme: theme::Theme) -> Result<Option<app::Picked>> {
+        pick(self.cli, self.terminal, scheme)
+    }
+
+    fn open(
+        &mut self,
+        scheme: theme::Theme,
+        file: PathBuf,
+    ) -> Result<(app::Outcome, theme::Theme, Option<PathBuf>)> {
+        open_and_run(self.cli, self.terminal, scheme, file)
+    }
+}
+
 fn run(cli: &Cli, terminal: &mut DefaultTerminal, theme: Option<theme::ThemeName>) -> Result<()> {
     // The scheme is carried from screen to screen instead of being re-read from
     // prefs at every hop: another instance writing prefs must not change what
     // this one is showing.
-    let mut scheme = app::resolve_theme(theme);
+    let scheme = app::resolve_theme(theme);
+    let first = cli.file.clone();
+    let mut session = TerminalSession { cli, terminal };
+    drive(&mut session, first, scheme)
+}
+
+/// Sequence a whole session: an explicit FILE opens first, then each round either
+/// takes the file the write monitor handed over or asks the picker, and the scheme
+/// each screen ended on is carried to the next instead of being re-read from
+/// prefs. `o` or Esc inside a file lead back to the picker, so the explicit-file
+/// case falls into the loop rather than exiting.
+fn drive(
+    session: &mut dyn Session,
+    first: Option<PathBuf>,
+    mut scheme: theme::Theme,
+) -> Result<()> {
     // A file the write monitor asked to open, which skips the picker.
     let mut pending: Option<PathBuf> = None;
 
-    // An explicit FILE opens straight away; `o` or Esc there still lead to the
-    // picker, so fall through to the loop instead of exiting.
-    if let Some(file) = &cli.file {
-        let (outcome, used, next) = open_and_run(cli, terminal, scheme, file.clone())?;
+    if let Some(file) = first {
+        let (outcome, used, next) = session.open(scheme, file)?;
         if outcome == app::Outcome::Quit {
             return Ok(());
         }
@@ -519,11 +566,9 @@ fn run(cli: &Cli, terminal: &mut DefaultTerminal, theme: Option<theme::ThemeName
         pending = next;
     }
     loop {
-        // The write monitor can hand over a file directly; otherwise ask the
-        // picker.
         let file = match pending.take() {
             Some(f) => f,
-            None => match pick(cli, terminal, scheme)? {
+            None => match session.pick(scheme)? {
                 Some(picked) => {
                     scheme = picked.theme;
                     picked.path
@@ -531,7 +576,7 @@ fn run(cli: &Cli, terminal: &mut DefaultTerminal, theme: Option<theme::ThemeName
                 None => return Ok(()), // user quit the picker
             },
         };
-        let (outcome, used, next) = open_and_run(cli, terminal, scheme, file)?;
+        let (outcome, used, next) = session.open(scheme, file)?;
         if outcome == app::Outcome::Quit {
             return Ok(());
         }
@@ -606,4 +651,150 @@ fn open_and_run(
     let mut app = app::App::with_theme(store, scheme);
     let outcome = app.run(terminal)?;
     Ok((outcome, app.theme(), app.open_next()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{drive, Session};
+    use crate::app::{Outcome, Picked};
+    use crate::theme::{Theme, ThemeName};
+    use std::path::PathBuf;
+
+    /// What the loop did, with the two terminal steps scripted.
+    #[derive(Default)]
+    struct Fake {
+        /// Files the picker will hand over, in order; `None` ends the session.
+        picks: Vec<Option<Picked>>,
+        /// What each open reports: outcome, the scheme it ended on, the next file.
+        opens: Vec<(Outcome, Theme, Option<PathBuf>)>,
+        /// Every open, as (file, scheme it was given).
+        opened: Vec<(PathBuf, ThemeName)>,
+        /// The scheme the picker was called with, once per call.
+        picked_with: Vec<ThemeName>,
+    }
+
+    impl Session for Fake {
+        fn pick(&mut self, scheme: Theme) -> anyhow::Result<Option<Picked>> {
+            self.picked_with.push(scheme.name);
+            Ok(self.picks.remove(0))
+        }
+
+        fn open(
+            &mut self,
+            scheme: Theme,
+            file: PathBuf,
+        ) -> anyhow::Result<(Outcome, Theme, Option<PathBuf>)> {
+            self.opened.push((file, scheme.name));
+            Ok(self.opens.remove(0))
+        }
+    }
+
+    fn theme(name: ThemeName) -> Theme {
+        Theme::from_name(name)
+    }
+
+    /// An explicit FILE opens first and quitting there ends the session without
+    /// ever showing the picker.
+    #[test]
+    fn an_explicit_file_that_quits_never_reaches_the_picker() {
+        let mut f = Fake {
+            opens: vec![(Outcome::Quit, theme(ThemeName::NeonSprawl), None)],
+            ..Default::default()
+        };
+        drive(
+            &mut f,
+            Some(PathBuf::from("/tmp/a.db")),
+            theme(ThemeName::NeonSprawl),
+        )
+        .unwrap();
+        assert_eq!(f.opened.len(), 1);
+        assert!(f.picked_with.is_empty(), "the picker must not open");
+    }
+
+    /// `o` inside a file (Reopen) goes to the picker, and the scheme the file
+    /// ended on is what the picker and the next file are given — prefs are not
+    /// re-read, so a concurrent instance cannot change this one's colors.
+    #[test]
+    fn reopen_carries_the_scheme_into_the_picker_and_the_next_file() {
+        let mut f = Fake {
+            opens: vec![
+                // The first file ends on a different scheme than it started with.
+                (Outcome::Reopen, theme(ThemeName::AcidRain), None),
+                (Outcome::Quit, theme(ThemeName::AcidRain), None),
+            ],
+            picks: vec![Some(Picked {
+                path: PathBuf::from("/tmp/b.rkyv"),
+                theme: theme(ThemeName::SynthWave),
+            })],
+            ..Default::default()
+        };
+        drive(
+            &mut f,
+            Some(PathBuf::from("/tmp/a.db")),
+            theme(ThemeName::NeonSprawl),
+        )
+        .unwrap();
+
+        assert_eq!(
+            f.picked_with,
+            vec![ThemeName::AcidRain],
+            "the file's scheme"
+        );
+        assert_eq!(
+            f.opened,
+            vec![
+                (PathBuf::from("/tmp/a.db"), ThemeName::NeonSprawl),
+                // The picker's own scheme change wins for the next file.
+                (PathBuf::from("/tmp/b.rkyv"), ThemeName::SynthWave),
+            ]
+        );
+    }
+
+    /// The write monitor hands a file over directly, which skips the picker for
+    /// that round only.
+    #[test]
+    fn a_file_from_the_monitor_skips_the_picker_once() {
+        let mut f = Fake {
+            opens: vec![
+                (
+                    Outcome::Reopen,
+                    theme(ThemeName::NeonSprawl),
+                    Some(PathBuf::from("/tmp/watched.db")),
+                ),
+                (Outcome::Reopen, theme(ThemeName::NeonSprawl), None),
+                (Outcome::Quit, theme(ThemeName::NeonSprawl), None),
+            ],
+            picks: vec![Some(Picked {
+                path: PathBuf::from("/tmp/from_picker.db"),
+                theme: theme(ThemeName::NeonSprawl),
+            })],
+            ..Default::default()
+        };
+        drive(
+            &mut f,
+            Some(PathBuf::from("/tmp/a.db")),
+            theme(ThemeName::NeonSprawl),
+        )
+        .unwrap();
+
+        let files: Vec<&str> = f.opened.iter().map(|(p, _)| p.to_str().unwrap()).collect();
+        assert_eq!(
+            files,
+            ["/tmp/a.db", "/tmp/watched.db", "/tmp/from_picker.db"],
+            "the handed-over file comes before the picker is asked"
+        );
+        assert_eq!(f.picked_with.len(), 1, "asked once, after the handover");
+    }
+
+    /// With no FILE the picker leads, and quitting it ends the session.
+    #[test]
+    fn quitting_the_picker_ends_a_session_with_no_file() {
+        let mut f = Fake {
+            picks: vec![None],
+            ..Default::default()
+        };
+        drive(&mut f, None, theme(ThemeName::NeonSprawl)).unwrap();
+        assert!(f.opened.is_empty(), "nothing was opened");
+        assert_eq!(f.picked_with.len(), 1);
+    }
 }

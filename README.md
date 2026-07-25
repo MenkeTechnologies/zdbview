@@ -145,6 +145,7 @@ SQLite files are self-describing, so every operation works on any database:
 - `D` — the **database report** (see below).
 - `A` — **column statistics** (see below).
 - `e` on a blob cell opens the **hex editor**; text cells edit inline.
+- `e` also works on the **detail screen**, on the field the arrows select there.
 
 Rows are addressed by `rowid`; `WITHOUT ROWID` tables are listed read-only.
 Identifiers are double-quoted with internal quotes doubled, and edited values are
@@ -237,7 +238,7 @@ is published on crates.io); disable with `--no-default-features`.
 | `gg` / `G` | jump to top / bottom |
 | `Enter` | open detail (row / record); focus rows (table list) |
 | `/` | **filter** the list/table as you type; `Enter` keeps it, `Esc` clears it |
-| `n` / `N` | next / previous match of the filter pattern |
+| `n` / `N` | next / previous match — inside the active filter, in display order |
 | `Ctrl-f` / `Ctrl-b`, `PgUp` / `PgDn` | page by a screenful (every view) |
 | `e` `a` `d` `:` | edit / add / delete / SQL (SQLite) |
 | `s` | sort by the cursor column (ascending → descending → off) |
@@ -498,6 +499,15 @@ Sorting is done in SQL (`ORDER BY "col" ASC|DESC, rowid`), so it orders the
 the `rowid` tiebreaker keeps paging stable when the sort column has duplicates.
 Search and the `(row N of M)` readout follow the displayed order, so `n` / `N`
 step to the next match *on screen* rather than the next by `rowid`.
+
+## Search inside a filter
+
+`/` narrows the list; `n` / `N` then step through matches **within** what is
+listed. For the SQLite grid that means the filter travels into the SQL: the search
+statement carries both the search `LIKE` and the filter `LIKE`, and the ordinal
+that decides which page to jump to counts only listed rows. Without that, a search
+under an active filter lands on a hidden row and scrolls to the page it would have
+been on unfiltered.
 
 ## Filtering
 
