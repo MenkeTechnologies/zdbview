@@ -95,6 +95,8 @@ enum Screen {
     Detail,
     /// Hex editor over one record's value bytes.
     HexEdit,
+    /// Live write monitor over every store zdbview knows about.
+    Top,
     /// SQLite schema (CREATE statements) view.
     Schema,
 }
@@ -180,8 +182,16 @@ pub struct App {
     hex: Option<HexEdit>,
     /// Rect the hex editor last rendered into, for click hit-testing.
     hex_area: Rect,
+    /// The write monitor, while `screen` is `Screen::Top`.
+    top: Option<crate::watch::Watcher>,
+    /// Row ordering in the write monitor.
+    top_order: crate::watch::Order,
+    /// Selected row of the write monitor.
+    top_sel: usize,
     /// Set by `o`: leave the app loop and show the file picker again.
     reopen: bool,
+    /// A file the monitor asked to open, taking precedence over the picker.
+    open_next: Option<PathBuf>,
     /// Position `/` started from, while a search prompt is open.
     search_origin: Option<SearchOrigin>,
     /// Active `/` filter: only matching rows/records/strings are listed. Empty
@@ -247,7 +257,11 @@ impl App {
             sort: None,
             hex: None,
             hex_area: Rect::ZERO,
+            top: None,
+            top_order: crate::watch::Order::Recent,
+            top_sel: 0,
             reopen: false,
+            open_next: None,
             search_origin: None,
             filter: String::new(),
             strings_truncated: false,
@@ -267,6 +281,11 @@ impl App {
         self.quit = true;
     }
 
+    /// A file the write monitor asked to open next, if any.
+    pub fn open_next(&mut self) -> Option<PathBuf> {
+        self.open_next.take()
+    }
+
     /// The scheme currently in use, to carry back to the picker.
     pub fn theme(&self) -> Theme {
         self.ov.theme
@@ -276,6 +295,9 @@ impl App {
     fn help_ctx(&self) -> HelpCtx {
         if self.screen == Screen::HexEdit {
             return HelpCtx::HexEdit;
+        }
+        if self.screen == Screen::Top {
+            return HelpCtx::Top;
         }
         match &self.store {
             Store::Sqlite(_) => HelpCtx::Sqlite,
@@ -334,6 +356,9 @@ impl App {
     pub fn run(&mut self, terminal: &mut DefaultTerminal) -> Result<Outcome> {
         while !self.quit {
             self.poll_decode();
+            if let Some(w) = self.top.as_mut() {
+                w.tick();
+            }
             terminal.draw(|f| self.render(f))?;
             if !event::poll(TICK)? {
                 self.ov.expire_toast();
@@ -433,6 +458,16 @@ impl App {
             return;
         }
 
+        // `w` opens the write monitor from any screen but the hex editor (where
+        // every letter is data) and the monitor itself, where it closes.
+        if code == KeyCode::Char('w')
+            && self.screen != Screen::HexEdit
+            && self.screen != Screen::Top
+        {
+            self.open_top();
+            return;
+        }
+
         // `o` goes back to the file picker from any screen but the hex editor,
         // where it inserts a byte.
         if code == KeyCode::Char('o') && self.screen != Screen::HexEdit {
@@ -444,6 +479,7 @@ impl App {
             // The hex editor is modal: it owns every key, including `h` and `c`,
             // because those are its own motions and data.
             Screen::HexEdit => return self.key_hex(key),
+            Screen::Top => return self.key_top(code),
             Screen::Detail => return self.key_detail(code),
             Screen::Schema => return self.key_schema(code),
             Screen::Main => {}
@@ -1934,6 +1970,7 @@ impl App {
         match self.screen {
             Screen::Detail => self.render_detail(f, outer[0]),
             Screen::HexEdit => self.render_hex(f, outer[0]),
+            Screen::Top => self.render_top(f, outer[0]),
             Screen::Schema => self.render_schema(f, outer[0]),
             Screen::Main => match &self.store {
                 Store::Sqlite(_) => self.render_sqlite(f, outer[0]),
@@ -2039,6 +2076,212 @@ impl App {
                 self.value_render.label()
             ))),
             rows[1],
+        );
+    }
+
+    /// Open the write monitor over everything zdbview knows about: the saved
+    /// scan, the recent-files list, and the file currently open.
+    fn open_top(&mut self) {
+        use crate::watch::Watcher;
+        let mut targets: Vec<(PathBuf, Kind)> = Vec::new();
+        // The open file first, since that is the one being edited.
+        match &self.store {
+            Store::Sqlite(s) => targets.push((s.path.clone(), Kind::Sqlite)),
+            Store::Rkyv(r) => targets.push((r.path.clone(), Kind::Rkyv)),
+        }
+        for e in crate::mru::load() {
+            targets.push((e.path, e.kind));
+        }
+        if let Some(c) = crate::scan::load_cache() {
+            for h in c.hits {
+                targets.push((h.path, h.kind));
+            }
+        }
+        targets.retain(|(p, _)| p.is_file());
+        let n = targets.len();
+        self.top = Some(Watcher::new(targets));
+        self.top_sel = 0;
+        self.screen = Screen::Top;
+        self.notify(format!("watching {} files for writes", n));
+    }
+
+    fn key_top(&mut self, code: KeyCode) {
+        let w = match self.top.as_mut() {
+            Some(w) => w,
+            None => {
+                self.screen = Screen::Main;
+                return;
+            }
+        };
+        let last = w.targets.len().saturating_sub(1);
+        let page = self.page_rows.max(1);
+        match code {
+            KeyCode::Esc | KeyCode::Char('w') => {
+                self.top = None;
+                self.screen = Screen::Main;
+            }
+            KeyCode::Char('q') => self.quit = true,
+            KeyCode::Down | KeyCode::Char('j') => self.top_sel = (self.top_sel + 1).min(last),
+            KeyCode::Up | KeyCode::Char('k') => self.top_sel = self.top_sel.saturating_sub(1),
+            KeyCode::PageDown => self.top_sel = (self.top_sel + page).min(last),
+            KeyCode::PageUp => self.top_sel = self.top_sel.saturating_sub(page),
+            KeyCode::Char('g') => self.top_sel = 0,
+            KeyCode::Char('G') => self.top_sel = last,
+            // `s` cycles the ordering, like a `top` does.
+            KeyCode::Char('s') => {
+                self.top_order = self.top_order.next();
+                let label = self.top_order.label();
+                self.notify(format!("sorted by {label}"));
+            }
+            KeyCode::Char('p') => {
+                w.paused = !w.paused;
+                let paused = w.paused;
+                self.notify(if paused { "paused" } else { "resumed" });
+            }
+            // `+` / `-` change how often it samples.
+            KeyCode::Char('+') | KeyCode::Char('=') => {
+                w.interval = (w.interval / 2).max(std::time::Duration::from_millis(100));
+                let ms = w.interval.as_millis();
+                self.notify(format!("sampling every {ms}ms"));
+            }
+            KeyCode::Char('-') => {
+                w.interval = (w.interval * 2).min(std::time::Duration::from_secs(5));
+                let ms = w.interval.as_millis();
+                self.notify(format!("sampling every {ms}ms"));
+            }
+            // Enter opens the selected file, which is the point of watching it.
+            KeyCode::Enter => {
+                let order = self.top_order;
+                let sel = self.top_sel;
+                if let Some(path) = w.sorted(order).get(sel).map(|&i| w.targets[i].path.clone()) {
+                    self.open_next = Some(path);
+                    self.reopen = true;
+                    self.quit = true;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// The write monitor: one row per watched store, ordered by activity, with a
+    /// sparkline of the last samples.
+    fn render_top(&mut self, f: &mut Frame, area: Rect) {
+        use crate::watch::{spark, ACTIVE_WINDOW};
+        let t = self.ov.theme;
+        let w = match self.top.as_ref() {
+            Some(w) => w,
+            None => return,
+        };
+        let order = self.top_order;
+        let rows = w.sorted(order);
+        // Scale every sparkline against the busiest sample on screen, so the
+        // bars are comparable between rows.
+        let peak = w
+            .targets
+            .iter()
+            .flat_map(|t| t.history.iter().copied())
+            .max()
+            .unwrap_or(0);
+
+        let header = Row::new(vec![
+            Cell::from("kind"),
+            Cell::from("file"),
+            Cell::from("size"),
+            Cell::from("written"),
+            Cell::from("rate"),
+            Cell::from("last"),
+            Cell::from("activity"),
+        ])
+        .style(Style::default().fg(t.primary).add_modifier(Modifier::BOLD));
+
+        let body = rows.iter().map(|&i| {
+            let tg = &w.targets[i];
+            let hot = tg.active(ACTIVE_WINDOW);
+            // A file being written stands out; the rest stay quiet.
+            let name_style = if hot {
+                Style::default().fg(t.accent).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(t.dim)
+            };
+            let rate = tg.rate(w.interval);
+            let bars: String = tg
+                .history
+                .iter()
+                .rev()
+                .take(24)
+                .rev()
+                .map(|&s| spark(s, peak))
+                .collect();
+            Row::new(vec![
+                Cell::from(match tg.kind {
+                    Kind::Sqlite => "sqlite",
+                    Kind::Rkyv => "rkyv",
+                })
+                .style(Style::default().fg(if tg.kind == Kind::Sqlite {
+                    t.primary
+                } else {
+                    t.alt
+                })),
+                Cell::from(truncate(tg.name(), 30)).style(name_style),
+                Cell::from(human_size(tg.size)).style(Style::default().fg(t.dim)),
+                Cell::from(if tg.written > 0 {
+                    human_size(tg.written)
+                } else {
+                    "—".into()
+                })
+                .style(Style::default().fg(if tg.written > 0 {
+                    t.label
+                } else {
+                    t.dim
+                })),
+                Cell::from(if rate >= 1.0 {
+                    format!("{}/s", human_size(rate as u64))
+                } else {
+                    "—".into()
+                })
+                .style(Style::default().fg(if hot { t.accent } else { t.dim })),
+                Cell::from(match tg.last_write {
+                    Some(at) => format!("{:.1}s", at.elapsed().as_secs_f64()),
+                    None => "—".into(),
+                })
+                .style(Style::default().fg(t.dim)),
+                Cell::from(bars).style(Style::default().fg(if hot { t.accent } else { t.label })),
+            ])
+        });
+
+        let widths = [
+            Constraint::Length(6),
+            Constraint::Length(30),
+            Constraint::Length(8),
+            Constraint::Length(9),
+            Constraint::Length(10),
+            Constraint::Length(7),
+            Constraint::Min(10),
+        ];
+        let mut st = TableState::default();
+        st.select(Some(self.top_sel.min(rows.len().saturating_sub(1))));
+        let title = format!(
+            " writes — {} files, {} active, {} in {}s at {}/s · sort {}{} ",
+            w.targets.len(),
+            w.active_count(ACTIVE_WINDOW),
+            human_size(w.total_written()),
+            w.elapsed().as_secs(),
+            human_size(w.total_rate() as u64),
+            order.label(),
+            if w.paused { " · PAUSED" } else { "" },
+        );
+        f.render_stateful_widget(
+            Table::new(body, widths)
+                .header(header)
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_style(Style::default().fg(t.accent))
+                        .title(title),
+                )
+                .row_highlight_style(Style::default().add_modifier(Modifier::REVERSED)),
+            area,
+            &mut st,
         );
     }
 
@@ -4078,6 +4321,86 @@ mod tests {
         press(&mut app, 'o');
         assert!(!app.reopen, "the editor keeps o for inserting a byte");
         assert_eq!(app.hex.as_ref().unwrap().bytes.len(), before + 1);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The write monitor: `w` opens it, it shows the watched stores, and rows
+    /// light up as bytes land.
+    #[test]
+    fn write_monitor_shows_live_writes() {
+        use std::io::Write;
+        let mut app = rkyv_app();
+        press(&mut app, 'w');
+        assert_eq!(app.screen, super::Screen::Top);
+        let watcher = app.top.as_ref().expect("watcher running");
+        assert!(
+            !watcher.targets.is_empty(),
+            "the open file must be watched at least"
+        );
+        assert!(app.status.contains("watching"), "got {:?}", app.status);
+        assert_eq!(app.help_ctx(), HelpCtx::Top);
+
+        // Watch a file we can write to, then write to it.
+        let path = scratch("rkyv");
+        std::fs::write(&path, b"start").unwrap();
+        app.top = Some(crate::watch::Watcher::new([(path.clone(), Kind::Rkyv)]));
+        let rows = frame_rows(&mut app, 110, 14);
+        assert!(
+            contains(&rows, "writes —"),
+            "no monitor header: {:?}",
+            rows[0]
+        );
+        assert!(contains(&rows, "activity"), "no column header");
+        assert!(contains(&rows, "0 active"), "nothing should be active yet");
+
+        {
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap();
+            f.write_all(&[b'x'; 4096]).unwrap();
+        }
+        // Force a sample the way the event loop's tick does.
+        let w = app.top.as_mut().unwrap();
+        w.interval = std::time::Duration::ZERO;
+        assert!(w.tick());
+        w.interval = crate::watch::DEFAULT_INTERVAL;
+
+        let rows = frame_rows(&mut app, 110, 14);
+        assert!(contains(&rows, "1 active"), "the write was not noticed");
+        assert!(contains(&rows, "4.0 K"), "written bytes missing: {rows:#?}");
+        assert!(
+            rows.iter().any(|r| r.contains('█') || r.contains('▁')),
+            "no activity sparkline drawn"
+        );
+
+        // Sorting, pausing and the sample interval are all reachable.
+        let before = app.top_order;
+        press(&mut app, 's');
+        assert_ne!(app.top_order, before);
+        assert!(app.status.contains("sorted by"));
+        press(&mut app, 'p');
+        assert!(app.top.as_ref().unwrap().paused);
+        assert!(contains(&frame_rows(&mut app, 110, 14), "PAUSED"));
+        press(&mut app, 'p');
+        assert!(!app.top.as_ref().unwrap().paused);
+        let iv = app.top.as_ref().unwrap().interval;
+        press(&mut app, '+');
+        assert!(app.top.as_ref().unwrap().interval < iv, "+ samples faster");
+        press(&mut app, '-');
+        assert_eq!(app.top.as_ref().unwrap().interval, iv);
+
+        // Enter hands the selected file to the caller instead of opening it here.
+        app.on_key(KeyEvent::from(KeyCode::Enter));
+        assert_eq!(app.open_next(), Some(path.clone()));
+        assert!(app.reopen && app.quit);
+
+        // `w` again (or Esc) leaves the monitor.
+        let mut app = rkyv_app();
+        press(&mut app, 'w');
+        press(&mut app, 'w');
+        assert_eq!(app.screen, super::Screen::Main);
+        assert!(app.top.is_none(), "the watcher is dropped on the way out");
         let _ = std::fs::remove_file(&path);
     }
 

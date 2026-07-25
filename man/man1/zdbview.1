@@ -401,6 +401,11 @@ rather than
 which edits data on every other screen. See also
 .BR \-\-list\-themes " and " \-\-theme .
 .TP
+.B w
+Open the write monitor \(em see
+.B WRITE MONITOR
+below \(em or close it when it is already open.
+.TP
 .B o
 Leave the open file and return to the picker, to open another one. In the hex
 editor
@@ -498,6 +503,37 @@ list is loaded. Roots given with
 .B \-\-scan
 neither read nor write the saved scan, being a different set from the default
 roots.
+.SH WRITE MONITOR
+.B w
+opens a
+.BR top -style
+view of every store zdbview knows about (the open file, the recent-files list and
+the saved scan), showing which are being written to. Each row carries the file's
+size, the bytes seen since the monitor opened, the current rate, the age of the
+last write, and a sparkline of the last twenty-four samples scaled against the
+busiest row.
+.PP
+.B s
+cycles the ordering (recent, rate, written, size, name),
+.B p
+pauses and resumes,
+.BR + / \-
+halve and double the sampling interval between 100\ ms and five seconds,
+.B Enter
+opens the selected file, and
+.BR w " or " Esc
+returns.
+.PP
+Activity is detected by polling
+.BR stat (2)
+rather than through a filesystem notification API, which keeps the behaviour
+identical across platforms at the cost of sub-tick resolution. SQLite writes are
+attributed correctly: the
+.B \-wal
+sidecar is sampled with the database and its growth counted as the database's, so
+a busy database does not appear idle, and a checkpoint moving bytes from the log
+into the file is not counted twice. A rkyv shard rewritten by rename may shrink;
+that counts as activity but adds no bytes to the total.
 .SH LARGE ARCHIVES
 Validating a large rkyv archive is slow \(em a 382\ MB heap image takes about
 twenty-five seconds \(em so anything over 4\ MB is decoded on a background

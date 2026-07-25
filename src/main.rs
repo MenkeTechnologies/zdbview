@@ -25,6 +25,7 @@ mod scan;
 mod sqlite;
 mod store;
 mod theme;
+mod watch;
 
 use anyhow::{anyhow, Result};
 use clap::Parser;
@@ -365,27 +366,38 @@ fn run(cli: &Cli, terminal: &mut DefaultTerminal, theme: Option<theme::ThemeName
     // prefs at every hop: another instance writing prefs must not change what
     // this one is showing.
     let mut scheme = app::resolve_theme(theme);
+    // A file the write monitor asked to open, which skips the picker.
+    let mut pending: Option<PathBuf> = None;
 
     // An explicit FILE opens straight away; `o` or Esc there still lead to the
     // picker, so fall through to the loop instead of exiting.
     if let Some(file) = &cli.file {
-        let (outcome, used) = open_and_run(cli, terminal, scheme, file.clone())?;
+        let (outcome, used, next) = open_and_run(cli, terminal, scheme, file.clone())?;
         if outcome == app::Outcome::Quit {
             return Ok(());
         }
         scheme = used;
+        pending = next;
     }
     loop {
-        let picked = match pick(cli, terminal, scheme)? {
-            Some(p) => p,
-            None => return Ok(()), // user quit the picker
+        // The write monitor can hand over a file directly; otherwise ask the
+        // picker.
+        let file = match pending.take() {
+            Some(f) => f,
+            None => match pick(cli, terminal, scheme)? {
+                Some(picked) => {
+                    scheme = picked.theme;
+                    picked.path
+                }
+                None => return Ok(()), // user quit the picker
+            },
         };
-        scheme = picked.theme;
-        let (outcome, used) = open_and_run(cli, terminal, scheme, picked.path)?;
+        let (outcome, used, next) = open_and_run(cli, terminal, scheme, file)?;
         if outcome == app::Outcome::Quit {
             return Ok(());
         }
         scheme = used;
+        pending = next;
     }
 }
 
@@ -448,11 +460,11 @@ fn open_and_run(
     terminal: &mut DefaultTerminal,
     scheme: theme::Theme,
     file: PathBuf,
-) -> Result<(app::Outcome, theme::Theme)> {
+) -> Result<(app::Outcome, theme::Theme, Option<PathBuf>)> {
     let kind = store::detect(&file, cli.sqlite, cli.rkyv)?;
     let (store, actual) = store::Store::open(&file, kind)?;
     mru::record(&file, actual);
     let mut app = app::App::with_theme(store, scheme);
     let outcome = app.run(terminal)?;
-    Ok((outcome, app.theme()))
+    Ok((outcome, app.theme(), app.open_next()))
 }

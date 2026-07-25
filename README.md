@@ -363,6 +363,49 @@ filter the same way; the Hex view is unfiltered (bytes have no rows) and keeps
 `/` as a byte search. Matching is case-insensitive substring; the hex byte search
 is case-sensitive.
 
+## Write monitor (`w`)
+
+`w` opens a `top` for stores: every shard and database zdbview knows about — the
+open file, the recent list and the saved scan — with what is being written to it
+right now.
+
+```
+┌ writes — 130 files, 2 active, 70 K in 6s at 29 K/s · sort written ─────────────┐
+│kind   file                           size     written   rate       last  activity│
+│rkyv   scripts.rkyv                   62 K     62 K      26 K/s     0.0s  ▂▃▄▆▇█ │
+│sqlite compsys.db                     187 M    8.8 K     2.9 K/s    0.0s  ▁▁▁▁▁▁ │
+│sqlite catalog.db                     48 M     —         —          —            │
+└────────────────────────────────────────────────────────────────────────────────┘
+```
+
+| Key | Action |
+|-----|--------|
+| `s` | cycle the sort: recent / rate / written / size / name |
+| `p` | pause and resume sampling |
+| `+` / `-` | sample faster / slower (100 ms … 5 s, 500 ms default) |
+| `Enter` | open the selected file |
+| `j` `k`, `PgUp` `PgDn`, `g` `G` | move |
+| `w` / `Esc` | back |
+
+Detection is by polling `stat`, not a filesystem notification API: no extra
+dependency, identical behaviour on macOS and Linux, and a few hundred `stat` calls
+per tick cost less than a frame. The trade is sub-tick resolution — a write that
+lands and is undone inside one interval is invisible.
+
+Two things it gets right that a naive size watch does not:
+
+- **SQLite writes land in the `-wal` sidecar first**, often growing it by megabytes
+  while the database file itself is untouched until a checkpoint. The sidecar is
+  sampled alongside and its growth attributed to the database, so a busy database
+  does not read as idle.
+- **rkyv shards are rewritten atomically** (temp file plus rename), so they can
+  shrink. A shrink counts as activity but adds no bytes to the total, and a
+  checkpoint that moves bytes from WAL to database is not counted twice.
+
+`written` is bytes seen since the monitor opened, `rate` averages the last four
+samples so one quiet tick does not read as "stopped", and `activity` is the last 24
+samples scaled against the busiest row on screen.
+
 ## Large archives
 
 Opening a big shard used to block: a 382 MB `elisprs` heap image took ~4 s to

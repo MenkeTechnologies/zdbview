@@ -56,6 +56,8 @@ pub enum HelpCtx {
     Picker,
     /// The hex editor over a record's value.
     HexEdit,
+    /// The live write monitor.
+    Top,
 }
 
 /// The overlay layer: active scheme plus help / chooser / editor / toast state.
@@ -720,6 +722,7 @@ impl HelpCtx {
             HelpCtx::Rkyv => "rkyv archive",
             HelpCtx::Picker => "recent files",
             HelpCtx::HexEdit => "hex editor",
+            HelpCtx::Top => "write monitor",
         }
     }
 }
@@ -732,6 +735,7 @@ struct HelpSection {
 
 /// Bindings shown on every screen: the overlay layer's own keys.
 const DISPLAY_KEYS: &[(&str, &str)] = &[
+    ("w", "Write monitor"),
     ("c", "Scheme chooser"),
     ("C", "Palette editor"),
     ("o / Esc", "Back to file list"),
@@ -747,6 +751,37 @@ const MOUSE_KEYS: &[(&str, &str)] = &[
 
 /// The help overlay's contents for a screen.
 fn help_sections(ctx: HelpCtx) -> Vec<HelpSection> {
+    if ctx == HelpCtx::Top {
+        return vec![
+            HelpSection {
+                title: "WATCH",
+                keys: &[
+                    ("s", "Cycle sort order"),
+                    ("p", "Pause / resume"),
+                    ("+ / -", "Sample faster/slower"),
+                    ("Enter", "Open the file"),
+                    ("w / Esc", "Back"),
+                ],
+            },
+            HelpSection {
+                title: "NAV",
+                keys: &[
+                    ("j/k ↑↓", "Move"),
+                    ("PgUp/PgDn", "Page"),
+                    ("g / G", "Top / bottom"),
+                ],
+            },
+            HelpSection {
+                title: "COLUMNS",
+                keys: &[
+                    ("written", "Bytes since opening"),
+                    ("rate", "Bytes per second"),
+                    ("last", "Age of last write"),
+                    ("activity", "Recent samples"),
+                ],
+            },
+        ];
+    }
     if ctx == HelpCtx::HexEdit {
         // The editor is modal: it owns h and c, so its help is reachable from
         // the Records view before opening it (and from `?` inside it).
