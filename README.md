@@ -92,8 +92,9 @@ j/k move · / search · Enter open · c scheme · h help · q quit  ·  awkrs sc
 ```
 
 The scan runs on its own thread, so the picker is usable immediately and fills in
-as results arrive; the title counts what has been found and `/` searches the whole
-path, not just the file name. Recent rows show their age, scanned rows their size,
+as results arrive; the title counts what has been found. `/` **filters** the list
+by path as you type (`zdbview — 1/127 files  /compsys` with everything else gone),
+`Enter` keeps the filter, `Esc` clears it, and a second `Esc` quits. Recent rows show their age, scanned rows their size,
 and the bottom line names the recognized format of the selected row.
 
 **The walk does not repeat on every start.** A completed scan is saved to

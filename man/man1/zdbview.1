@@ -266,7 +266,11 @@ clears it and restores the position. The pattern is matched against table names,
 or \(em with the row grid focused \(em every column of the table via a SQL
 .BR WHERE ,
 so it covers the whole table rather than the loaded page; also against record
-keys, the extracted strings, and the paths in the picker. Matching is a
+keys, the extracted strings, and the whole path of each row in the picker (where
+.B Esc
+clears the filter and a second
+.B Esc
+quits). Matching is a
 case-insensitive substring. The Hex view is not filtered: there
 .B /
 searches for a byte sequence, case-sensitively.

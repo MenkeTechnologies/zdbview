@@ -2559,17 +2559,21 @@ pub fn pick_mru(terminal: &mut DefaultTerminal, mut p: Picker<'_>) -> Result<Opt
     let mut cache_age = p.cache_age;
     // Hits are kept as well as merged so a finished walk can be saved.
     let mut scanned: Vec<crate::scan::Hit> = std::mem::take(&mut p.cached);
-    let mut idx = 0usize;
-    let mut pending_g = false;
-    let mut search = String::new();
-    let mut searching = false;
-    // Where `/` was pressed, so the incremental match is measured from there.
-    let mut search_origin = 0usize;
-    // First row the list drew last frame, for mapping a click to an entry.
-    let mut list_offset = 0usize;
     // Recent files first, then whatever the scan turns up.
     let mut choices: Vec<Choice> = entries.iter().map(Choice::from_entry).collect();
     merge_hits(&mut choices, scanned.clone());
+
+    // `/` filters the list: `view` holds the indices still listed and `sel` is a
+    // position within it, so navigation and clicks address rows that are visible.
+    let mut filter = String::new();
+    let mut typing = false;
+    let mut sel = 0usize;
+    let mut pending_g = false;
+    // The row `/` was pressed on, restored when the filter is cancelled.
+    let mut before_filter = 0usize;
+    // First row the list drew last frame, for mapping a click to an entry.
+    let mut list_offset = 0usize;
+
     // The picker carries the same overlay layer as the main screens, so `h`,
     // `c` and `C` work here too — and a scheme picked here is the one the file
     // opens with.
@@ -2579,12 +2583,8 @@ pub fn pick_mru(terminal: &mut DefaultTerminal, mut p: Picker<'_>) -> Result<Opt
         (None, Some(c)) => Theme::from_palette(prefs.theme, c),
         (None, None) => Theme::from_name(prefs.theme),
     });
+
     loop {
-        let query = if searching {
-            Some(search.as_str())
-        } else {
-            None
-        };
         // Pull in whatever the scan thread produced since the last frame, and
         // save the finished list so the next start does not walk again.
         let scanning = match scan.as_mut() {
@@ -2605,14 +2605,27 @@ pub fn pick_mru(terminal: &mut DefaultTerminal, mut p: Picker<'_>) -> Result<Opt
             }
             None => None,
         };
+
+        // Rows the filter leaves listed, and a selection inside that list.
+        let view: Vec<usize> = choices
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| filter_passes(&filter, c.path.to_str().unwrap_or("")))
+            .map(|(i, _)| i)
+            .collect();
+        sel = sel.min(view.len().saturating_sub(1));
+
         // List height for paging: the body minus its borders.
         let page = terminal
             .size()
             .map(|s| s.height.saturating_sub(3) as usize)
             .unwrap_or(10)
             .max(1);
+        let prompt = typing.then_some(filter.as_str());
         terminal.draw(|f| {
-            list_offset = render_picker(f, &choices, idx, query, scanning, cache_age, &ov.theme);
+            list_offset = render_picker(
+                f, &choices, &view, sel, &filter, prompt, scanning, cache_age, &ov.theme,
+            );
             ov.render(f, HelpCtx::Picker);
         })?;
         if !event::poll(TICK)? {
@@ -2621,30 +2634,29 @@ pub fn pick_mru(terminal: &mut DefaultTerminal, mut p: Picker<'_>) -> Result<Opt
         }
         let ev = event::read()?;
         ov.expire_toast();
+
+        let last = view.len().saturating_sub(1);
+        let pick = |i: usize| -> Option<PathBuf> { view.get(i).map(|&c| choices[c].path.clone()) };
+
         // Mouse: wheel moves the selection, a click opens the entry under it.
         if let Event::Mouse(m) = ev {
             if ov.on_mouse(m) {
                 continue;
             }
             match m.kind {
-                MouseEventKind::ScrollDown => {
-                    if idx + 1 < choices.len() {
-                        idx += 1;
-                    }
-                }
-                MouseEventKind::ScrollUp => idx = idx.saturating_sub(1),
+                MouseEventKind::ScrollDown => sel = (sel + 1).min(last),
+                MouseEventKind::ScrollUp => sel = sel.saturating_sub(1),
                 MouseEventKind::Down(_) => {
-                    // The list starts one row below the block's top border, and
-                    // is scrolled by `offset` — without that a click in a
-                    // scrolled list opened the wrong file. Rows below the last
-                    // entry (and the status line) select nothing.
+                    // The list starts one row below the block's top border and is
+                    // scrolled by `list_offset`; rows past the last entry select
+                    // nothing.
                     let row = (m.row as usize).saturating_sub(1);
                     let clicked = row + list_offset;
-                    if row < page && clicked < choices.len() {
+                    if row < page && clicked < view.len() {
                         if let Some(sc) = &scan {
                             sc.cancel();
                         }
-                        return Ok(Some(choices[clicked].path.clone()));
+                        return Ok(pick(clicked));
                     }
                 }
                 _ => {}
@@ -2658,35 +2670,34 @@ pub fn pick_mru(terminal: &mut DefaultTerminal, mut p: Picker<'_>) -> Result<Opt
             // Ctrl-f / Ctrl-b page like the app's grids do.
             if key.modifiers.contains(KeyModifiers::CONTROL) {
                 match key.code {
-                    KeyCode::Char('f') => idx = (idx + page).min(choices.len().saturating_sub(1)),
-                    KeyCode::Char('b') => idx = idx.saturating_sub(page),
+                    KeyCode::Char('f') => sel = (sel + page).min(last),
+                    KeyCode::Char('b') => sel = sel.saturating_sub(page),
                     _ => {}
                 }
                 continue;
             }
 
-            // Search-input capture takes priority. The selection follows the
-            // pattern as it is typed, from where `/` was pressed.
-            if searching {
+            // While the `/` prompt is open every key edits the filter, and the
+            // list shrinks to the matches as it is typed.
+            if typing {
                 match key.code {
                     KeyCode::Esc => {
-                        searching = false;
-                        search.clear();
-                        idx = search_origin;
+                        // Cancel: drop the filter and go back to the row `/` was
+                        // pressed on.
+                        typing = false;
+                        filter.clear();
+                        sel = before_filter;
                     }
-                    KeyCode::Enter => searching = false,
+                    KeyCode::Enter => typing = false,
                     KeyCode::Backspace => {
-                        search.pop();
+                        filter.pop();
+                        sel = 0;
                     }
-                    KeyCode::Char(c) => search.push(c),
+                    KeyCode::Char(c) => {
+                        filter.push(c);
+                        sel = 0;
+                    }
                     _ => {}
-                }
-                if searching {
-                    idx = if search.is_empty() {
-                        search_origin
-                    } else {
-                        picker_find_from(&choices, search_origin, &search).unwrap_or(search_origin)
-                    };
                 }
                 continue;
             }
@@ -2699,7 +2710,7 @@ pub fn pick_mru(terminal: &mut DefaultTerminal, mut p: Picker<'_>) -> Result<Opt
             if key.code == KeyCode::Char('g') {
                 if pending_g {
                     pending_g = false;
-                    idx = 0;
+                    sel = 0;
                 } else {
                     pending_g = true;
                 }
@@ -2707,6 +2718,11 @@ pub fn pick_mru(terminal: &mut DefaultTerminal, mut p: Picker<'_>) -> Result<Opt
             }
             pending_g = false;
             match key.code {
+                // Esc clears an applied filter first, then quits.
+                KeyCode::Esc if !filter.is_empty() => {
+                    filter.clear();
+                    sel = 0;
+                }
                 KeyCode::Char('q') | KeyCode::Esc => {
                     if let Some(sc) = &scan {
                         sc.cancel();
@@ -2714,20 +2730,14 @@ pub fn pick_mru(terminal: &mut DefaultTerminal, mut p: Picker<'_>) -> Result<Opt
                     return Ok(None);
                 }
                 KeyCode::Char('/') => {
-                    searching = true;
-                    search.clear();
-                    search_origin = idx;
+                    typing = true;
+                    filter.clear();
+                    before_filter = sel;
+                    sel = 0;
                 }
-                KeyCode::Char('n') => {
-                    if let Some(i) = picker_find(&choices, idx, true, &search) {
-                        idx = i;
-                    }
-                }
-                KeyCode::Char('N') => {
-                    if let Some(i) = picker_find(&choices, idx, false, &search) {
-                        idx = i;
-                    }
-                }
+                // Within a filtered list every row matches, so n/N simply step.
+                KeyCode::Char('n') => sel = (sel + 1).min(last),
+                KeyCode::Char('N') => sel = sel.saturating_sub(1),
                 // `r` walks again (keeping the rows on screen until new ones
                 // arrive); `R` also drops the saved scan first.
                 KeyCode::Char('r') | KeyCode::Char('R') => {
@@ -2739,30 +2749,24 @@ pub fn pick_mru(terminal: &mut DefaultTerminal, mut p: Picker<'_>) -> Result<Opt
                     }
                     scanned.clear();
                     choices.retain(|c| c.opened.is_some());
-                    idx = 0;
+                    sel = 0;
                     cache_age = None;
                     scan = Some(crate::scan::spawn(p.roots.clone()));
                     ov.toast("rescanning");
                 }
-                KeyCode::Char('G') => idx = choices.len().saturating_sub(1),
+                KeyCode::Char('G') => sel = last,
                 // A screenful, from the height this frame was drawn at.
-                KeyCode::PageDown => {
-                    idx = (idx + page).min(choices.len().saturating_sub(1));
-                }
-                KeyCode::PageUp => idx = idx.saturating_sub(page),
-                KeyCode::Up | KeyCode::Char('k') => idx = idx.saturating_sub(1),
-                KeyCode::Down | KeyCode::Char('j') => {
-                    if idx + 1 < choices.len() {
-                        idx += 1;
-                    }
-                }
+                KeyCode::PageDown => sel = (sel + page).min(last),
+                KeyCode::PageUp => sel = sel.saturating_sub(page),
+                KeyCode::Up | KeyCode::Char('k') => sel = sel.saturating_sub(1),
+                KeyCode::Down | KeyCode::Char('j') => sel = (sel + 1).min(last),
                 KeyCode::Enter => {
-                    if let Some(c) = choices.get(idx) {
+                    if let Some(path) = pick(sel) {
                         // Nothing more to walk once a file is chosen.
                         if let Some(sc) = &scan {
                             sc.cancel();
                         }
-                        return Ok(Some(c.path.clone()));
+                        return Ok(Some(path));
                     }
                 }
                 _ => {}
@@ -2771,44 +2775,28 @@ pub fn pick_mru(terminal: &mut DefaultTerminal, mut p: Picker<'_>) -> Result<Opt
     }
 }
 
-/// First row at or after `from` whose path contains `q`, for the incremental
-/// search while typing.
-fn picker_find_from(choices: &[Choice], from: usize, q: &str) -> Option<usize> {
-    if q.is_empty() {
-        return None;
-    }
-    let ql = q.to_lowercase();
-    find_from(choices.len(), from, |i| {
-        choices[i]
-            .path
-            .to_str()
-            .map(|p| p.to_lowercase().contains(&ql))
-            .unwrap_or(false)
-    })
-}
+/// Archives up to this size are decoded inline; bigger ones go to a thread.
+/// 12MB takes ~0.8s to validate, 382MB takes ~25s, so the line sits below the
+/// point where a person would notice the wait.
+const DECODE_INLINE_MAX: usize = 4 * 1024 * 1024;
 
-/// Find the next/previous picker row whose path contains `q` (the whole path, so
-/// a scan hit can be found by its directory as well as its name).
-fn picker_find(choices: &[Choice], from: usize, forward: bool, q: &str) -> Option<usize> {
-    if q.is_empty() {
-        return None;
-    }
-    let ql = q.to_lowercase();
-    find_next(choices.len(), from, forward, |i| {
-        choices[i]
-            .path
-            .to_str()
-            .map(|p| p.to_lowercase().contains(&ql))
-            .unwrap_or(false)
-    })
+/// Validate and decode `bytes` on another thread.
+fn spawn_decode(bytes: Vec<u8>) -> std::sync::mpsc::Receiver<Option<Decoded>> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(formats::try_decode(&bytes));
+    });
+    rx
 }
 
 #[allow(clippy::too_many_arguments)]
 fn render_picker(
     f: &mut Frame,
     choices: &[Choice],
-    idx: usize,
-    query: Option<&str>,
+    view: &[usize],
+    sel: usize,
+    filter: &str,
+    prompt: Option<&str>,
     scanning: Option<usize>,
     cache_age: Option<std::time::Duration>,
     t: &Theme,
@@ -2816,13 +2804,24 @@ fn render_picker(
     let outer = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(f.area());
     let mut offset = 0usize;
 
-    if choices.is_empty() {
-        let body = match scanning {
-            Some(_) => vec![
+    if view.is_empty() {
+        let body = if !filter.is_empty() {
+            vec![
+                Line::from(""),
+                Line::from(format!("  Nothing matches /{}", filter)),
+                Line::from(""),
+                Line::from(Span::styled(
+                    "  Esc clears the filter",
+                    Style::default().fg(t.dim),
+                )),
+            ]
+        } else if scanning.is_some() {
+            vec![
                 Line::from(""),
                 Line::from("  Scanning for databases and rkyv shards…"),
-            ],
-            None => vec![
+            ]
+        } else {
+            vec![
                 Line::from(""),
                 Line::from("  Nothing found."),
                 Line::from(""),
@@ -2834,7 +2833,7 @@ fn render_picker(
                     "  Or scan elsewhere:  zdbview --scan <dir>",
                     Style::default().fg(t.dim),
                 )),
-            ],
+            ]
         };
         let p = Paragraph::new(body).block(
             Block::default()
@@ -2844,16 +2843,16 @@ fn render_picker(
         );
         f.render_widget(p, outer[0]);
     } else {
-        let items: Vec<ListItem> = choices
+        let items: Vec<ListItem> = view
             .iter()
-            .map(|c| {
+            .map(|&i| {
+                let c = &choices[i];
                 let dir = c.path.parent().and_then(|p| p.to_str()).unwrap_or("");
                 let (badge, color) = match c.kind {
                     Kind::Sqlite => ("sqlite", t.primary),
                     Kind::Rkyv => ("rkyv  ", t.alt),
                 };
-                // Recent files show their age; scanned ones show a marker, so it
-                // is obvious which rows came from where.
+                // Recent files show their age; scanned ones their size.
                 let (age, age_style) = match (c.opened, c.size) {
                     (Some(when), _) => (mru::rel_age(when), Style::default().fg(t.dim)),
                     (None, Some(size)) => (human_size(size), Style::default().fg(t.label)),
@@ -2871,24 +2870,36 @@ fn render_picker(
             })
             .collect();
         let mut st = ListState::default();
-        st.select(Some(idx.min(choices.len().saturating_sub(1))));
-        let recent = choices.iter().filter(|c| c.opened.is_some()).count();
-        let title = match (scanning, cache_age) {
-            (Some(found), _) => format!(
-                " zdbview — {} files ({} recent, scanning… {} found) ",
+        st.select(Some(sel.min(view.len() - 1)));
+        let recent = view
+            .iter()
+            .filter(|&&i| choices[i].opened.is_some())
+            .count();
+        let title = if !filter.is_empty() {
+            // A filtered list says how much of the whole it is showing.
+            format!(
+                " zdbview — {}/{} files  /{} ",
+                view.len(),
                 choices.len(),
-                recent,
-                found
-            ),
-            // Saved scans are reused, so say how old the rows are and how to
-            // refresh them.
-            (None, Some(age)) => format!(
-                " zdbview — {} files ({} recent, scan {} · r rescans) ",
-                choices.len(),
-                recent,
-                age_label(age)
-            ),
-            (None, None) => format!(" zdbview — {} files ({} recent) ", choices.len(), recent),
+                filter
+            )
+        } else {
+            match (scanning, cache_age) {
+                (Some(found), _) => format!(
+                    " zdbview — {} files ({} recent, scanning… {} found) ",
+                    view.len(),
+                    recent,
+                    found
+                ),
+                // Saved scans are reused, so say how old the rows are.
+                (None, Some(age)) => format!(
+                    " zdbview — {} files ({} recent, scan {} · r rescans) ",
+                    view.len(),
+                    recent,
+                    age_label(age)
+                ),
+                (None, None) => format!(" zdbview — {} files ({} recent) ", view.len(), recent),
+            }
         };
         let list = List::new(items)
             .block(
@@ -2902,15 +2913,16 @@ fn render_picker(
         offset = st.offset();
     }
 
-    // Bottom line: the search prompt, else the selected row's format / size.
-    let help = match query {
+    // Bottom line: the filter prompt while typing, else the selected row's
+    // format, else the keys.
+    let help = match prompt {
         Some(q) => {
             Paragraph::new(format!("/{}_", q)).style(Style::default().fg(Color::Black).bg(t.accent))
         }
         None => {
-            let detail = choices
-                .get(idx)
-                .and_then(|c| c.format)
+            let detail = view
+                .get(sel)
+                .and_then(|&i| choices[i].format)
                 .map(|fmt| format!("  ·  {}", fmt))
                 .unwrap_or_default();
             // Kept short so the selected row's format still fits beside it on a
@@ -2926,34 +2938,9 @@ fn render_picker(
     offset
 }
 
-/// Archives up to this size are decoded inline; bigger ones go to a thread.
-/// 12MB takes ~0.8s to validate, 382MB takes ~25s, so the line sits below the
-/// point where a person would notice the wait.
-const DECODE_INLINE_MAX: usize = 4 * 1024 * 1024;
-
-/// Validate and decode `bytes` on another thread.
-fn spawn_decode(bytes: Vec<u8>) -> std::sync::mpsc::Receiver<Option<Decoded>> {
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let _ = tx.send(formats::try_decode(&bytes));
-    });
-    rx
-}
-
 /// Whether `hay` passes `filter` (case-insensitive substring; empty passes all).
 fn filter_passes(filter: &str, hay: &str) -> bool {
     filter.is_empty() || hay.to_lowercase().contains(&filter.to_lowercase())
-}
-
-/// First index at or after `from` (wrapping once) for which `pred` holds. Unlike
-/// [`find_next`], `from` itself counts — an incremental search must be able to
-/// stay where it is as the pattern grows.
-fn find_from(len: usize, from: usize, pred: impl Fn(usize) -> bool) -> Option<usize> {
-    if len == 0 {
-        return None;
-    }
-    let start = from.min(len - 1);
-    (0..len).map(|step| (start + step) % len).find(|&i| pred(i))
 }
 
 /// Find the next index (wrapping) from `from` for which `pred` holds, scanning
@@ -3581,7 +3568,8 @@ mod tests {
         let render = |choices: &[super::Choice], scanning: Option<usize>| -> Vec<String> {
             let mut term = Terminal::new(TestBackend::new(100, 8)).unwrap();
             term.draw(|f| {
-                super::render_picker(f, choices, 0, None, scanning, None, &theme);
+                let view: Vec<usize> = (0..choices.len()).collect();
+                super::render_picker(f, choices, &view, 0, "", None, scanning, None, &theme);
             })
             .unwrap();
             let buf = term.backend().buffer().clone();
@@ -3795,20 +3783,6 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    #[test]
-    fn find_from_is_inclusive_and_wraps() {
-        let pred = |i: usize| i == 1 || i == 4;
-        assert_eq!(super::find_from(5, 1, pred), Some(1), "from itself counts");
-        assert_eq!(super::find_from(5, 2, pred), Some(4));
-        assert_eq!(super::find_from(5, 0, pred), Some(1));
-        assert_eq!(super::find_from(5, 4, pred), Some(4));
-        // Wraps past the end back to the first match.
-        assert_eq!(super::find_from(5, 3, |i| i == 0), Some(0));
-        assert_eq!(super::find_from(5, 9, pred), Some(4), "clamps a wild start");
-        assert_eq!(super::find_from(0, 0, pred), None);
-        assert_eq!(super::find_from(5, 0, |_| false), None);
-    }
-
     /// PageUp/PageDown must move by what is on screen. They used to be bound to
     /// the 500-row SQL window, which did nothing at all on a smaller table, and
     /// were missing outright from the Records and Strings views.
@@ -3995,6 +3969,67 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// The picker's `/` must remove rows, not just move the cursor.
+    #[test]
+    fn picker_filter_removes_rows_from_the_list() {
+        let theme = crate::theme::Theme::from_name(ThemeName::NeonSprawl);
+        let mut choices: Vec<super::Choice> = Vec::new();
+        super::merge_hits(
+            &mut choices,
+            vec![
+                scan_hit("/h/.zshrs/scripts.rkyv", Kind::Rkyv, None, 30, 1),
+                scan_hit("/h/.zshrs/compsys.db", Kind::Sqlite, None, 20, 2),
+                scan_hit("/h/.pythonrs/scripts.rkyv", Kind::Rkyv, None, 10, 1),
+            ],
+        );
+        let render = |filter: &str| -> Vec<String> {
+            let view: Vec<usize> = choices
+                .iter()
+                .enumerate()
+                .filter(|(_, c)| super::filter_passes(filter, c.path.to_str().unwrap()))
+                .map(|(i, _)| i)
+                .collect();
+            let mut term = Terminal::new(TestBackend::new(100, 10)).unwrap();
+            term.draw(|f| {
+                super::render_picker(f, &choices, &view, 0, filter, None, None, None, &theme);
+            })
+            .unwrap();
+            let buf = term.backend().buffer().clone();
+            (0..buf.area().height)
+                .map(|y| {
+                    (0..buf.area().width)
+                        .map(|x| buf[(x, y)].symbol())
+                        .collect::<String>()
+                })
+                .collect()
+        };
+
+        // Unfiltered: all three.
+        let rows = render("");
+        assert!(contains(&rows, "compsys.db"));
+        assert!(contains(&rows, "3 files"));
+
+        // Filtering by directory drops the pythonrs row entirely.
+        let rows = render("zshrs");
+        assert!(contains(&rows, "scripts.rkyv") && contains(&rows, "compsys.db"));
+        assert!(
+            !contains(&rows, ".pythonrs"),
+            "a filtered-out row is still listed: {rows:#?}"
+        );
+        assert!(contains(&rows, "2/3 files"), "count missing: {:?}", rows[0]);
+        assert!(contains(&rows, "/zshrs"), "the pattern must be shown");
+
+        // Filtering by name works the same way.
+        let rows = render("compsys");
+        assert!(contains(&rows, "compsys.db") && !contains(&rows, "pythonrs"));
+        assert!(contains(&rows, "1/3 files"));
+
+        // No match: the list is empty and says how to get out.
+        let rows = render("nothing-matches-this");
+        assert!(contains(&rows, "Nothing matches"));
+        assert!(contains(&rows, "Esc clears the filter"));
+    }
+
     /// Rows restored from the saved scan are labelled with their age, so it is
     /// clear the list was not just walked.
     #[test]
@@ -4008,7 +4043,8 @@ mod tests {
         let render = |age: Option<std::time::Duration>| -> Vec<String> {
             let mut term = Terminal::new(TestBackend::new(100, 6)).unwrap();
             term.draw(|f| {
-                super::render_picker(f, &choices, 0, None, None, age, &theme);
+                let view: Vec<usize> = (0..choices.len()).collect();
+                super::render_picker(f, &choices, &view, 0, "", None, None, age, &theme);
             })
             .unwrap();
             let buf = term.backend().buffer().clone();
