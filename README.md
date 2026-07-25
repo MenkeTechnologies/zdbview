@@ -251,6 +251,12 @@ is published on crates.io); disable with `--no-default-features`.
 
 ## Color schemes
 
+The scheme is carried from screen to screen — the picker hands it to the file it
+opens and the file hands it back — so opening a file never re-reads it from disk
+and cannot land on a different one. Writes to the prefs file are atomic
+(temp-plus-rename), because a plain write is briefly empty and another instance
+reading at that moment would fall back to the default scheme.
+
 `c` opens the scheme chooser (ported from `iftoprs`): every scheme with a swatch
 of its six palette colors, `j`/`k` or the wheel to cycle with live preview,
 `Enter` to save, `Esc` to cancel and restore the previous scheme. `C` opens the

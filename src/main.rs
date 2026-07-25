@@ -361,21 +361,31 @@ fn export_store(store: &Store, fmt: &str) -> Result<String> {
 }
 
 fn run(cli: &Cli, terminal: &mut DefaultTerminal, theme: Option<theme::ThemeName>) -> Result<()> {
+    // The scheme is carried from screen to screen instead of being re-read from
+    // prefs at every hop: another instance writing prefs must not change what
+    // this one is showing.
+    let mut scheme = app::resolve_theme(theme);
+
     // An explicit FILE opens straight away; `o` or Esc there still lead to the
     // picker, so fall through to the loop instead of exiting.
     if let Some(file) = &cli.file {
-        if open_and_run(cli, terminal, theme, file.clone())? == app::Outcome::Quit {
+        let (outcome, used) = open_and_run(cli, terminal, scheme, file.clone())?;
+        if outcome == app::Outcome::Quit {
             return Ok(());
         }
+        scheme = used;
     }
     loop {
-        let file = match pick(cli, terminal, theme)? {
-            Some(f) => f,
+        let picked = match pick(cli, terminal, scheme)? {
+            Some(p) => p,
             None => return Ok(()), // user quit the picker
         };
-        if open_and_run(cli, terminal, theme, file)? == app::Outcome::Quit {
+        scheme = picked.theme;
+        let (outcome, used) = open_and_run(cli, terminal, scheme, picked.path)?;
+        if outcome == app::Outcome::Quit {
             return Ok(());
         }
+        scheme = used;
     }
 }
 
@@ -384,8 +394,8 @@ fn run(cli: &Cli, terminal: &mut DefaultTerminal, theme: Option<theme::ThemeName
 fn pick(
     cli: &Cli,
     terminal: &mut DefaultTerminal,
-    theme: Option<theme::ThemeName>,
-) -> Result<Option<PathBuf>> {
+    scheme: theme::Theme,
+) -> Result<Option<app::Picked>> {
     let recent: Vec<mru::Entry> = mru::load()
         .into_iter()
         .filter(|e| e.path.exists())
@@ -421,7 +431,7 @@ fn pick(
         terminal,
         app::Picker {
             recent: &recent,
-            theme_override: theme,
+            theme: scheme,
             cached,
             cache_age,
             scan: walk.then(|| scan::spawn(roots.clone())),
@@ -431,15 +441,18 @@ fn pick(
     )
 }
 
-/// Open `file` and run the app over it.
+/// Open `file` and run the app over it in `scheme`, reporting the scheme it ended
+/// on so the next screen keeps it.
 fn open_and_run(
     cli: &Cli,
     terminal: &mut DefaultTerminal,
-    theme: Option<theme::ThemeName>,
+    scheme: theme::Theme,
     file: PathBuf,
-) -> Result<app::Outcome> {
+) -> Result<(app::Outcome, theme::Theme)> {
     let kind = store::detect(&file, cli.sqlite, cli.rkyv)?;
     let (store, actual) = store::Store::open(&file, kind)?;
     mru::record(&file, actual);
-    app::App::new(store, theme).run(terminal)
+    let mut app = app::App::with_theme(store, scheme);
+    let outcome = app.run(terminal)?;
+    Ok((outcome, app.theme()))
 }

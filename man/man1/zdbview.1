@@ -389,7 +389,11 @@ and by sixteen with
 and saves the edited palette with
 .BR Enter .
 Both persist to
-.IR $XDG_CONFIG_HOME/zdbview/prefs .
+.IR $XDG_CONFIG_HOME/zdbview/prefs ,
+written atomically (temp file plus rename) so a concurrent reader never sees a
+half-written file and fall back to the default scheme. The active scheme is
+carried between the picker and the open file rather than re-read, so opening a
+file cannot change it.
 The editor is bound to
 .B C
 rather than

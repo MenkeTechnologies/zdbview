@@ -208,15 +208,10 @@ pub struct App {
 }
 
 impl App {
-    /// `theme_override` is `--theme`: it wins over the saved preference (and
-    /// over a saved custom palette) for this run only.
-    pub fn new(store: Store, theme_override: Option<ThemeName>) -> Self {
-        let prefs = crate::prefs::load();
-        let theme = match (theme_override, prefs.custom) {
-            (Some(name), _) => Theme::from_name(name),
-            (None, Some(c)) => Theme::from_palette(prefs.theme, c),
-            (None, None) => Theme::from_name(prefs.theme),
-        };
+    /// Open `store` with an already-resolved scheme. The picker hands its own
+    /// scheme over this way, so opening a file cannot re-read prefs and land on a
+    /// different one.
+    pub fn with_theme(store: Store, theme: Theme) -> Self {
         let mut app = App {
             store,
             focus: Focus::Left,
@@ -270,6 +265,11 @@ impl App {
     fn back_to_files(&mut self) {
         self.reopen = true;
         self.quit = true;
+    }
+
+    /// The scheme currently in use, to carry back to the picker.
+    pub fn theme(&self) -> Theme {
+        self.ov.theme
     }
 
     /// Which key sections the help overlay lists for what is on screen.
@@ -2553,6 +2553,12 @@ impl Choice {
     }
 }
 
+/// What the picker returned: the file to open and the scheme it was showing.
+pub struct Picked {
+    pub path: PathBuf,
+    pub theme: Theme,
+}
+
 /// Merge scan hits into the list, dropping any path already present (a recent
 /// file the scan also found stays a recent file, keeping its age column).
 fn merge_hits(choices: &mut Vec<Choice>, hits: Vec<crate::scan::Hit>) {
@@ -2586,7 +2592,9 @@ fn merge_hits(choices: &mut Vec<Choice>, hits: Vec<crate::scan::Hit>) {
 /// where its scan rows come from.
 pub struct Picker<'a> {
     pub recent: &'a [Entry],
-    pub theme_override: Option<ThemeName>,
+    /// The scheme to show. Carried from the previous screen when there was one,
+    /// so a concurrent prefs write cannot change it mid-session.
+    pub theme: Theme,
     /// Rows restored from the saved scan (appdata), shown immediately.
     pub cached: Vec<crate::scan::Hit>,
     /// How old those rows are, for the title.
@@ -2600,9 +2608,8 @@ pub struct Picker<'a> {
     pub persist: bool,
 }
 
-pub fn pick_mru(terminal: &mut DefaultTerminal, mut p: Picker<'_>) -> Result<Option<PathBuf>> {
+pub fn pick_mru(terminal: &mut DefaultTerminal, mut p: Picker<'_>) -> Result<Option<Picked>> {
     let entries = p.recent;
-    let theme_override = p.theme_override;
     let mut scan = p.scan.take();
     let mut cache_age = p.cache_age;
     // Hits are kept as well as merged so a finished walk can be saved.
@@ -2623,14 +2630,9 @@ pub fn pick_mru(terminal: &mut DefaultTerminal, mut p: Picker<'_>) -> Result<Opt
     let mut list_offset = 0usize;
 
     // The picker carries the same overlay layer as the main screens, so `h`,
-    // `c` and `C` work here too — and a scheme picked here is the one the file
-    // opens with.
-    let prefs = crate::prefs::load();
-    let mut ov = Overlays::new(match (theme_override, prefs.custom) {
-        (Some(name), _) => Theme::from_name(name),
-        (None, Some(c)) => Theme::from_palette(prefs.theme, c),
-        (None, None) => Theme::from_name(prefs.theme),
-    });
+    // `c` and `C` work here too — and the scheme it is showing is the one the
+    // opened file gets, handed over rather than re-read.
+    let mut ov = Overlays::new(p.theme);
 
     loop {
         // Pull in whatever the scan thread produced since the last frame, and
@@ -2704,7 +2706,11 @@ pub fn pick_mru(terminal: &mut DefaultTerminal, mut p: Picker<'_>) -> Result<Opt
                         if let Some(sc) = &scan {
                             sc.cancel();
                         }
-                        return Ok(pick(clicked));
+                        // Hand over the scheme on screen, so the file opens in it.
+                        return Ok(pick(clicked).map(|path| Picked {
+                            path,
+                            theme: ov.theme,
+                        }));
                     }
                 }
                 _ => {}
@@ -2805,7 +2811,10 @@ pub fn pick_mru(terminal: &mut DefaultTerminal, mut p: Picker<'_>) -> Result<Opt
                         if let Some(sc) = &scan {
                             sc.cancel();
                         }
-                        return Ok(Some(path));
+                        return Ok(Some(Picked {
+                            path,
+                            theme: ov.theme,
+                        }));
                     }
                 }
                 _ => {}
@@ -3019,6 +3028,17 @@ fn render_picker(
     };
     f.render_widget(help, outer[1]);
     offset
+}
+
+/// The scheme to start from: `--theme` wins, else the saved preference (with any
+/// custom palette), else the default.
+pub fn resolve_theme(theme_override: Option<ThemeName>) -> Theme {
+    let prefs = crate::prefs::load();
+    match (theme_override, prefs.custom) {
+        (Some(name), _) => Theme::from_name(name),
+        (None, Some(c)) => Theme::from_palette(prefs.theme, c),
+        (None, None) => Theme::from_name(prefs.theme),
+    }
 }
 
 /// Whether `hay` passes `filter` (case-insensitive substring; empty passes all).
@@ -3290,7 +3310,7 @@ mod tests {
     use crate::rkyv_inspect::RkyvStore;
     use crate::sqlite::SqliteStore;
     use crate::store::Kind;
-    use crate::theme::ThemeName;
+    use crate::theme::{Theme, ThemeName};
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::backend::TestBackend;
     use ratatui::layout::Rect;
@@ -3318,7 +3338,7 @@ mod tests {
         std::fs::write(&path, b"zdbview overlay render test payload").unwrap();
         let store = Store::Rkyv(RkyvStore::open(&path).unwrap());
         let _ = std::fs::remove_file(&path);
-        App::new(store, Some(ThemeName::NeonSprawl))
+        App::with_theme(store, Theme::from_name(ThemeName::NeonSprawl))
     }
 
     /// An App over a SQLite table with `n` rows, for paging tests.
@@ -3332,7 +3352,10 @@ mod tests {
         }
         drop(conn);
         let store = Store::Sqlite(SqliteStore::open(&path).unwrap());
-        (App::new(store, Some(ThemeName::NeonSprawl)), path)
+        (
+            App::with_theme(store, Theme::from_name(ThemeName::NeonSprawl)),
+            path,
+        )
     }
 
     /// An App over arbitrary binary content.
@@ -3341,7 +3364,7 @@ mod tests {
         std::fs::write(&path, bytes).unwrap();
         let store = Store::Rkyv(RkyvStore::open(&path).unwrap());
         let _ = std::fs::remove_file(&path);
-        App::new(store, Some(ThemeName::NeonSprawl))
+        App::with_theme(store, Theme::from_name(ThemeName::NeonSprawl))
     }
 
     /// An App over a two-column SQLite table, for column-motion tests.
@@ -3354,7 +3377,10 @@ mod tests {
             .unwrap();
         drop(conn);
         let store = Store::Sqlite(SqliteStore::open(&path).unwrap());
-        (App::new(store, Some(ThemeName::NeonSprawl)), path)
+        (
+            App::with_theme(store, Theme::from_name(ThemeName::NeonSprawl)),
+            path,
+        )
     }
 
     /// Render one frame and flatten the buffer into per-row strings.
@@ -3472,7 +3498,10 @@ mod tests {
         )
         .unwrap();
         let store = Store::Rkyv(RkyvStore::open(&path).unwrap());
-        (App::new(store, Some(ThemeName::NeonSprawl)), path)
+        (
+            App::with_theme(store, Theme::from_name(ThemeName::NeonSprawl)),
+            path,
+        )
     }
 
     /// `e` on a record opens the ported hex editor pre-filled with the record's
@@ -3702,7 +3731,7 @@ mod tests {
             .collect();
         std::fs::write(&path, crate::formats::test_script_shard_bytes_many(&recs)).unwrap();
         let store = Store::Rkyv(RkyvStore::open(&path).unwrap());
-        let mut app = App::new(store, Some(ThemeName::NeonSprawl));
+        let mut app = App::with_theme(store, Theme::from_name(ThemeName::NeonSprawl));
         assert_eq!(app.visible_records().len(), 4);
 
         press(&mut app, '/');
@@ -3765,7 +3794,7 @@ mod tests {
             .collect();
         std::fs::write(&path, crate::formats::test_script_shard_bytes_many(&recs)).unwrap();
         let store = Store::Rkyv(RkyvStore::open(&path).unwrap());
-        let mut app = App::new(store, Some(ThemeName::NeonSprawl));
+        let mut app = App::with_theme(store, Theme::from_name(ThemeName::NeonSprawl));
         press(&mut app, '/');
         for c in "a_".chars() {
             press(&mut app, c);
@@ -3845,7 +3874,7 @@ mod tests {
         }
         drop(conn);
         let store = Store::Sqlite(SqliteStore::open(&path).unwrap());
-        let mut app = App::new(store, Some(ThemeName::NeonSprawl));
+        let mut app = App::with_theme(store, Theme::from_name(ThemeName::NeonSprawl));
         assert_eq!(app.visible_tables().len(), 3);
         press(&mut app, '/');
         for c in "user".chars() {
@@ -3951,7 +3980,7 @@ mod tests {
         }
         std::fs::write(&path, crate::formats::test_script_shard_bytes_many(&keys)).unwrap();
         let store = Store::Rkyv(RkyvStore::open(&path).unwrap());
-        let mut app = App::new(store, Some(ThemeName::NeonSprawl));
+        let mut app = App::with_theme(store, Theme::from_name(ThemeName::NeonSprawl));
         frame_rows(&mut app, 80, 14);
         let step = app.page_rows;
         assert_eq!(app.record_idx, 0);
@@ -4052,6 +4081,49 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// Opening a file must keep the scheme the picker was showing. It used to
+    /// re-read prefs, so a concurrent write (or any drift) reset the colours on
+    /// open — "randomly resetting my colorscheme when I click a file".
+    #[test]
+    fn opening_a_file_keeps_the_picker_scheme() {
+        let path = scratch("rkyv");
+        std::fs::write(
+            &path,
+            crate::formats::test_script_shard_bytes("/tmp/a.sh", b"x"),
+        )
+        .unwrap();
+        let store = Store::Rkyv(RkyvStore::open(&path).unwrap());
+
+        // Whatever prefs say, the handed-over scheme is what the app shows.
+        let handed = Theme::from_name(ThemeName::BladeRunner);
+        let app = App::with_theme(store, handed);
+        assert_eq!(app.theme().name, ThemeName::BladeRunner);
+        assert_eq!(app.theme().accent, handed.accent);
+
+        // A custom palette survives the hand-over too, which `Theme::from_name`
+        // alone would have flattened back to the scheme's stock colours.
+        let store = Store::Rkyv(RkyvStore::open(&path).unwrap());
+        let custom = Theme::from_palette(ThemeName::BladeRunner, [10, 20, 30, 40, 50, 60]);
+        let app = App::with_theme(store, custom);
+        assert_eq!(app.theme().accent, ratatui::style::Color::Indexed(20));
+        assert_eq!(app.theme().primary, ratatui::style::Color::Indexed(10));
+
+        // And the app reports back whatever it ended on, so the picker resumes
+        // in the same scheme.
+        let store = Store::Rkyv(RkyvStore::open(&path).unwrap());
+        let mut app = App::with_theme(store, handed);
+        press(&mut app, 'c');
+        app.on_key(KeyEvent::from(KeyCode::Down));
+        let previewed = app.theme().name;
+        assert_ne!(previewed, ThemeName::BladeRunner, "chooser previews live");
+        assert_eq!(
+            app.theme().name,
+            previewed,
+            "theme() reports the live scheme"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
     /// The arrows must keep working while a filter prompt is open — they were
     /// swallowed by the prompt, so the list froze as soon as `/` was pressed.
     #[test]
@@ -4064,7 +4136,7 @@ mod tests {
             .collect();
         std::fs::write(&path, crate::formats::test_script_shard_bytes_many(&recs)).unwrap();
         let store = Store::Rkyv(RkyvStore::open(&path).unwrap());
-        let mut app = App::new(store, Some(ThemeName::NeonSprawl));
+        let mut app = App::with_theme(store, Theme::from_name(ThemeName::NeonSprawl));
         press(&mut app, '/');
         for c in "a_".chars() {
             press(&mut app, c);
