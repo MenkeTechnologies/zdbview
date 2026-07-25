@@ -17,6 +17,7 @@ mod disasm;
 mod export;
 mod formats;
 mod mru;
+mod overlay;
 mod prefs;
 mod rkyv_inspect;
 mod sqlite;
@@ -55,21 +56,37 @@ struct Cli {
     /// Non-interactively dump the file's contents and exit (json | csv).
     #[arg(long, value_name = "FORMAT")]
     export: Option<String>,
+    /// Color scheme for this run, by token (see --list-themes). Overrides the
+    /// saved preference without replacing it.
+    #[arg(long, value_name = "NAME")]
+    theme: Option<String>,
+    /// Preview every built-in color scheme with its palette and exit.
+    #[arg(long)]
+    list_themes: bool,
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+
+    if cli.list_themes {
+        list_themes();
+        return Ok(());
+    }
 
     // `--export` is non-interactive: dump to stdout without touching the TUI.
     if let Some(fmt) = &cli.export {
         return run_export(&cli, fmt);
     }
 
+    // Resolve --theme before touching the terminal so a typo prints plainly
+    // instead of after an alternate-screen round trip.
+    let theme = cli.theme.as_deref().map(parse_theme).transpose()?;
+
     // Manual terminal setup (ported from iftoprs) so mouse capture is enabled
     // in the same sequence as entering the alternate screen — `ratatui::init()`
     // does not capture the mouse, so scroll/click events never arrive.
     let mut terminal = setup_terminal()?;
-    let res = run(&cli, &mut terminal);
+    let res = run(&cli, &mut terminal, theme);
     restore_terminal(&mut terminal);
     res
 }
@@ -94,6 +111,46 @@ fn restore_terminal(terminal: &mut DefaultTerminal) {
     )
     .ok();
     terminal.show_cursor().ok();
+}
+
+/// Print every scheme as `token`, display name and a 6-cell palette swatch
+/// (port of iftoprs's `--list-colors`).
+fn list_themes() {
+    use theme::{Theme, ThemeName};
+    const RST: &str = "\x1b[0m";
+    const B_CYAN: &str = "\x1b[1;36m";
+    const B_GREEN: &str = "\x1b[1;32m";
+    const B_MAGENTA: &str = "\x1b[1;35m";
+    const B_YELLOW: &str = "\x1b[1;33m";
+
+    println!("\n{B_CYAN}  ── COLOR SCHEMES ({}) ────────────────────────{RST}\n", ThemeName::ALL.len());
+    for &name in ThemeName::ALL {
+        let swatch: String = Theme::swatch(name)
+            .iter()
+            .map(|(color, _)| match color {
+                ratatui::style::Color::Indexed(n) => format!("\x1b[48;5;{n}m   {RST}"),
+                _ => "   ".to_string(),
+            })
+            .collect();
+        println!(
+            "  {B_GREEN}{token:<14}{RST} {B_MAGENTA}{display:<14}{RST} {swatch}",
+            token = name.token(),
+            display = name.display(),
+        );
+    }
+    println!("\n  {B_YELLOW}Use:{RST}    zdbview FILE {B_GREEN}--theme neon_sprawl{RST}");
+    println!("  {B_YELLOW}In TUI:{RST} press {B_GREEN}t{RST} for the chooser, {B_GREEN}e{RST} for the palette editor\n");
+}
+
+/// Resolve `--theme` to a scheme, erroring with the valid tokens on a typo.
+fn parse_theme(token: &str) -> Result<theme::ThemeName> {
+    theme::ThemeName::from_token(token).ok_or_else(|| {
+        anyhow!(
+            "unknown theme '{}' — run --list-themes for the {} valid names",
+            token,
+            theme::ThemeName::ALL.len()
+        )
+    })
 }
 
 fn run_export(cli: &Cli, fmt: &str) -> Result<()> {
@@ -121,7 +178,7 @@ fn export_store(store: &Store, fmt: &str) -> Result<String> {
                     .cloned()
                     .ok_or_else(|| anyhow!("no tables to export"))?;
                 let total = s.count(&table)?;
-                let v = s.rows(&table, total.max(1), 0)?;
+                let v = s.rows(&table, total.max(1), 0, None)?;
                 Ok(export::rows_to_csv(&v.columns, &v.rows))
             } else {
                 // JSON: object of { table_name: [rows...] } for every table.
@@ -131,7 +188,7 @@ fn export_store(store: &Store, fmt: &str) -> Result<String> {
                         out.push(',');
                     }
                     let total = s.count(t)?;
-                    let v = s.rows(t, total.max(1), 0)?;
+                    let v = s.rows(t, total.max(1), 0, None)?;
                     out.push_str(&export::json_escape(t));
                     out.push(':');
                     out.push_str(&export::rows_to_json(&v.columns, &v.rows));
@@ -160,7 +217,11 @@ fn export_store(store: &Store, fmt: &str) -> Result<String> {
     }
 }
 
-fn run(cli: &Cli, terminal: &mut DefaultTerminal) -> Result<()> {
+fn run(
+    cli: &Cli,
+    terminal: &mut DefaultTerminal,
+    theme: Option<theme::ThemeName>,
+) -> Result<()> {
     // Resolve the file to open: explicit argument, or a pick from the MRU list.
     let file = match &cli.file {
         Some(f) => f.clone(),
@@ -169,7 +230,7 @@ fn run(cli: &Cli, terminal: &mut DefaultTerminal) -> Result<()> {
                 .into_iter()
                 .filter(|e| e.path.exists())
                 .collect();
-            match app::pick_mru(terminal, &recent)? {
+            match app::pick_mru(terminal, &recent, theme)? {
                 Some(p) => p,
                 None => return Ok(()), // user quit the picker
             }
@@ -179,5 +240,5 @@ fn run(cli: &Cli, terminal: &mut DefaultTerminal) -> Result<()> {
     let kind = store::detect(&file, cli.sqlite, cli.rkyv)?;
     let (store, actual) = store::Store::open(&file, kind)?;
     mru::record(&file, actual);
-    app::App::new(store).run(terminal)
+    app::App::new(store, theme).run(terminal)
 }

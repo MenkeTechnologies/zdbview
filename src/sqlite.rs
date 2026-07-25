@@ -15,6 +15,51 @@ pub struct SqliteStore {
     pub tables: Vec<String>,
 }
 
+/// Which column the row grid is ordered by, and in which direction. The display
+/// order is the tuple `(column, rowid)` taken in `desc`'s direction, so paging,
+/// ordinals and search all agree on one total order even when the sort column
+/// holds duplicates.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Sort {
+    pub column: String,
+    pub desc: bool,
+}
+
+impl Sort {
+    /// `ORDER BY` body for the display order.
+    fn order_by(&self) -> String {
+        let dir = self.dir();
+        format!("\"{}\" {dir}, rowid {dir}", esc(&self.column))
+    }
+
+    /// Same, with both keys reversed — used to walk backwards.
+    fn order_by_reversed(&self) -> String {
+        let dir = if self.desc { "ASC" } else { "DESC" };
+        format!("\"{}\" {dir}, rowid {dir}", esc(&self.column))
+    }
+
+    fn dir(&self) -> &'static str {
+        if self.desc {
+            "DESC"
+        } else {
+            "ASC"
+        }
+    }
+
+    /// Row-value comparison against the row with `rowid = ?2`, in display order:
+    /// `later` selects rows that come after it on screen.
+    fn compare_to_marker(&self, table: &str, later: bool) -> String {
+        // Ascending display order puts "later" rows above the marker tuple;
+        // descending inverts it.
+        let op = if later != self.desc { ">" } else { "<" };
+        let col = esc(&self.column);
+        format!(
+            "(\"{col}\", rowid) {op} (SELECT \"{col}\", rowid FROM \"{t}\" WHERE rowid = ?2)",
+            t = esc(table)
+        )
+    }
+}
+
 /// A page of rows for one table, stringified for display.
 pub struct RowsView {
     pub columns: Vec<String>,
@@ -58,7 +103,7 @@ impl SqliteStore {
 
     /// Fetch one page of rows. Includes `rowid` for edit/delete addressing when
     /// the table exposes it.
-    pub fn rows(&self, table: &str, limit: i64, offset: i64) -> Result<RowsView> {
+    pub fn rows(&self, table: &str, limit: i64, offset: i64, sort: Option<&Sort>) -> Result<RowsView> {
         let columns = self.columns(table)?;
         let total = self.count(table)?;
         let ncols = columns.len();
@@ -75,19 +120,34 @@ impl SqliteStore {
             ))
             .is_ok();
 
-        // `ORDER BY rowid` makes paging and search-positioning deterministic:
-        // a matching rowid's ordinal position is then well-defined.
+        // An explicit ORDER BY makes paging and search-positioning
+        // deterministic: a matching rowid's ordinal position is then
+        // well-defined. Without a chosen sort column that order is `rowid`.
         let sql = if with_rowid {
+            let order = match sort {
+                Some(s) if columns.contains(&s.column) => s.order_by(),
+                _ => "rowid".to_string(),
+            };
             format!(
-                "SELECT rowid, * FROM \"{}\" ORDER BY rowid LIMIT {} OFFSET {}",
+                "SELECT rowid, * FROM \"{}\" ORDER BY {} LIMIT {} OFFSET {}",
                 esc(table),
+                order,
                 limit,
                 offset
             )
         } else {
+            // A WITHOUT ROWID table has no rowid tiebreaker; sort on the column
+            // alone, which is still stable enough for display.
+            let order = match sort {
+                Some(s) if columns.contains(&s.column) => {
+                    format!("\"{}\" {}", esc(&s.column), s.dir())
+                }
+                _ => "1".to_string(),
+            };
             format!(
-                "SELECT * FROM \"{}\" LIMIT {} OFFSET {}",
+                "SELECT * FROM \"{}\" ORDER BY {} LIMIT {} OFFSET {}",
                 esc(table),
+                order,
                 limit,
                 offset
             )
@@ -128,6 +188,7 @@ impl SqliteStore {
         term: &str,
         from_rowid: i64,
         forward: bool,
+        sort: Option<&Sort>,
     ) -> Result<Option<i64>> {
         if columns.is_empty() {
             return Ok(None);
@@ -137,14 +198,31 @@ impl SqliteStore {
             .map(|c| format!("CAST(\"{}\" AS TEXT) LIKE ?1 ESCAPE '\\'", esc(c)))
             .collect::<Vec<_>>()
             .join(" OR ");
-        let (cmp, ord) = if forward { (">", "ASC") } else { ("<", "DESC") };
-        let sql = format!(
-            "SELECT rowid FROM \"{}\" WHERE rowid {} ?2 AND ({}) ORDER BY rowid {} LIMIT 1",
-            esc(table),
-            cmp,
-            likes,
-            ord
-        );
+        // Search must step through the rows in the order they are displayed, so
+        // both the comparison and the ORDER BY follow the active sort.
+        let sql = match sort {
+            Some(s) if columns.contains(&s.column) => format!(
+                "SELECT rowid FROM \"{}\" WHERE {} AND ({}) ORDER BY {} LIMIT 1",
+                esc(table),
+                s.compare_to_marker(table, forward),
+                likes,
+                if forward {
+                    s.order_by()
+                } else {
+                    s.order_by_reversed()
+                }
+            ),
+            _ => {
+                let (cmp, ord) = if forward { (">", "ASC") } else { ("<", "DESC") };
+                format!(
+                    "SELECT rowid FROM \"{}\" WHERE rowid {} ?2 AND ({}) ORDER BY rowid {} LIMIT 1",
+                    esc(table),
+                    cmp,
+                    likes,
+                    ord
+                )
+            }
+        };
         let pattern = format!("%{}%", like_escape(term));
         let mut stmt = self.conn.prepare(&sql)?;
         let rid = stmt
@@ -153,13 +231,64 @@ impl SqliteStore {
         Ok(rid)
     }
 
-    /// 1-based ordinal position of `rowid` within the `ORDER BY rowid` ordering.
-    pub fn rowid_ordinal(&self, table: &str, rowid: i64) -> Result<i64> {
-        let n: i64 = self.conn.query_row(
-            &format!("SELECT COUNT(*) FROM \"{}\" WHERE rowid <= ?1", esc(table)),
-            params![rowid],
-            |r| r.get(0),
-        )?;
+    /// First (or last, when `forward` is false) matching row in display order —
+    /// the wrap-around step of a search, and the entry point when nothing is
+    /// selected yet. A marker-relative comparison cannot express this, because
+    /// with a sort active there is no synthetic rowid that sits before every row.
+    pub fn find_row_edge(
+        &self,
+        table: &str,
+        columns: &[String],
+        term: &str,
+        forward: bool,
+        sort: Option<&Sort>,
+    ) -> Result<Option<i64>> {
+        if columns.is_empty() {
+            return Ok(None);
+        }
+        let likes = columns
+            .iter()
+            .map(|c| format!("CAST(\"{}\" AS TEXT) LIKE ?1 ESCAPE '\\'", esc(c)))
+            .collect::<Vec<_>>()
+            .join(" OR ");
+        let order = match sort {
+            Some(s) if columns.contains(&s.column) => {
+                if forward {
+                    s.order_by()
+                } else {
+                    s.order_by_reversed()
+                }
+            }
+            _ => format!("rowid {}", if forward { "ASC" } else { "DESC" }),
+        };
+        let sql = format!(
+            "SELECT rowid FROM \"{}\" WHERE ({}) ORDER BY {} LIMIT 1",
+            esc(table),
+            likes,
+            order
+        );
+        let pattern = format!("%{}%", like_escape(term));
+        let mut stmt = self.conn.prepare(&sql)?;
+        Ok(stmt
+            .query_row(params![pattern], |r| r.get::<_, i64>(0))
+            .optional()?)
+    }
+
+    /// 1-based ordinal position of `rowid` within the displayed ordering — which
+    /// is the active sort when there is one, else `rowid`.
+    pub fn rowid_ordinal(&self, table: &str, rowid: i64, sort: Option<&Sort>) -> Result<i64> {
+        let sql = match sort {
+            // Everything not strictly after the marker row is at or before it.
+            Some(s) => format!(
+                "SELECT COUNT(*) FROM \"{}\" WHERE NOT ({})",
+                esc(table),
+                s.compare_to_marker(table, true)
+            ),
+            None => format!("SELECT COUNT(*) FROM \"{}\" WHERE rowid <= ?2", esc(table)),
+        };
+        let n: i64 = self
+            .conn
+            .query_row(&sql, params![rowid, rowid], |r| r.get(0))?;
         Ok(n)
     }
 

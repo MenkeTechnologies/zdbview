@@ -2,9 +2,10 @@
 //!
 //! Each of the 31 named schemes is a 6-color ANSI-256 palette. iftoprs's
 //! `Theme` mapped those onto its network-monitor UI (bars, hosts, rates); here
-//! the same 6 base colors are mapped onto zdbview's UI roles (accent, primary,
-//! alt, mid, dim, dark). The palettes themselves are copied verbatim so the
-//! schemes look identical across the two tools.
+//! the same 6 base colors are mapped onto zdbview's UI roles (primary, accent,
+//! alt, label, dim) plus the overlay roles the help / chooser / editor modals
+//! use. The palettes themselves are copied verbatim so the schemes look
+//! identical across the two tools.
 
 use ratatui::style::Color;
 
@@ -200,7 +201,7 @@ fn palette(name: ThemeName) -> (u8, u8, u8, u8, u8, u8) {
 
 /// zdbview's active color set, derived from a scheme's 6 base colors. The role
 /// mapping mirrors iftoprs's (c1 primary, c2 bright accent, c3 alt, c4 mid,
-/// c5 dim, c6 dark).
+/// c5 dim; c6 becomes the overlay section color).
 #[derive(Debug, Clone, Copy)]
 pub struct Theme {
     pub name: ThemeName,
@@ -214,8 +215,18 @@ pub struct Theme {
     pub label: Color,
     /// Dim — secondary text and separators.
     pub dim: Color,
-    /// Dark — reserved for fills.
-    pub dark: Color,
+    /// Overlay fill — the modal background behind help / chooser / editor.
+    pub help_bg: Color,
+    /// Overlay frame.
+    pub help_border: Color,
+    /// Overlay title line.
+    pub help_title: Color,
+    /// Overlay section headings.
+    pub help_section: Color,
+    /// Overlay key names (also the chooser's selected-row background).
+    pub help_key: Color,
+    /// Overlay values / footer text.
+    pub help_val: Color,
 }
 
 impl Default for Theme {
@@ -231,6 +242,11 @@ impl Theme {
     }
 
     /// Build a theme from an explicit 6-color palette (used by the editor).
+    ///
+    /// The overlay roles use the same derivation as iftoprs's
+    /// `Theme::from_palette_raw`: a fixed dark fill (236) with the frame and
+    /// title on the primary, sections on the darkest base color, keys on the
+    /// accent, and values on the mid color.
     pub fn from_palette(name: ThemeName, p: [u8; 6]) -> Self {
         Theme {
             name,
@@ -239,8 +255,27 @@ impl Theme {
             alt: Color::Indexed(p[2]),
             label: Color::Indexed(p[3]),
             dim: Color::Indexed(p[4]),
-            dark: Color::Indexed(p[5]),
+            help_bg: Color::Indexed(236),
+            help_border: Color::Indexed(p[0]),
+            help_title: Color::Indexed(p[0]),
+            help_section: Color::Indexed(p[5]),
+            help_key: Color::Indexed(p[1]),
+            help_val: Color::Indexed(p[3]),
         }
+    }
+
+    /// A 6-cell color swatch for the scheme, used by the chooser and
+    /// `--list-themes` (ported from iftoprs's `Theme::swatch`).
+    pub fn swatch(name: ThemeName) -> [(Color, &'static str); 6] {
+        let p = base_palette(name);
+        [
+            (Color::Indexed(p[0]), "██"),
+            (Color::Indexed(p[1]), "██"),
+            (Color::Indexed(p[2]), "██"),
+            (Color::Indexed(p[3]), "██"),
+            (Color::Indexed(p[4]), "██"),
+            (Color::Indexed(p[5]), "██"),
+        ]
     }
 }
 
@@ -248,4 +283,88 @@ impl Theme {
 pub fn base_palette(name: ThemeName) -> [u8; 6] {
     let (c1, c2, c3, c4, c5, c6) = palette(name);
     [c1, c2, c3, c4, c5, c6]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The palette table is copied from iftoprs; spot-check two schemes against
+    /// `iftoprs/src/config/theme.rs` so a typo in either file is caught.
+    #[test]
+    fn palettes_match_iftoprs() {
+        assert_eq!(base_palette(ThemeName::NeonSprawl), [27, 48, 135, 141, 63, 99]);
+        assert_eq!(base_palette(ThemeName::BladeRunner), [208, 37, 166, 73, 130, 23]);
+    }
+
+    /// Every scheme must resolve all six overlay roles to indexed colors —
+    /// a `Color::Reset` here would make a modal unreadable on that scheme.
+    #[test]
+    fn every_scheme_resolves_overlay_roles() {
+        for &name in ThemeName::ALL {
+            let t = Theme::from_name(name);
+            for (role, c) in [
+                ("help_bg", t.help_bg),
+                ("help_border", t.help_border),
+                ("help_title", t.help_title),
+                ("help_section", t.help_section),
+                ("help_key", t.help_key),
+                ("help_val", t.help_val),
+            ] {
+                assert!(
+                    matches!(c, Color::Indexed(_)),
+                    "{}: {role} is not indexed",
+                    name.token()
+                );
+            }
+        }
+    }
+
+    /// The overlay roles are derived from the *edited* palette, not the named
+    /// scheme's, so the editor previews custom colors live.
+    #[test]
+    fn overlay_roles_follow_edited_palette() {
+        let t = Theme::from_palette(ThemeName::NeonSprawl, [1, 2, 3, 4, 5, 6]);
+        assert_eq!(t.help_border, Color::Indexed(1));
+        assert_eq!(t.help_title, Color::Indexed(1));
+        assert_eq!(t.help_key, Color::Indexed(2));
+        assert_eq!(t.help_val, Color::Indexed(4));
+        assert_eq!(t.help_section, Color::Indexed(6));
+        // Fill stays a fixed dark gray regardless of palette (matches iftoprs).
+        assert_eq!(t.help_bg, Color::Indexed(236));
+    }
+
+    /// The chooser draws `swatch` next to the scheme name; its cells must be in
+    /// base-palette order or the preview lies about the colors.
+    #[test]
+    fn swatch_cells_are_base_palette_in_order() {
+        for &name in ThemeName::ALL {
+            let p = base_palette(name);
+            for (i, (color, block)) in Theme::swatch(name).iter().enumerate() {
+                assert_eq!(*color, Color::Indexed(p[i]), "{}", name.token());
+                assert_eq!(*block, "██");
+            }
+        }
+    }
+
+    /// Prefs persist the token, so tokens must be unique and roundtrip.
+    #[test]
+    fn tokens_are_unique_and_roundtrip() {
+        let mut seen = std::collections::HashSet::new();
+        for &name in ThemeName::ALL {
+            assert!(seen.insert(name.token()), "duplicate token {}", name.token());
+            assert_eq!(ThemeName::from_token(name.token()), Some(name));
+        }
+        assert_eq!(ThemeName::from_token("no_such_scheme"), None);
+    }
+
+    /// `--list-themes` and the chooser both label schemes by `display`.
+    #[test]
+    fn display_names_are_unique_and_non_empty() {
+        let mut seen = std::collections::HashSet::new();
+        for &name in ThemeName::ALL {
+            assert!(!name.display().is_empty());
+            assert!(seen.insert(name.display()), "duplicate name {}", name.display());
+        }
+    }
 }

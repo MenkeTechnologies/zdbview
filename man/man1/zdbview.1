@@ -57,6 +57,22 @@ for every table and
 emits the first table. For a recognized rkyv archive, records are emitted as
 JSON with the value blob as a hex string.
 .TP
+.BI \-\-theme " NAME"
+Use color scheme
+.I NAME
+for this run, overriding the saved preference without replacing it.
+.I NAME
+is a scheme token as printed by
+.BR \-\-list\-themes ,
+for example
+.BR neon_sprawl .
+An unknown name is an error listing where to find the valid ones.
+.TP
+.B \-\-list\-themes
+Print every built-in color scheme \(em token, display name and a swatch of its
+six palette colors \(em then exit. Requires a 256-color terminal to show the
+swatches.
+.TP
 .B \-h ", " \-\-help
 Print usage and exit.
 .TP
@@ -206,12 +222,12 @@ feature, which is on by default (disable with
 .B Tab
 Switch focus between the table list and the row grid.
 .TP
-.BR h ", " j ", " k ", " l ", " arrows
+.BR j ", " k ", " arrows
 Move. In the row grid,
+.BR \(<- / \(->
+move the selected column;
 .B h
-and
-.B l
-also move the selected column.
+is the help key, not a motion.
 .TP
 .BR gg ", " G
 Jump to the first / last item. In the row grid this walks to the first or last
@@ -252,12 +268,69 @@ the working directory.
 .B S
 Show the SQLite schema (CREATE statements for tables, views, and indexes).
 .TP
-.B t
-Open the theme chooser (31 color schemes; j/k or wheel to preview, Enter to
-save, e to edit the palette). The choice persists to \fI$XDG_CONFIG_HOME/zdbview/prefs\fR.
+.B s
+Sort the row grid by the column under the cursor: ascending, descending on a
+second press, then back to the table's natural
+.B rowid
+order on a third. The sorted column is marked with an up/down arrow in its
+header and in the pane title; selecting another table clears the sort.
 .TP
-.B ?
-Show the context-sensitive key help overlay.
+.BR < ", " >
+Move the sort to the previous / next column, keeping the direction.
+.PP
+Sorting is performed in SQL
+.RB ( "ORDER BY \(dqcol\(dq ASC|DESC, rowid" ),
+so it orders the whole table rather than the loaded page: numeric columns sort
+numerically and the
+.B rowid
+tiebreaker keeps paging stable when the sort column contains duplicates. Search
+and the row ordinal follow the displayed order, so
+.BR n / N
+step to the next match on screen rather than the next by
+.BR rowid .
+.TP
+.B c
+Open the color-scheme chooser: every built-in scheme with a swatch of its six
+palette colors,
+.B j
+/
+.B k
+or the wheel to preview live,
+.B Enter
+to save,
+.B C
+to open the palette editor, Esc to cancel and restore the previous scheme.
+.TP
+.B C
+Open the palette editor directly, seeded from the active scheme (or from the
+highlighted one when the chooser is open). It moves between slots with
+.BR \(<- / \(-> ,
+adjusts the selected slot by one with
+.BR \(ua / \(da
+and by sixteen with
+.BR PgUp / PgDn ,
+and saves the edited palette with
+.BR Enter .
+Both persist to
+.IR $XDG_CONFIG_HOME/zdbview/prefs .
+The editor is bound to
+.B C
+rather than
+.BR e ,
+which edits data on every other screen. See also
+.BR \-\-list\-themes " and " \-\-theme .
+.TP
+.BR h ", " ?
+Show the key help overlay: a themed box listing every binding in three columns,
+with the section matching what is open \(em SQLite, rkyv, or the recent-files
+picker. Any key or click closes it.
+.PP
+.BR h ", " c " and " C
+work on every screen, the recent-files picker included.
+.PP
+Action results \(em copy, export, cell edit, delete, SQL, scheme saved \(em are
+reported as a transient toast centered above the status bar, which dismisses
+itself after three seconds; the same text stays in the status bar afterwards.
 .TP
 .B mouse
 The scroll wheel moves the selection, left-click selects the row / record /

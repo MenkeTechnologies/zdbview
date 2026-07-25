@@ -11,11 +11,26 @@ _zdbview() {
         '(--sqlite --rkyv)--sqlite[Force treating the file as a SQLite database]'
         '(--sqlite --rkyv)--rkyv[Force treating the file as a rkyv archive or raw binary]'
         '--export[Non-interactively dump contents and exit]:format:(json csv)'
+        '--theme[Color scheme for this run]:scheme:_zdbview_themes'
+        '(- *)--list-themes[Preview all color schemes and exit]'
         '(- *)'{-h,--help}'[Print help]'
         '(- *)'{-V,--version}'[Print version]'
         '1:file:_zdbview_files'
     )
     _arguments -s -S : $args
+}
+
+# Scheme tokens come from the binary itself (--list-themes), so this never goes
+# stale when schemes are added or renamed.
+_zdbview_themes() {
+    local -a schemes
+    schemes=(${(f)"$(command zdbview --list-themes 2>/dev/null |
+        command perl -lne 's/\e\[[0-9;]*m//g; print $1 if /^\s{2}(\w+)\s{2,}/')"})
+    if (( ${#schemes} )); then
+        _describe -t schemes 'color scheme' schemes
+    else
+        _message 'color scheme'
+    fi
 }
 
 # Database-ish files first, then any file — a rkyv shard can carry any name.

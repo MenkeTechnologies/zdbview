@@ -79,7 +79,9 @@ sha256 sums listed at the bottom of the formula.
 
 Every opened file is recorded to `$XDG_CACHE_HOME/zdbview/recent` (or
 `~/.cache/zdbview/recent`), most-recent-first. Running `zdbview` with no argument
-shows that list as a picker — `j`/`k` to move, `Enter` to open, `q` to quit.
+shows that list as a picker — `j`/`k` to move, `Enter` to open, `q` to quit. The
+overlay keys work here too: `h` help, `c` scheme chooser, `C` palette editor, and
+a scheme picked here is the one the opened file uses.
 
 Paths are canonicalized, so the same file reached through different relative
 paths or symlinks dedupes to one entry that moves back to the front on re-open.
@@ -177,36 +179,77 @@ is published on crates.io); disable with `--no-default-features`.
 | Key | Action |
 |-----|--------|
 | `Tab` | switch focus (table list ↔ rows) |
-| arrows / `hjkl` | move |
+| `j` / `k`, arrows | move; `←` / `→` change column |
 | `gg` / `G` | jump to top / bottom |
 | `Enter` | open detail (row / record); focus rows (table list) |
 | `/` | search; `n` / `N` next / previous match |
 | `Ctrl-f` / `Ctrl-b` | page forward / back (SQLite) |
 | `e` `a` `d` `:` | edit / add / delete / SQL (SQLite) |
+| `s` | sort by the cursor column (ascending → descending → off) |
+| `<` / `>` | move the sort to the previous / next column |
 | `a` `e` `r` `d` | create / update-value / rename / delete record (rkyv) |
 | `S` | schema view (SQLite) |
 | `0` `1` `2` `3` | Records / Info / Strings / Hex (rkyv) |
 | `v` | cycle value render (auto / hex / text / disasm) — detail screen |
 | `y` | copy cell / value / key to clipboard (OSC 52) |
 | `x` | export table (CSV) / records (JSON) to a file |
-| `t` | theme chooser (31 schemes) |
-| `?` | help overlay |
+| `c` | color-scheme chooser |
+| `C` | palette editor |
+| `h` / `?` | help overlay |
 | mouse | wheel scrolls, click selects, right-click selects + opens detail |
 | `q` | quit |
 | `Esc` | back out of a nested screen (quits on the main screen) |
 
-## Themes
+`h` is the help key, not a motion — columns move with `←` / `→`. The overlay keys
+(`h`, `c`, `C`) work on every screen, including the recent-files picker.
 
-`t` opens a chooser of **31 color schemes** (ported from `iftoprs`); `j`/`k` or
-the wheel cycle with live preview, `Enter` saves, `e` opens a palette **editor**
-(adjust the 6 base colors, `Enter` saves a custom scheme). The selection
-persists to `$XDG_CONFIG_HOME/zdbview/prefs` (or `~/.config/zdbview/prefs`) and
-loads on startup.
+## Color schemes
+
+`c` opens the scheme chooser (ported from `iftoprs`): every scheme with a swatch
+of its six palette colors, `j`/`k` or the wheel to cycle with live preview,
+`Enter` to save, `Esc` to cancel and restore the previous scheme. `C` opens the
+palette **editor** — `←`/`→` pick a slot, `↑`/`↓` adjust it by one, `PgUp`/`PgDn`
+by sixteen, `Enter` saves the custom palette. Both persist to
+`$XDG_CONFIG_HOME/zdbview/prefs` (or `~/.config/zdbview/prefs`) and load on
+startup; the editor uses `C` rather than `e`, which edits data everywhere else.
+
+Non-interactively, `--list-themes` prints every scheme with its token and swatch,
+and `--theme <token>` overrides the saved scheme for one run:
+
+```sh
+zdbview --list-themes                  # tokens, names, palettes
+zdbview data.db --theme blade_runner   # this run only, prefs untouched
+```
+
+## Help overlay and toasts
+
+`h` (or `?`) opens the keyboard-shortcut overlay: a themed box listing every
+binding in three columns, with the section matching what is open — SQLite, rkyv,
+or the recent-files picker. Any key or click closes it.
+
+Action results (copy, export, edit, delete, SQL, scheme saved) appear as a
+transient **toast** centered above the status bar and dismiss themselves after
+three seconds — a port of iftoprs's `StatusMsg` / `draw_status`. The same text
+stays in the status bar so it remains readable after the toast fades.
 
 Input prompts (search, SQL, cell/value edit, add/rename) have a movable text
 cursor: `←`/`→`, `Home`/`End`, and the readline chords `Ctrl-a`/`Ctrl-e`
 (line start/end), `Ctrl-w` (delete word), `Ctrl-u`/`Ctrl-k` (kill to
 start/end). Mouse support and the cursor model are ported from `iftoprs`.
+
+## Sorting
+
+`s` sorts the row grid by the column under the cursor: ascending, then descending
+on a second press, then back to the table's natural `rowid` order on a third.
+`<` / `>` move the sort to the previous / next column, keeping the direction. The
+sorted column is marked in its header (`qty ▲`) and in the pane title; selecting
+another table clears the sort.
+
+Sorting is done in SQL (`ORDER BY "col" ASC|DESC, rowid`), so it orders the
+**whole table**, not just the loaded page — numeric columns sort numerically, and
+the `rowid` tiebreaker keeps paging stable when the sort column has duplicates.
+Search and the `(row N of M)` readout follow the displayed order, so `n` / `N`
+step to the next match *on screen* rather than the next by `rowid`.
 
 SQLite search is **whole-table** (SQL-backed across every column), not limited to
 the loaded page; rkyv search scans record keys, the string list, or raw bytes.

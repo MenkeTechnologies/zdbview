@@ -25,7 +25,7 @@ mod sqlite;
 mod store;
 
 use rkyv_inspect::RkyvStore;
-use sqlite::SqliteStore;
+use sqlite::{Sort, SqliteStore};
 use store::{detect, Kind};
 
 fn tmp(name: &str) -> std::path::PathBuf {
@@ -54,7 +54,7 @@ fn sqlite_full_crud_roundtrip() {
     assert_eq!(store.count("items").unwrap(), 2);
     assert_eq!(store.columns("items").unwrap(), vec!["name", "qty"]);
 
-    let view = store.rows("items", 100, 0).unwrap();
+    let view = store.rows("items", 100, 0, None).unwrap();
     assert_eq!(view.total, 2);
     assert_eq!(view.rows.len(), 2);
     assert_eq!(view.rows[0], vec!["a".to_string(), "1".to_string()]);
@@ -62,7 +62,7 @@ fn sqlite_full_crud_roundtrip() {
 
     // UPDATE
     store.update_cell("items", rowid_a, "qty", "42").unwrap();
-    let view = store.rows("items", 100, 0).unwrap();
+    let view = store.rows("items", 100, 0, None).unwrap();
     assert_eq!(view.rows[0], vec!["a".to_string(), "42".to_string()]);
 
     // INSERT (default values)
@@ -72,7 +72,7 @@ fn sqlite_full_crud_roundtrip() {
     // DELETE
     store.delete_row("items", rowid_a).unwrap();
     assert_eq!(store.count("items").unwrap(), 2);
-    let view = store.rows("items", 100, 0).unwrap();
+    let view = store.rows("items", 100, 0, None).unwrap();
     assert!(view.rows.iter().all(|r| r[0] != "a"));
 
     // raw exec
@@ -180,4 +180,168 @@ fn detect_sqlite_by_magic_and_extension() {
 
     let _ = std::fs::remove_file(&dbpath);
     let _ = std::fs::remove_file(&binpath);
+}
+
+/// Build a table whose natural rowid order differs from every column order, so a
+/// wrong ORDER BY cannot accidentally pass.
+fn sortable_db(name: &str) -> (std::path::PathBuf, SqliteStore) {
+    let path = tmp(name);
+    let _ = std::fs::remove_file(&path);
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute("CREATE TABLE t (name TEXT, qty INTEGER)", [])
+        .unwrap();
+    for (n, q) in [("pear", 3), ("apple", 10), ("fig", 3), ("date", 7)] {
+        conn.execute("INSERT INTO t (name, qty) VALUES (?1, ?2)", (n, q))
+            .unwrap();
+    }
+    drop(conn);
+    let store = SqliteStore::open(&path).unwrap();
+    (path, store)
+}
+
+fn col(view: &sqlite::RowsView, i: usize) -> Vec<String> {
+    view.rows.iter().map(|r| r[i].clone()).collect()
+}
+
+#[test]
+fn rows_sort_ascending_descending_and_natural_order() {
+    let (path, store) = sortable_db("sort.db");
+
+    // No sort: insertion (rowid) order.
+    let v = store.rows("t", 100, 0, None).unwrap();
+    assert_eq!(col(&v, 0), ["pear", "apple", "fig", "date"]);
+
+    let asc = Sort { column: "name".into(), desc: false };
+    let v = store.rows("t", 100, 0, Some(&asc)).unwrap();
+    assert_eq!(col(&v, 0), ["apple", "date", "fig", "pear"]);
+
+    let desc = Sort { column: "name".into(), desc: true };
+    let v = store.rows("t", 100, 0, Some(&desc)).unwrap();
+    assert_eq!(col(&v, 0), ["pear", "fig", "date", "apple"]);
+
+    // Numeric column must sort numerically, not lexically (10 after 7).
+    let qty = Sort { column: "qty".into(), desc: false };
+    let v = store.rows("t", 100, 0, Some(&qty)).unwrap();
+    assert_eq!(col(&v, 1), ["3", "3", "7", "10"]);
+
+    // An unknown column falls back to rowid order instead of failing the query.
+    let bogus = Sort { column: "nope".into(), desc: false };
+    let v = store.rows("t", 100, 0, Some(&bogus)).unwrap();
+    assert_eq!(col(&v, 0), ["pear", "apple", "fig", "date"]);
+
+    let _ = std::fs::remove_file(&path);
+}
+
+/// Paging must partition the sorted order without gaps or repeats — the rowid
+/// tiebreaker is what makes this hold when the sort column has duplicates.
+#[test]
+fn sorted_paging_is_stable_across_duplicate_keys() {
+    let (path, store) = sortable_db("sort_page.db");
+    let qty = Sort { column: "qty".into(), desc: false };
+
+    let mut seen = Vec::new();
+    for offset in [0, 2] {
+        let page = store.rows("t", 2, offset, Some(&qty)).unwrap();
+        assert_eq!(page.rows.len(), 2);
+        seen.extend(col(&page, 0));
+    }
+    let full = col(&store.rows("t", 100, 0, Some(&qty)).unwrap(), 0);
+    assert_eq!(seen, full, "pages must concatenate into the full order");
+    let _ = std::fs::remove_file(&path);
+}
+
+/// Search steps through matches in *display* order, so with a sort active the
+/// next match is the next one on screen, not the next by rowid.
+#[test]
+fn search_and_ordinals_follow_the_sorted_order() {
+    let (path, store) = sortable_db("sort_search.db");
+    let cols = store.columns("t").unwrap();
+    let asc = Sort { column: "name".into(), desc: false };
+
+    // Sorted ascending: apple(2) date(4) fig(3) pear(1) by rowid.
+    let sorted = store.rows("t", 100, 0, Some(&asc)).unwrap();
+    let rowid_of = |n: &str| -> i64 {
+        let i = sorted.rows.iter().position(|r| r[0] == n).unwrap();
+        sorted.rowids[i].unwrap()
+    };
+
+    // Every row matches "e"? No — apple, date, pear do. From apple, forward is
+    // date (next in sorted order), not fig or the next rowid.
+    let next = store
+        .find_row("t", &cols, "e", rowid_of("apple"), true, Some(&asc))
+        .unwrap();
+    assert_eq!(next, Some(rowid_of("date")));
+
+    // Backward from pear is date as well.
+    let prev = store
+        .find_row("t", &cols, "e", rowid_of("pear"), false, Some(&asc))
+        .unwrap();
+    assert_eq!(prev, Some(rowid_of("date")));
+
+    // Nothing after pear: the caller wraps via the edge query, which returns the
+    // first match in display order.
+    assert_eq!(
+        store
+            .find_row("t", &cols, "e", rowid_of("pear"), true, Some(&asc))
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        store
+            .find_row_edge("t", &cols, "e", true, Some(&asc))
+            .unwrap(),
+        Some(rowid_of("apple"))
+    );
+    assert_eq!(
+        store
+            .find_row_edge("t", &cols, "e", false, Some(&asc))
+            .unwrap(),
+        Some(rowid_of("pear"))
+    );
+
+    // Ordinals are positions in the sorted view: apple is 1st, pear 4th.
+    assert_eq!(
+        store.rowid_ordinal("t", rowid_of("apple"), Some(&asc)).unwrap(),
+        1
+    );
+    assert_eq!(
+        store.rowid_ordinal("t", rowid_of("pear"), Some(&asc)).unwrap(),
+        4
+    );
+    // Without a sort the same rowid is placed by rowid instead.
+    assert_eq!(store.rowid_ordinal("t", rowid_of("pear"), None).unwrap(), 1);
+
+    // Descending flips both the stepping direction and the ordinals.
+    let desc = Sort { column: "name".into(), desc: true };
+    assert_eq!(
+        store
+            .find_row("t", &cols, "e", rowid_of("pear"), true, Some(&desc))
+            .unwrap(),
+        Some(rowid_of("date"))
+    );
+    assert_eq!(
+        store.rowid_ordinal("t", rowid_of("pear"), Some(&desc)).unwrap(),
+        1
+    );
+
+    let _ = std::fs::remove_file(&path);
+}
+
+/// A column name with a quote must not break out of its identifier.
+#[test]
+fn sort_column_names_are_escaped() {
+    let path = tmp("sort_quote.db");
+    let _ = std::fs::remove_file(&path);
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute(r#"CREATE TABLE t ("od""d" TEXT)"#, []).unwrap();
+    conn.execute(r#"INSERT INTO t VALUES ('b'), ('a')"#, []).unwrap();
+    drop(conn);
+    let store = SqliteStore::open(&path).unwrap();
+    let cols = store.columns("t").unwrap();
+    assert_eq!(cols, vec![r#"od"d"#.to_string()]);
+    let sort = Sort { column: cols[0].clone(), desc: false };
+    let v = store.rows("t", 100, 0, Some(&sort)).unwrap();
+    assert_eq!(col(&v, 0), ["a", "b"]);
+    assert_eq!(store.rowid_ordinal("t", 2, Some(&sort)).unwrap(), 1);
+    let _ = std::fs::remove_file(&path);
 }

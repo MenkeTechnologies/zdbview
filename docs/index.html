@@ -207,19 +207,24 @@ zdbview</pre>
           <thead><tr><th>Key</th><th>Action</th></tr></thead>
           <tbody>
             <tr><td>Tab</td><td>Switch focus between the table list and the row grid</td></tr>
-            <tr><td>h j k l / arrows</td><td>Move; <code>h</code>/<code>l</code> also move the selected column in the row grid</td></tr>
+            <tr><td>j k / arrows</td><td>Move; <code>&larr;</code>/<code>&rarr;</code> move the selected column in the row grid</td></tr>
             <tr><td>gg / G</td><td>First / last — across pages, not just the visible rows</td></tr>
             <tr><td>Ctrl-f / Ctrl-b</td><td>Page forward / back (also PageDown / PageUp)</td></tr>
             <tr><td>/</td><td>Search</td></tr>
-            <tr><td>n / N</td><td>Next / previous match</td></tr>
+            <tr><td>n / N</td><td>Next / previous match — in the displayed order, so sorting is respected</td></tr>
             <tr><td>e a d :</td><td>Edit cell / insert row / delete row / SQL (SQLite)</td></tr>
+            <tr><td>s</td><td>Sort by the column under the cursor: ascending &rarr; descending &rarr; off (SQLite)</td></tr>
+            <tr><td>&lt; / &gt;</td><td>Move the sort to the previous / next column, keeping the direction</td></tr>
             <tr><td>S</td><td>Schema view for the selected table (SQLite)</td></tr>
             <tr><td>0 1 2 3</td><td>Records / Info / Strings / Hex (rkyv — <code>0</code> only when the format was recognized)</td></tr>
+            <tr><td>a e r d</td><td>Create / update value / rename key / delete record (rkyv Records)</td></tr>
             <tr><td>Enter</td><td>Open the detail screen for the selected row or record; from the table list, focus the rows; in the picker, open the file</td></tr>
-            <tr><td>v</td><td>Cycle how a value renders on the detail screen: auto / hex / text</td></tr>
+            <tr><td>v</td><td>Cycle how a value renders on the detail screen: auto / hex / text / disasm</td></tr>
             <tr><td>y</td><td>Copy the cell, value or record key to the clipboard (OSC 52 — works over SSH)</td></tr>
             <tr><td>x</td><td>Export the current table as CSV, or all records as JSON, to a file</td></tr>
-            <tr><td>?</td><td>Help overlay; any key closes it</td></tr>
+            <tr><td>c</td><td>Color-scheme chooser — live preview, <code>Enter</code> saves, <code>Esc</code> restores</td></tr>
+            <tr><td>C</td><td>Palette editor for the six base colors</td></tr>
+            <tr><td>h / ?</td><td>Help overlay; any key closes it</td></tr>
             <tr><td>q / Esc</td><td>Leave the current screen, or quit — inside a modal, Esc cancels the modal only</td></tr>
           </tbody>
         </table>

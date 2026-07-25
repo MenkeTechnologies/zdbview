@@ -17,8 +17,9 @@ use std::path::PathBuf;
 
 use crate::formats::{self, Decoded, FormatKind};
 use crate::mru::{self, Entry};
+use crate::overlay::{HelpCtx, Overlays};
 use crate::rkyv_inspect::RkyvStore;
-use crate::sqlite::{RowsView, SqliteStore};
+use crate::sqlite::{RowsView, Sort, SqliteStore};
 use crate::store::{Kind, Store};
 use crate::theme::{Theme, ThemeName};
 
@@ -26,6 +27,9 @@ use crate::theme::{Theme, ThemeName};
 const PAGE: i64 = 500;
 /// Minimum length for an extracted rkyv string run.
 const MIN_STRING: usize = 4;
+/// Idle wake-up interval: how often the loop redraws with no input pending, so a
+/// toast dismisses itself on time (iftoprs's `event::poll` tick).
+const TICK: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// Which pane has keyboard focus.
 #[derive(PartialEq, Eq, Clone, Copy)]
@@ -133,7 +137,6 @@ pub struct App {
 
     // Screens / overlays
     screen: Screen,
-    show_help: bool,
     value_render: ValueRender,
     /// Cached bytes shown in the Detail value pane.
     detail_value: Vec<u8>,
@@ -152,26 +155,24 @@ pub struct App {
     off_records: usize,
     /// Byte offset of the text cursor within the active input modal's buffer.
     input_cursor: usize,
+    /// Active row-grid ordering, or `None` for the table's natural `rowid`
+    /// order. Reset when another table is selected.
+    sort: Option<Sort>,
 
-    // Theming (ported from iftoprs)
-    theme: Theme,
-    /// Theme chooser overlay: index into `ThemeName::ALL`, plus the scheme to
-    /// restore if the chooser is cancelled.
-    show_chooser: bool,
-    chooser_idx: usize,
-    chooser_saved: ThemeName,
-    /// Editor overlay: which of the 6 base colors is selected.
-    show_editor: bool,
-    editor_slot: usize,
-    editor_palette: [u8; 6],
+    /// Themed overlays (help / scheme chooser / palette editor / toast),
+    /// shared with the recent-files picker.
+    ov: Overlays,
 }
 
 impl App {
-    pub fn new(store: Store) -> Self {
+    /// `theme_override` is `--theme`: it wins over the saved preference (and
+    /// over a saved custom palette) for this run only.
+    pub fn new(store: Store, theme_override: Option<ThemeName>) -> Self {
         let prefs = crate::prefs::load();
-        let theme = match prefs.custom {
-            Some(c) => Theme::from_palette(prefs.theme, c),
-            None => Theme::from_name(prefs.theme),
+        let theme = match (theme_override, prefs.custom) {
+            (Some(name), _) => Theme::from_name(name),
+            (None, Some(c)) => Theme::from_palette(prefs.theme, c),
+            (None, None) => Theme::from_name(prefs.theme),
         };
         let mut app = App {
             store,
@@ -193,7 +194,6 @@ impl App {
             pending_g: false,
             search: String::new(),
             screen: Screen::Main,
-            show_help: false,
             value_render: ValueRender::Auto,
             detail_value: Vec::new(),
             detail_scroll: 0,
@@ -206,16 +206,27 @@ impl App {
             off_right: 0,
             off_records: 0,
             input_cursor: 0,
-            theme,
-            show_chooser: false,
-            chooser_idx: 0,
-            chooser_saved: ThemeName::default(),
-            show_editor: false,
-            editor_slot: 0,
-            editor_palette: [0; 6],
+            sort: None,
+            ov: Overlays::new(theme),
         };
         app.init();
         app
+    }
+
+    /// Which key sections the help overlay lists for the open file.
+    fn help_ctx(&self) -> HelpCtx {
+        match &self.store {
+            Store::Sqlite(_) => HelpCtx::Sqlite,
+            Store::Rkyv(_) => HelpCtx::Rkyv,
+        }
+    }
+
+    /// Report an action's result: a transient toast over the UI plus the same
+    /// text in the status bar, so it stays readable after the toast fades.
+    fn notify(&mut self, msg: impl Into<String>) {
+        let msg = msg.into();
+        self.ov.toast(msg.clone());
+        self.status = msg;
     }
 
     fn init(&mut self) {
@@ -224,7 +235,7 @@ impl App {
                 if !s.tables.is_empty() {
                     self.load_table();
                 }
-                self.status = "hjkl move · Tab focus · / search (n/N) · ^f/^b page · e edit · a add · d delete · : SQL · q quit".into();
+                self.status = "j/k ←/→ move · Tab focus · / search (n/N) · ^f/^b page · e edit · a add · d delete · : SQL · s sort · c scheme · h help · q quit".into();
             }
             Store::Rkyv(r) => {
                 self.strings = r.strings(MIN_STRING);
@@ -232,12 +243,12 @@ impl App {
                 if let Some(d) = &self.decoded {
                     self.rkyv_view = RkyvView::Records;
                     self.status = format!(
-                        "{} · {} records · Enter detail · a add e edit r rename d delete · / search · 0/1/2/3 views · q quit",
+                        "{} · {} records · Enter detail · a add e edit r rename d delete · / search · 0/1/2/3 views · c scheme · h help · q quit",
                         d.format,
                         d.records.len()
                     );
                 } else {
-                    self.status = "1 Info · 2 Strings · 3 Hex · j/k scroll · / search (n/N) · q quit  (rkyv: unrecognized — structural view)".into();
+                    self.status = "1 Info · 2 Strings · 3 Hex · j/k scroll · / search (n/N) · c scheme · h help · q quit  (rkyv: unrecognized)".into();
                 }
             }
         }
@@ -246,11 +257,16 @@ impl App {
     pub fn run(&mut self, terminal: &mut DefaultTerminal) -> Result<()> {
         while !self.quit {
             terminal.draw(|f| self.render(f))?;
+            if !event::poll(TICK)? {
+                self.ov.expire_toast();
+                continue;
+            }
             match event::read()? {
                 Event::Key(key) if key.kind == KeyEventKind::Press => self.on_key(key),
                 Event::Mouse(m) => self.on_mouse(m),
                 _ => {}
             }
+            self.ov.expire_toast();
         }
         Ok(())
     }
@@ -260,17 +276,10 @@ impl App {
     fn on_key(&mut self, key: KeyEvent) {
         let code = key.code;
 
-        // Help overlay swallows the next key (any key closes it).
-        if self.show_help {
-            self.show_help = false;
+        // An open overlay owns the key.
+        if self.ov.active() {
+            self.ov.on_key(code);
             return;
-        }
-        // Theme editor / chooser overlays take keys next.
-        if self.show_editor {
-            return self.editor_key(code);
-        }
-        if self.show_chooser {
-            return self.chooser_key(code);
         }
 
         // Modal input first. Snapshot the buffer into a local so no borrow of
@@ -316,14 +325,9 @@ impl App {
             Modal::None => {}
         }
 
-        // `?` opens help from any screen.
-        if code == KeyCode::Char('?') {
-            self.show_help = true;
-            return;
-        }
-        // `t` opens the theme chooser from any screen.
-        if code == KeyCode::Char('t') {
-            self.open_chooser();
+        // The overlay openers (`h`/`?` help, `c` chooser, `C` editor) work from
+        // every screen, exactly as on the recent-files picker.
+        if self.ov.on_key(code) {
             return;
         }
 
@@ -342,30 +346,8 @@ impl App {
     // ----- mouse (ported from iftoprs `handle_mouse`) -----------------------
 
     fn on_mouse(&mut self, m: MouseEvent) {
-        // Any click dismisses the help overlay.
-        if self.show_help {
-            if matches!(m.kind, MouseEventKind::Down(_)) {
-                self.show_help = false;
-            }
-            return;
-        }
-        // Theme chooser: wheel cycles schemes, click confirms.
-        if self.show_chooser {
-            match m.kind {
-                MouseEventKind::ScrollDown => self.chooser_key(KeyCode::Down),
-                MouseEventKind::ScrollUp => self.chooser_key(KeyCode::Up),
-                MouseEventKind::Down(MouseButton::Left) => self.chooser_key(KeyCode::Enter),
-                _ => {}
-            }
-            return;
-        }
-        // Editor: wheel adjusts the selected slot's color.
-        if self.show_editor {
-            match m.kind {
-                MouseEventKind::ScrollUp => self.editor_key(KeyCode::Up),
-                MouseEventKind::ScrollDown => self.editor_key(KeyCode::Down),
-                _ => {}
-            }
+        // An open overlay owns the event (wheel drives it, a click confirms).
+        if self.ov.on_mouse(m) {
             return;
         }
         // Scroll wheel reuses the existing up/down navigation for the active
@@ -427,110 +409,6 @@ impl App {
                     }
                 }
             }
-        }
-    }
-
-    // ----- theming: chooser + editor (ported from iftoprs) ------------------
-
-    fn open_chooser(&mut self) {
-        self.chooser_saved = self.theme.name;
-        self.chooser_idx = ThemeName::ALL
-            .iter()
-            .position(|&t| t == self.theme.name)
-            .unwrap_or(0);
-        self.show_chooser = true;
-    }
-
-    fn chooser_preview(&mut self) {
-        self.theme = Theme::from_name(ThemeName::ALL[self.chooser_idx]);
-    }
-
-    fn chooser_key(&mut self, code: KeyCode) {
-        let n = ThemeName::ALL.len();
-        match code {
-            KeyCode::Up | KeyCode::Char('k') => {
-                self.chooser_idx = (self.chooser_idx + n - 1) % n;
-                self.chooser_preview();
-            }
-            KeyCode::Down | KeyCode::Char('j') => {
-                self.chooser_idx = (self.chooser_idx + 1) % n;
-                self.chooser_preview();
-            }
-            KeyCode::Char('g') => {
-                self.chooser_idx = 0;
-                self.chooser_preview();
-            }
-            KeyCode::Char('G') => {
-                self.chooser_idx = n - 1;
-                self.chooser_preview();
-            }
-            KeyCode::Enter => {
-                self.chooser_preview();
-                crate::prefs::save(&crate::prefs::Prefs {
-                    theme: self.theme.name,
-                    custom: None,
-                });
-                self.show_chooser = false;
-                self.status = format!("theme: {}", self.theme.name.display());
-            }
-            KeyCode::Char('e') => {
-                // Open the editor seeded from the highlighted scheme.
-                self.editor_palette = crate::theme::base_palette(ThemeName::ALL[self.chooser_idx]);
-                self.editor_slot = 0;
-                self.show_chooser = false;
-                self.show_editor = true;
-                self.editor_preview();
-            }
-            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('t') => {
-                self.theme = Theme::from_name(self.chooser_saved);
-                self.show_chooser = false;
-            }
-            _ => {}
-        }
-    }
-
-    fn editor_preview(&mut self) {
-        self.theme = Theme::from_palette(self.theme.name, self.editor_palette);
-    }
-
-    fn editor_key(&mut self, code: KeyCode) {
-        match code {
-            KeyCode::Left | KeyCode::Char('h') => self.editor_slot = (self.editor_slot + 5) % 6,
-            KeyCode::Right | KeyCode::Char('l') => self.editor_slot = (self.editor_slot + 1) % 6,
-            KeyCode::Up | KeyCode::Char('k') => {
-                self.editor_palette[self.editor_slot] =
-                    self.editor_palette[self.editor_slot].wrapping_add(1);
-                self.editor_preview();
-            }
-            KeyCode::Down | KeyCode::Char('j') => {
-                self.editor_palette[self.editor_slot] =
-                    self.editor_palette[self.editor_slot].wrapping_sub(1);
-                self.editor_preview();
-            }
-            KeyCode::PageUp => {
-                self.editor_palette[self.editor_slot] =
-                    self.editor_palette[self.editor_slot].wrapping_add(16);
-                self.editor_preview();
-            }
-            KeyCode::PageDown => {
-                self.editor_palette[self.editor_slot] =
-                    self.editor_palette[self.editor_slot].wrapping_sub(16);
-                self.editor_preview();
-            }
-            KeyCode::Enter => {
-                self.editor_preview();
-                crate::prefs::save(&crate::prefs::Prefs {
-                    theme: self.theme.name,
-                    custom: Some(self.editor_palette),
-                });
-                self.show_editor = false;
-                self.status = "saved custom theme".into();
-            }
-            KeyCode::Esc | KeyCode::Char('q') => {
-                self.theme = Theme::from_name(self.chooser_saved);
-                self.show_editor = false;
-            }
-            _ => {}
         }
     }
 
@@ -636,11 +514,11 @@ impl App {
             _ => hex_string(&self.detail_value),
         };
         let ok = crate::clipboard::copy(&text);
-        self.status = if ok {
+        self.notify(if ok {
             format!("copied {} bytes to clipboard", self.detail_value.len())
         } else {
             "clipboard unavailable (no tty)".into()
-        };
+        });
     }
 
     /// Export the current view to a file in the working directory.
@@ -657,10 +535,14 @@ impl App {
             None => return,
         };
         let total = self.rows.as_ref().map(|r| r.total).unwrap_or(0);
-        let view = match self.sqlite().unwrap().rows(&table, total.max(1), 0) {
+        let view = match self
+            .sqlite()
+            .unwrap()
+            .rows(&table, total.max(1), 0, self.sort.as_ref())
+        {
             Ok(v) => v,
             Err(e) => {
-                self.status = format!("export failed: {}", e);
+                self.notify(format!("export failed: {}", e));
                 return;
             }
         };
@@ -676,7 +558,7 @@ impl App {
         let d = match &self.decoded {
             Some(d) => d,
             None => {
-                self.status = "nothing to export (unrecognized archive)".into();
+                self.notify("nothing to export (unrecognized archive)");
                 return;
             }
         };
@@ -760,12 +642,14 @@ impl App {
                     }
                 }
             },
-            KeyCode::Left | KeyCode::Char('h') => {
+            // Columns move with the arrows only: `h` is the help overlay (as in
+            // iftoprs) and `l` is left free so the pair stays consistent.
+            KeyCode::Left => {
                 if self.focus == Focus::Right {
                     self.col_idx = self.col_idx.saturating_sub(1);
                 }
             }
-            KeyCode::Right | KeyCode::Char('l') => {
+            KeyCode::Right => {
                 if self.focus == Focus::Right {
                     if let Some(r) = &self.rows {
                         if self.col_idx + 1 < r.columns.len() {
@@ -788,6 +672,11 @@ impl App {
                 }
             }
             KeyCode::Char('S') => self.open_schema(),
+            // Sorting: `s` toggles the cursor column (asc → desc → off), and
+            // `<`/`>` walk the sort across columns keeping the direction.
+            KeyCode::Char('s') => self.sort_by_current_column(),
+            KeyCode::Char('<') => self.sort_shift_column(false),
+            KeyCode::Char('>') => self.sort_shift_column(true),
             KeyCode::Char('x') => self.export_current(),
             KeyCode::Char('y') => self.copy_sqlite_cell(),
             KeyCode::Char(':') => self.open_modal(Mode::Command(String::new())),
@@ -820,11 +709,11 @@ impl App {
             .cloned()
             .unwrap_or_default();
         let ok = crate::clipboard::copy(&cell);
-        self.status = if ok {
-            "copied cell to clipboard".into()
+        self.notify(if ok {
+            "copied cell to clipboard"
         } else {
-            "clipboard unavailable (no tty)".into()
-        };
+            "clipboard unavailable (no tty)"
+        });
     }
 
     fn key_rkyv(&mut self, key: KeyEvent) {
@@ -1062,7 +951,7 @@ impl App {
         let new_bytes = match result {
             Ok(b) => b,
             Err(e) => {
-                self.status = format!("failed: {}", e);
+                self.notify(format!("failed: {}", e));
                 return;
             }
         };
@@ -1074,14 +963,14 @@ impl App {
         let write = std::fs::write(&tmp, &new_bytes).and_then(|_| std::fs::rename(&tmp, &path));
         if let Err(e) = write {
             let _ = std::fs::remove_file(&tmp);
-            self.status = format!("write failed: {}", e);
+            self.notify(format!("write failed: {}", e));
             return;
         }
         if let Store::Rkyv(r) = &mut self.store {
             r.bytes = new_bytes;
         }
         self.reload_rkyv();
-        self.status = ok_msg;
+        self.notify(ok_msg);
     }
 
     /// Delete the selected rkyv record and write the shard back.
@@ -1098,7 +987,7 @@ impl App {
 
     fn commit_add_record(&mut self, key: &str) {
         if key.is_empty() {
-            self.status = "add cancelled: empty key".into();
+            self.notify("add cancelled: empty key");
             return;
         }
         let (kind, bytes) = match self.rkyv_kind_bytes() {
@@ -1126,7 +1015,7 @@ impl App {
 
     fn commit_rename_record(&mut self, new_key: &str) {
         if new_key.is_empty() {
-            self.status = "rename cancelled".into();
+            self.notify("rename cancelled");
             return;
         }
         let (_, del_key, kind, bytes) = match self.rkyv_ctx() {
@@ -1185,13 +1074,81 @@ impl App {
         self.page_offset = 0;
         self.row_idx = 0;
         self.col_idx = 0;
+        // The sort column belongs to the table that was open.
+        self.sort = None;
         self.load_table();
+    }
+
+    /// Sort the row grid by the column under the cursor. Pressing it again on
+    /// the same column flips the direction; a third press clears the sort and
+    /// returns to the table's natural `rowid` order.
+    fn sort_by_current_column(&mut self) {
+        let col = match self
+            .rows
+            .as_ref()
+            .and_then(|r| r.columns.get(self.col_idx))
+            .cloned()
+        {
+            Some(c) => c,
+            None => return,
+        };
+        self.sort = match self.sort.take() {
+            Some(s) if s.column == col && !s.desc => Some(Sort {
+                column: col.clone(),
+                desc: true,
+            }),
+            Some(s) if s.column == col => None,
+            _ => Some(Sort {
+                column: col.clone(),
+                desc: false,
+            }),
+        };
+        // A different ordering means a different first page.
+        self.page_offset = 0;
+        self.row_idx = 0;
+        self.load_table();
+        match &self.sort {
+            Some(s) => {
+                let dir = if s.desc { "descending" } else { "ascending" };
+                self.notify(format!("sorted by {} {}", s.column, dir))
+            }
+            None => self.notify("sort cleared (rowid order)"),
+        }
+    }
+
+    /// Move the sort to the next / previous column, keeping the direction.
+    fn sort_shift_column(&mut self, forward: bool) {
+        let columns = match self.rows.as_ref().map(|r| r.columns.clone()) {
+            Some(c) if !c.is_empty() => c,
+            _ => return,
+        };
+        let desc = self.sort.as_ref().is_some_and(|s| s.desc);
+        let cur = self
+            .sort
+            .as_ref()
+            .and_then(|s| columns.iter().position(|c| *c == s.column));
+        let next = match cur {
+            Some(i) if forward => (i + 1) % columns.len(),
+            Some(i) => (i + columns.len() - 1) % columns.len(),
+            // No sort yet: start from the column the cursor is on.
+            None => self.col_idx.min(columns.len() - 1),
+        };
+        self.col_idx = next;
+        self.sort = Some(Sort {
+            column: columns[next].clone(),
+            desc,
+        });
+        self.page_offset = 0;
+        self.row_idx = 0;
+        self.load_table();
+        let dir = if desc { "descending" } else { "ascending" };
+        self.notify(format!("sorted by {} {}", columns[next], dir));
     }
 
     fn load_table(&mut self) {
         let (table, res) = match (self.current_table(), self.sqlite()) {
             (Some(t), Some(s)) => {
-                let r = s.rows(&t, PAGE, self.page_offset);
+                let r = s.rows(&t, PAGE, self.page_offset, self.sort.as_ref());
                 (t, r)
             }
             _ => return,
@@ -1234,7 +1191,7 @@ impl App {
         if self.current_rowid().is_some() {
             self.open_modal(Mode::EditCell(cur));
         } else {
-            self.status = "row has no rowid — cannot edit (WITHOUT ROWID table)".into();
+            self.notify("row has no rowid — cannot edit (WITHOUT ROWID table)");
         }
     }
 
@@ -1252,7 +1209,7 @@ impl App {
         let res = self.sqlite().unwrap().update_cell(&table, rowid, &col, val);
         match res {
             Ok(()) => {
-                self.status = format!("updated {}.{}", table, col);
+                self.notify(format!("updated {}.{}", table, col));
                 self.load_table();
             }
             Err(e) => self.status = format!("update failed: {}", e),
@@ -1266,7 +1223,7 @@ impl App {
         };
         match self.sqlite().unwrap().insert_blank(&table) {
             Ok(()) => {
-                self.status = format!("inserted default row into {}", table);
+                self.notify(format!("inserted default row into {}", table));
                 self.load_table();
             }
             Err(e) => self.status = format!("insert failed: {}", e),
@@ -1280,7 +1237,7 @@ impl App {
         };
         match self.sqlite().unwrap().delete_row(&table, rowid) {
             Ok(()) => {
-                self.status = format!("deleted row {} from {}", rowid, table);
+                self.notify(format!("deleted row {} from {}", rowid, table));
                 self.row_idx = self.row_idx.saturating_sub(1);
                 self.load_table();
             }
@@ -1294,7 +1251,7 @@ impl App {
         }
         match self.sqlite().unwrap().exec(sql) {
             Ok(n) => {
-                self.status = format!("ok, {} row(s) affected", n);
+                self.notify(format!("ok, {} row(s) affected", n));
                 self.load_table();
             }
             Err(e) => self.status = format!("sql error: {}", e),
@@ -1409,26 +1366,29 @@ impl App {
             (Some(t), Some(c)) => (t, c),
             _ => return,
         };
-        let from = self
-            .current_rowid()
-            .unwrap_or(if forward { i64::MIN } else { i64::MAX });
-
         let outcome: Result<Option<(i64, i64)>, String> = {
+            let sort = self.sort.clone();
             let s = self.sqlite().unwrap();
-            let first = s.find_row(&table, &columns, &self.search, from, forward);
+            // From the selected row, else from the edge the scan comes in from.
+            let first = match self.current_rowid() {
+                Some(from) => s.find_row(&table, &columns, &self.search, from, forward, sort.as_ref()),
+                None => s.find_row_edge(&table, &columns, &self.search, forward, sort.as_ref()),
+            };
             let rid = match first {
                 Err(e) => Err(e.to_string()),
                 Ok(Some(r)) => Ok(Some(r)),
-                Ok(None) => {
-                    let edge = if forward { i64::MIN } else { i64::MAX };
-                    s.find_row(&table, &columns, &self.search, edge, forward)
-                        .map_err(|e| e.to_string())
-                }
+                // Nothing ahead: wrap to the first/last match in display order.
+                Ok(None) => s
+                    .find_row_edge(&table, &columns, &self.search, forward, sort.as_ref())
+                    .map_err(|e| e.to_string()),
             };
             match rid {
                 Err(e) => Err(e),
                 Ok(None) => Ok(None),
-                Ok(Some(r)) => Ok(Some((r, s.rowid_ordinal(&table, r).unwrap_or(1)))),
+                Ok(Some(r)) => Ok(Some((
+                    r,
+                    s.rowid_ordinal(&table, r, sort.as_ref()).unwrap_or(1),
+                ))),
             }
         };
 
@@ -1439,7 +1399,7 @@ impl App {
                 self.load_table();
                 self.row_idx = (idx0 - self.page_offset) as usize;
                 let total = self.rows.as_ref().map(|r| r.total).unwrap_or(0);
-                self.status = format!("/{}  (row {} of {})", self.search, ord, total);
+                self.notify(format!("/{}  (row {} of {})", self.search, ord, total));
             }
             Ok(None) => self.status = format!("not found: {}", self.search),
             Err(e) => self.status = format!("search error: {}", e),
@@ -1479,7 +1439,7 @@ impl App {
                 match find_bytes(&bytes, self.search.as_bytes(), cur, forward) {
                     Some(off) => {
                         self.hex_row = off / 16;
-                        self.status = format!("/{}  (offset {:#x})", self.search, off);
+                        self.notify(format!("/{}  (offset {:#x})", self.search, off));
                     }
                     None => self.status = format!("not found: {}", self.search),
                 }
@@ -1525,89 +1485,7 @@ impl App {
             Mode::Normal => {}
         }
 
-        if self.show_help {
-            self.render_help(f);
-        }
-        if self.show_chooser {
-            self.render_chooser(f);
-        }
-        if self.show_editor {
-            self.render_editor(f);
-        }
-    }
-
-    fn render_chooser(&self, f: &mut Frame) {
-        let items: Vec<ListItem> = ThemeName::ALL
-            .iter()
-            .map(|&t| {
-                let th = Theme::from_name(t);
-                ListItem::new(Line::from(vec![
-                    Span::styled("██", Style::default().fg(th.accent)),
-                    Span::styled("██", Style::default().fg(th.primary)),
-                    Span::styled("██", Style::default().fg(th.label)),
-                    Span::styled("██  ", Style::default().fg(th.dark)),
-                    Span::raw(t.display().to_string()),
-                ]))
-            })
-            .collect();
-        let mut st = ListState::default();
-        st.select(Some(self.chooser_idx));
-        let h = (ThemeName::ALL.len() as u16 + 2).min(f.area().height.saturating_sub(2));
-        let area = centered(f.area(), 40.min(f.area().width), h);
-        f.render_widget(Clear, area);
-        let list = List::new(items)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(self.theme.accent))
-                    .title(" theme  (j/k · Enter=save · e=edit · Esc) "),
-            )
-            .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
-        f.render_stateful_widget(list, area, &mut st);
-    }
-
-    fn render_editor(&self, f: &mut Frame) {
-        let labels = ["primary", "accent", "alt", "label", "dim", "dark"];
-        let mut lines: Vec<Line> = vec![
-            Line::from(Span::styled(
-                "edit palette — ←/→ slot · ↑/↓ ±1 · PgUp/Dn ±16 · Enter save · Esc",
-                Style::default().fg(self.theme.dim),
-            )),
-            Line::from(""),
-        ];
-        for (i, (lab, &c)) in labels.iter().zip(self.editor_palette.iter()).enumerate() {
-            let sel = i == self.editor_slot;
-            lines.push(Line::from(vec![
-                Span::styled(
-                    if sel { "▶ " } else { "  " },
-                    Style::default().fg(self.theme.accent),
-                ),
-                Span::styled(
-                    "██████ ",
-                    Style::default().fg(ratatui::style::Color::Indexed(c)),
-                ),
-                Span::styled(
-                    format!("{:<9}", lab),
-                    Style::default().fg(if sel {
-                        self.theme.accent
-                    } else {
-                        self.theme.dim
-                    }),
-                ),
-                Span::raw(format!("idx {c}")),
-            ]));
-        }
-        let area = centered(f.area(), 44.min(f.area().width), 11.min(f.area().height));
-        f.render_widget(Clear, area);
-        f.render_widget(
-            Paragraph::new(lines).block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(self.theme.accent))
-                    .title(" theme editor "),
-            ),
-            area,
-        );
+        self.ov.render(f, self.help_ctx());
     }
 
     fn render_detail(&self, f: &mut Frame, area: Rect) {
@@ -1627,9 +1505,9 @@ impl App {
                                 Span::styled(
                                     format!("{:<20}", truncate(col, 20)),
                                     Style::default().fg(if sel {
-                                        self.theme.accent
+                                        self.ov.theme.accent
                                     } else {
-                                        self.theme.dim
+                                        self.ov.theme.dim
                                     }),
                                 ),
                                 Span::raw(truncate(
@@ -1651,7 +1529,7 @@ impl App {
                     fields.push(Line::from(vec![
                         Span::styled(
                             format!("{:<20}", "key"),
-                            Style::default().fg(self.theme.accent),
+                            Style::default().fg(self.ov.theme.accent),
                         ),
                         Span::raw(truncate(&rec.key, 80)),
                     ]));
@@ -1659,7 +1537,7 @@ impl App {
                         fields.push(Line::from(vec![
                             Span::styled(
                                 format!("{:<20}", truncate(name, 20)),
-                                Style::default().fg(self.theme.dim),
+                                Style::default().fg(self.ov.theme.dim),
                             ),
                             Span::raw(val.clone()),
                         ]));
@@ -1694,13 +1572,13 @@ impl App {
         let mut lines: Vec<Line> = Vec::new();
         for (ty, name, sql) in &self.schema {
             lines.push(Line::from(vec![
-                Span::styled(format!("{:<6}", ty), Style::default().fg(self.theme.alt)),
+                Span::styled(format!("{:<6}", ty), Style::default().fg(self.ov.theme.alt)),
                 Span::styled(name.clone(), Style::default().add_modifier(Modifier::BOLD)),
             ]));
             for l in sql.lines() {
                 lines.push(Line::from(Span::styled(
                     format!("    {}", l),
-                    Style::default().fg(self.theme.dim),
+                    Style::default().fg(self.ov.theme.dim),
                 )));
             }
             lines.push(Line::from(""));
@@ -1716,77 +1594,6 @@ impl App {
                 " schema — {} objects (j/k scroll · Esc back) ",
                 self.schema.len()
             ))),
-            area,
-        );
-    }
-
-    fn render_help(&self, f: &mut Frame) {
-        let is_sqlite = matches!(self.store, Store::Sqlite(_));
-        let mut lines = vec![
-            Line::from(Span::styled(
-                "zdbview — keys",
-                Style::default()
-                    .fg(self.theme.accent)
-                    .add_modifier(Modifier::BOLD),
-            )),
-            Line::from(""),
-            Line::from("  hjkl / arrows   move            gg / G   top / bottom"),
-            Line::from("  /               search          n / N    next / prev match"),
-            Line::from("  Enter           open detail     v        cycle value render"),
-            Line::from("  y               copy (OSC52)    x        export to file"),
-            Line::from("  t               themes (31)     Esc      back (quit on main)"),
-            Line::from("  ?               this help       q        quit"),
-        ];
-        if is_sqlite {
-            lines.push(Line::from(""));
-            lines.push(Line::from(Span::styled(
-                "  SQLite:",
-                Style::default().fg(self.theme.label),
-            )));
-            lines.push(Line::from(
-                "  Tab focus   e edit cell   a add row   d delete   : SQL",
-            ));
-            lines.push(Line::from(
-                "  S schema    Ctrl-f/Ctrl-b page   / searches whole table",
-            ));
-        } else {
-            lines.push(Line::from(""));
-            lines.push(Line::from(Span::styled(
-                "  rkyv:",
-                Style::default().fg(self.theme.label),
-            )));
-            lines.push(Line::from("  0 Records   1 Info   2 Strings   3 Hex"));
-            lines.push(Line::from(
-                "  Records CRUD:  a add   e edit value   r rename   d delete",
-            ));
-        }
-        lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled(
-            "  mouse:",
-            Style::default().fg(self.theme.label),
-        )));
-        lines.push(Line::from(
-            "  wheel scroll   click select   right-click select + detail",
-        ));
-        lines.push(Line::from(
-            "  input line: ←/→ move  Home/End  Ctrl-a/e/w/u/k  cursor edit",
-        ));
-        lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled(
-            "  press any key to close",
-            Style::default().fg(self.theme.dim),
-        )));
-
-        let h = (lines.len() as u16 + 2).min(f.area().height);
-        let area = centered(f.area(), 66.min(f.area().width), h);
-        f.render_widget(Clear, area);
-        f.render_widget(
-            Paragraph::new(lines).block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(self.theme.accent))
-                    .title(" help "),
-            ),
             area,
         );
     }
@@ -1821,12 +1628,17 @@ impl App {
         let title = match self.current_table() {
             Some(t) => {
                 let total = self.rows.as_ref().map(|r| r.total).unwrap_or(0);
+                let sorted = match &self.sort {
+                    Some(s) => format!(" — sorted {} {}", s.column, arrow(s.desc)),
+                    None => String::new(),
+                };
                 format!(
-                    " {} — rows {}..{} of {} ",
+                    " {} — rows {}..{} of {}{} ",
                     t,
                     self.page_offset,
                     self.page_offset + self.rows.as_ref().map(|r| r.rows.len() as i64).unwrap_or(0),
-                    total
+                    total,
+                    sorted
                 )
             }
             None => " (no table) ".into(),
@@ -1840,12 +1652,17 @@ impl App {
                     .map(|(i, c)| {
                         let st = if i == self.col_idx && self.focus == Focus::Right {
                             Style::default()
-                                .fg(self.theme.accent)
+                                .fg(self.ov.theme.accent)
                                 .add_modifier(Modifier::BOLD)
                         } else {
                             Style::default().add_modifier(Modifier::BOLD)
                         };
-                        Cell::from(c.clone()).style(st)
+                        // Mark the sorted column in its header.
+                        let label = match &self.sort {
+                            Some(s) if s.column == *c => format!("{} {}", c, arrow(s.desc)),
+                            _ => c.clone(),
+                        };
+                        Cell::from(label).style(st)
                     })
                     .collect::<Vec<_>>(),
             );
@@ -1927,7 +1744,7 @@ impl App {
             .block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .border_style(Style::default().fg(self.theme.accent))
+                    .border_style(Style::default().fg(self.ov.theme.accent))
                     .title(format!(" {} — {} keys ", d.format, d.records.len())),
             )
             .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
@@ -1939,14 +1756,14 @@ impl App {
         if let Some(rec) = d.records.get(self.record_idx) {
             for (name, val) in &rec.fields {
                 lines.push(Line::from(vec![
-                    Span::styled(format!("{:<22}", name), Style::default().fg(self.theme.dim)),
+                    Span::styled(format!("{:<22}", name), Style::default().fg(self.ov.theme.dim)),
                     Span::raw(val.clone()),
                 ]));
             }
             lines.push(Line::from(""));
             lines.push(Line::from(Span::styled(
                 format!("value — {} bytes (hex):", rec.value.len()),
-                Style::default().fg(self.theme.primary),
+                Style::default().fg(self.ov.theme.primary),
             )));
             let rows = area.height.saturating_sub(6) as usize;
             for i in 0..rows {
@@ -1966,15 +1783,15 @@ impl App {
     fn render_rkyv_info(&self, f: &mut Frame, area: Rect, r: &RkyvStore) {
         let mut lines = vec![
             Line::from(vec![
-                Span::styled("file:    ", Style::default().fg(self.theme.dim)),
+                Span::styled("file:    ", Style::default().fg(self.ov.theme.dim)),
                 Span::raw(r.path.display().to_string()),
             ]),
             Line::from(vec![
-                Span::styled("size:    ", Style::default().fg(self.theme.dim)),
+                Span::styled("size:    ", Style::default().fg(self.ov.theme.dim)),
                 Span::raw(format!("{} bytes", r.len())),
             ]),
             Line::from(vec![
-                Span::styled("strings: ", Style::default().fg(self.theme.dim)),
+                Span::styled("strings: ", Style::default().fg(self.ov.theme.dim)),
                 Span::raw(format!(
                     "{} runs (>= {} printable bytes)",
                     self.strings.len(),
@@ -1987,11 +1804,11 @@ impl App {
             Some(d) => {
                 lines.push(Line::from(""));
                 lines.push(Line::from(vec![
-                    Span::styled("format:  ", Style::default().fg(self.theme.dim)),
-                    Span::styled(d.format.clone(), Style::default().fg(self.theme.label)),
+                    Span::styled("format:  ", Style::default().fg(self.ov.theme.dim)),
+                    Span::styled(d.format.clone(), Style::default().fg(self.ov.theme.label)),
                 ]));
                 lines.push(Line::from(vec![
-                    Span::styled("records: ", Style::default().fg(self.theme.dim)),
+                    Span::styled("records: ", Style::default().fg(self.ov.theme.dim)),
                     Span::raw(d.records.len().to_string()),
                 ]));
                 lines.push(Line::from(""));
@@ -1999,7 +1816,7 @@ impl App {
                     lines.push(Line::from(vec![
                         Span::styled(
                             format!("  {:<16}", name),
-                            Style::default().fg(self.theme.dim),
+                            Style::default().fg(self.ov.theme.dim),
                         ),
                         Span::raw(val.clone()),
                     ]));
@@ -2007,26 +1824,26 @@ impl App {
                 lines.push(Line::from(""));
                 lines.push(Line::from(Span::styled(
                     "Views:  0 Records (key/value)  2 Strings  3 Hex",
-                    Style::default().fg(self.theme.dim),
+                    Style::default().fg(self.ov.theme.dim),
                 )));
             }
             None => {
                 lines.push(Line::from(""));
                 lines.push(Line::from(Span::styled(
                     "unrecognized rkyv archive: no matching format decoder.",
-                    Style::default().fg(self.theme.primary),
+                    Style::default().fg(self.ov.theme.primary),
                 )));
                 lines.push(Line::from(Span::styled(
                     "rkyv stores no field names or type tags, so an unknown type",
-                    Style::default().fg(self.theme.primary),
+                    Style::default().fg(self.ov.theme.primary),
                 )));
                 lines.push(Line::from(Span::styled(
                     "cannot be decoded generically — showing raw structure.",
-                    Style::default().fg(self.theme.primary),
+                    Style::default().fg(self.ov.theme.primary),
                 )));
                 lines.push(Line::from(Span::styled(
                     "Views:  2 Strings (embedded text)  3 Hex (raw bytes)",
-                    Style::default().fg(self.theme.dim),
+                    Style::default().fg(self.ov.theme.dim),
                 )));
             }
         }
@@ -2046,7 +1863,7 @@ impl App {
                 ListItem::new(Line::from(vec![
                     Span::styled(
                         format!("{:08x}  ", h.offset),
-                        Style::default().fg(self.theme.dim),
+                        Style::default().fg(self.ov.theme.dim),
                     ),
                     Span::raw(truncate(&h.text, 200)),
                 ]))
@@ -2114,7 +1931,7 @@ impl App {
         let p = Paragraph::new(line).block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(self.theme.accent))
+                .border_style(Style::default().fg(self.ov.theme.accent))
                 .title(format!(" {} ", title)),
         );
         f.render_widget(p, area);
@@ -2122,30 +1939,54 @@ impl App {
 
     fn pane_style(&self, which: Focus) -> Style {
         if self.focus == which {
-            Style::default().fg(self.theme.accent)
+            Style::default().fg(self.ov.theme.accent)
         } else {
-            Style::default().fg(self.theme.dim)
+            Style::default().fg(self.ov.theme.dim)
         }
     }
 }
 
 /// Recent-files picker shown when zdbview is launched with no file argument.
 /// Returns the chosen file, or `None` if the user quits.
-pub fn pick_mru(terminal: &mut DefaultTerminal, entries: &[Entry]) -> Result<Option<PathBuf>> {
+pub fn pick_mru(
+    terminal: &mut DefaultTerminal,
+    entries: &[Entry],
+    theme_override: Option<ThemeName>,
+) -> Result<Option<PathBuf>> {
     let mut idx = 0usize;
     let mut pending_g = false;
     let mut search = String::new();
     let mut searching = false;
+    // The picker carries the same overlay layer as the main screens, so `h`,
+    // `c` and `C` work here too — and a scheme picked here is the one the file
+    // opens with.
+    let prefs = crate::prefs::load();
+    let mut ov = Overlays::new(match (theme_override, prefs.custom) {
+        (Some(name), _) => Theme::from_name(name),
+        (None, Some(c)) => Theme::from_palette(prefs.theme, c),
+        (None, None) => Theme::from_name(prefs.theme),
+    });
     loop {
         let query = if searching {
             Some(search.as_str())
         } else {
             None
         };
-        terminal.draw(|f| render_picker(f, entries, idx, query))?;
+        terminal.draw(|f| {
+            render_picker(f, entries, idx, query, &ov.theme);
+            ov.render(f, HelpCtx::Picker);
+        })?;
+        if !event::poll(TICK)? {
+            ov.expire_toast();
+            continue;
+        }
         let ev = event::read()?;
+        ov.expire_toast();
         // Mouse: wheel moves the selection, a click opens the entry under it.
         if let Event::Mouse(m) = ev {
+            if ov.on_mouse(m) {
+                continue;
+            }
             match m.kind {
                 MouseEventKind::ScrollDown => {
                     if idx + 1 < entries.len() {
@@ -2188,6 +2029,11 @@ pub fn pick_mru(terminal: &mut DefaultTerminal, entries: &[Entry]) -> Result<Opt
                     KeyCode::Char(c) => search.push(c),
                     _ => {}
                 }
+                continue;
+            }
+
+            // Overlay keys (open or drive: h/? c C) come before the picker's own.
+            if ov.on_key(key.code) {
                 continue;
             }
 
@@ -2251,7 +2097,13 @@ fn picker_find(entries: &[Entry], from: usize, forward: bool, q: &str) -> Option
     })
 }
 
-fn render_picker(f: &mut Frame, entries: &[Entry], idx: usize, query: Option<&str>) {
+fn render_picker(
+    f: &mut Frame,
+    entries: &[Entry],
+    idx: usize,
+    query: Option<&str>,
+    t: &Theme,
+) {
     let outer = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(f.area());
 
     if entries.is_empty() {
@@ -2261,12 +2113,13 @@ fn render_picker(f: &mut Frame, entries: &[Entry], idx: usize, query: Option<&st
             Line::from(""),
             Line::from(Span::styled(
                 "  Open one with:  zdbview <file>",
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(t.dim),
             )),
         ])
         .block(
             Block::default()
                 .borders(Borders::ALL)
+                .border_style(Style::default().fg(t.accent))
                 .title(" zdbview — recent "),
         );
         f.render_widget(p, outer[0]);
@@ -2277,20 +2130,22 @@ fn render_picker(f: &mut Frame, entries: &[Entry], idx: usize, query: Option<&st
                 let name = e.path.file_name().and_then(|n| n.to_str()).unwrap_or("?");
                 let dir = e.path.parent().and_then(|p| p.to_str()).unwrap_or("");
                 let (badge, color) = match e.kind {
-                    Kind::Sqlite => ("sqlite", Color::Green),
-                    Kind::Rkyv => ("rkyv  ", Color::Magenta),
+                    Kind::Sqlite => ("sqlite", t.primary),
+                    Kind::Rkyv => ("rkyv  ", t.alt),
                 };
                 ListItem::new(Line::from(vec![
                     Span::styled(format!(" {} ", badge), Style::default().fg(color)),
                     Span::styled(
                         format!("{:<28}", truncate(name, 28)),
-                        Style::default().add_modifier(Modifier::BOLD),
+                        Style::default()
+                            .fg(t.accent)
+                            .add_modifier(Modifier::BOLD),
                     ),
                     Span::styled(
                         format!("{:>10}  ", mru::rel_age(e.opened)),
-                        Style::default().fg(Color::DarkGray),
+                        Style::default().fg(t.dim),
                     ),
-                    Span::styled(truncate(dir, 60), Style::default().fg(Color::DarkGray)),
+                    Span::styled(truncate(dir, 60), Style::default().fg(t.label)),
                 ]))
             })
             .collect();
@@ -2300,6 +2155,7 @@ fn render_picker(f: &mut Frame, entries: &[Entry], idx: usize, query: Option<&st
             .block(
                 Block::default()
                     .borders(Borders::ALL)
+                    .border_style(Style::default().fg(t.accent))
                     .title(format!(" zdbview — recent files ({}) ", entries.len())),
             )
             .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
@@ -2308,9 +2164,11 @@ fn render_picker(f: &mut Frame, entries: &[Entry], idx: usize, query: Option<&st
 
     let help = match query {
         Some(q) => Paragraph::new(format!("/{}_", q))
-            .style(Style::default().fg(Color::Black).bg(Color::Cyan)),
-        None => Paragraph::new("j/k move · / search · n/N next/prev · Enter open · q quit")
-            .style(Style::default().fg(Color::Black).bg(Color::Gray)),
+            .style(Style::default().fg(Color::Black).bg(t.accent)),
+        None => Paragraph::new(
+            "j/k move · / search · n/N next/prev · Enter open · c scheme · h help · q quit",
+        )
+        .style(Style::default().fg(Color::Black).bg(t.help_key)),
     };
     f.render_widget(help, outer[1]);
 }
@@ -2560,6 +2418,15 @@ fn hex_row(bytes: &[u8], offset: usize) -> String {
 }
 
 /// Truncate a display string to `max` chars, appending an ellipsis.
+/// Sort-direction marker for a column header.
+fn arrow(desc: bool) -> &'static str {
+    if desc {
+        "▼"
+    } else {
+        "▲"
+    }
+}
+
 fn truncate(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         s.to_string()
@@ -2584,8 +2451,191 @@ fn centered(area: Rect, w: u16, h: u16) -> Rect {
 
 #[cfg(test)]
 mod tests {
-    use super::{find_bytes, find_next, hit, input_delete_word, input_left, input_right};
+    use super::{
+        find_bytes, find_next, hit, input_delete_word, input_left, input_right, App, Store,
+    };
+    use crate::overlay::HelpCtx;
+    use crate::rkyv_inspect::RkyvStore;
+    use crate::sqlite::SqliteStore;
+    use crate::theme::ThemeName;
+    use crossterm::event::{KeyCode, KeyEvent};
+    use ratatui::backend::TestBackend;
     use ratatui::layout::Rect;
+    use ratatui::Terminal;
+
+    /// A unique scratch path per call — these tests run concurrently.
+    fn scratch(ext: &str) -> std::path::PathBuf {
+        static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let seq = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut path = std::env::temp_dir();
+        path.push(format!("zdbview_app_{}_{}.{}", std::process::id(), seq, ext));
+        let _ = std::fs::remove_file(&path);
+        path
+    }
+
+    /// An App over a throwaway binary file, on a fixed scheme so assertions
+    /// don't depend on the developer's saved prefs.
+    fn rkyv_app() -> App {
+        let path = scratch("bin");
+        std::fs::write(&path, b"zdbview overlay render test payload").unwrap();
+        let store = Store::Rkyv(RkyvStore::open(&path).unwrap());
+        let _ = std::fs::remove_file(&path);
+        App::new(store, Some(ThemeName::NeonSprawl))
+    }
+
+    /// An App over a two-column SQLite table, for column-motion tests.
+    fn sqlite_app() -> (App, std::path::PathBuf) {
+        let path = scratch("db");
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute("CREATE TABLE t (a TEXT, b TEXT, c TEXT)", []).unwrap();
+        conn.execute("INSERT INTO t VALUES ('x', 'y', 'z')", []).unwrap();
+        drop(conn);
+        let store = Store::Sqlite(SqliteStore::open(&path).unwrap());
+        (App::new(store, Some(ThemeName::NeonSprawl)), path)
+    }
+
+    /// Render one frame and flatten the buffer into per-row strings.
+    fn frame_rows(app: &mut App, w: u16, h: u16) -> Vec<String> {
+        let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+        term.draw(|f| app.render(f)).unwrap();
+        let buf = term.backend().buffer().clone();
+        (0..buf.area().height)
+            .map(|y| {
+                (0..buf.area().width)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    fn contains(rows: &[String], needle: &str) -> bool {
+        rows.iter().any(|r| r.contains(needle))
+    }
+
+    fn press(app: &mut App, c: char) {
+        app.on_key(KeyEvent::from(KeyCode::Char(c)));
+    }
+
+    /// The overlay openers must work from the app's screens, and keys the
+    /// overlay layer doesn't own must still reach the app.
+    #[test]
+    fn overlay_keys_route_through_the_app() {
+        let mut app = rkyv_app();
+        press(&mut app, 'h');
+        assert!(app.ov.help, "h must open help");
+        press(&mut app, 'j');
+        assert!(!app.ov.help, "any key closes help");
+
+        press(&mut app, 'c');
+        assert!(app.ov.chooser, "c must open the scheme chooser");
+        press(&mut app, 'c');
+        assert!(!app.ov.chooser);
+
+        press(&mut app, 'C');
+        assert!(app.ov.editor, "C must open the palette editor");
+        app.on_key(KeyEvent::from(KeyCode::Esc));
+        assert!(!app.ov.editor);
+
+        // `e` belongs to the data screens, not the overlays.
+        press(&mut app, 'e');
+        assert!(!app.ov.active(), "e must not open an overlay");
+    }
+
+    /// `h` is the help key, so it must not double as a column motion; the
+    /// arrows own that.
+    #[test]
+    fn columns_move_with_arrows_and_h_opens_help() {
+        let (mut app, path) = sqlite_app();
+        app.on_key(KeyEvent::from(KeyCode::Tab)); // focus the row grid
+        app.on_key(KeyEvent::from(KeyCode::Right));
+        assert_eq!(app.col_idx, 1, "Right must move a column");
+        app.on_key(KeyEvent::from(KeyCode::Left));
+        assert_eq!(app.col_idx, 0, "Left must move back");
+
+        app.on_key(KeyEvent::from(KeyCode::Right));
+        press(&mut app, 'h');
+        assert_eq!(app.col_idx, 1, "h must not move the column");
+        assert!(app.ov.help, "h must open help instead");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// `s` cycles the row grid's sort on the cursor column (ascending →
+    /// descending → off), reloads the page, and marks the column in its header.
+    #[test]
+    fn s_cycles_the_sort_on_the_cursor_column() {
+        let (mut app, path) = sqlite_app();
+        app.on_key(KeyEvent::from(KeyCode::Tab)); // focus the row grid
+        app.on_key(KeyEvent::from(KeyCode::Right)); // cursor on column `b`
+        assert!(app.sort.is_none(), "no sort until asked for");
+
+        press(&mut app, 's');
+        let sort = app.sort.as_ref().expect("s must sort");
+        assert_eq!(sort.column, "b");
+        assert!(!sort.desc, "first press sorts ascending");
+        let rows = frame_rows(&mut app, 100, 20);
+        assert!(contains(&rows, "b ▲"), "ascending marker missing");
+        assert!(contains(&rows, "sorted by b ascending"), "no sort toast");
+
+        press(&mut app, 's');
+        assert!(app.sort.as_ref().unwrap().desc, "second press flips it");
+        let rows = frame_rows(&mut app, 100, 20);
+        assert!(contains(&rows, "b ▼"), "descending marker missing");
+
+        press(&mut app, 's');
+        assert!(app.sort.is_none(), "third press clears the sort");
+
+        // `>` walks the sort to the next column, keeping the direction.
+        press(&mut app, '>');
+        assert_eq!(app.sort.as_ref().unwrap().column, "b");
+        press(&mut app, '>');
+        assert_eq!(app.sort.as_ref().unwrap().column, "c");
+        press(&mut app, '<');
+        assert_eq!(app.sort.as_ref().unwrap().column, "b");
+
+        // Selecting another table drops a sort that named its columns.
+        app.on_key(KeyEvent::from(KeyCode::Tab));
+        app.select_table(0);
+        assert!(app.sort.is_none(), "sort must not survive a table switch");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Help lists the section for the open store.
+    #[test]
+    fn help_ctx_follows_the_store() {
+        assert_eq!(rkyv_app().help_ctx(), HelpCtx::Rkyv);
+        let (app, path) = sqlite_app();
+        assert_eq!(app.help_ctx(), HelpCtx::Sqlite);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Action results must raise a toast as well as land in the status bar.
+    #[test]
+    fn action_results_raise_a_toast() {
+        let mut app = rkyv_app();
+        assert!(app.ov.toast.is_none(), "no toast before any action");
+        // Export on an unrecognized archive: reports that there is nothing to
+        // write, without touching the filesystem.
+        press(&mut app, 'x');
+        let toast = app.ov.toast.as_ref().expect("an action must toast");
+        assert!(!toast.text.is_empty());
+        assert_eq!(app.status, toast.text, "status bar keeps the same text");
+    }
+
+    /// The overlay draws over the app's own screen, including a nested one.
+    #[test]
+    fn overlays_render_over_the_app_screens() {
+        let mut app = rkyv_app();
+        app.ov.help = true;
+        let rows = frame_rows(&mut app, 100, 40);
+        assert!(contains(&rows, "KEYBOARD SHORTCUTS"));
+        assert!(contains(&rows, "RKYV"), "store section missing");
+
+        app.ov.help = false;
+        app.screen = super::Screen::Detail;
+        app.ov.toast("copied 12 bytes to clipboard");
+        let rows = frame_rows(&mut app, 100, 40);
+        assert!(contains(&rows, "copied 12 bytes"), "toast missing on detail");
+    }
 
     #[test]
     fn cursor_left_right_utf8() {
