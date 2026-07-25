@@ -143,6 +143,8 @@ SQLite files are self-describing, so every operation works on any database:
 - `d` — delete the selected row (confirm with `y`).
 - `:` — open the **SQL editor** (see below).
 - `D` — the **database report** (see below).
+- `A` — **column statistics** (see below).
+- `e` on a blob cell opens the **hex editor**; text cells edit inline.
 
 Rows are addressed by `rowid`; `WITHOUT ROWID` tables are listed read-only.
 Identifiers are double-quoted with internal quotes doubled, and edited values are
@@ -242,7 +244,9 @@ is published on crates.io); disable with `--no-default-features`.
 | `<` / `>` | move the sort to the previous / next column |
 | `a` `e` `r` `d` | create / hex-edit value / rename / delete record (rkyv) |
 | `S` | schema view (SQLite) |
-| `D` | database report: pragmas, integrity check, foreign-key lint (SQLite) |
+| `D` | database report: pragmas, integrity check, foreign-key lint, maintenance (SQLite) |
+| `A` | column statistics for the table, with a per-column frequency table (SQLite) |
+| `Y` | copy the row as an `INSERT` (SQLite) |
 | `0` `1` `2` `3` | Records / Info / Strings / Hex (rkyv) |
 | `v` | cycle value render (auto / hex / text / disasm) — detail screen |
 | `y` | copy cell / value / key to clipboard (OSC 52) |
@@ -416,11 +420,70 @@ walk the whole file:
 | `i` | `PRAGMA integrity_check` | `.intck` |
 | `Q` | `PRAGMA quick_check` | `.intck` (cheap) |
 | `f` | foreign keys with no index to serve them | `.lint fkey-indexes` |
+| `v` | `VACUUM` — rewrite the file, reclaiming free pages (reports the size change) | `.vacuum` / DB4S "Compact Database" |
+| `z` | `ANALYZE` — write `sqlite_stat1` so the planner has statistics | `.analyze` |
+| `r` | `REINDEX` — rebuild every index | — |
 
 The lint reads `foreign_key_list`, `index_list` and `index_info` per table and
 reports a key only when no index *starts* with the child column, which is the
 condition that makes every parent-row change scan the child table. An index on
 some other column of the same table does not count.
+
+## Column statistics (`A`)
+
+`A` describes every column of the current table — what VisiData's `describe` and
+sqlite-utils' `analyze-tables` report:
+
+```
+  column           type       rows  nulls  distinct  numeric  longest       min       max      mean
+  id            INTEGER      46716      0     46716    46716        5         1     46716   23358.5
+  name             TEXT      46716      0     46716        0       51      _0ad     _zzuf         —
+  body             BLOB      46716      0     46713        0   552636   <blob …   <blob …         —
+```
+
+`numeric` is the count of cells SQLite actually stores as a number, which is the
+only way to see that a column declared `INTEGER` is holding text — a declared type
+is an affinity hint, not a constraint. `mean` covers those numeric cells only, so a
+text column is not averaged into nonsense.
+
+`Enter` on a column shows its most common values with bars, VisiData's frequency
+sheet — one glance says whether a column is skewed:
+
+```
+  a                                    2  ########################
+  b                                    1  ############
+```
+
+Every column costs one pass over the table, and on a real database a wide blob
+column costs over a second of it (measured: 1.6s for `count(DISTINCT body)` across
+46,716 rows of `~/.zshrs/compsys.db`). So the pass runs on its own connection on a
+background thread — the screen opens saying `analyzing …` and fills in when the
+work lands, and the UI never blocks.
+
+## Editing blobs
+
+A blob cell has no text form, so `e` on one opens the **hex editor** over its bytes
+instead of the line editor, and `^s` writes them back as a blob parameter. Editing
+a blob as a string would replace the bytes with their own description. Text,
+integer and real cells still edit inline.
+
+## Import
+
+`--import` loads a CSV (or TSV, by extension) into an existing table — the shell's
+`.import`:
+
+```sh
+zdbview data.db --import rows.csv --table people
+# imported 3 rows into people
+```
+
+The header row names the columns, so a file whose columns are ordered differently
+from the table still lands correctly, and a header naming a column the table does
+not have is an error rather than a silent drop. The whole file goes in one
+transaction: a row with the wrong field count rolls all of it back. Values are
+inserted as text and left to SQLite's affinity rules, which is what the shell does.
+The reader is RFC 4180 — quoted fields may hold the separator, newlines and doubled
+quotes, and CRLF or a missing final newline are both accepted.
 
 ## Sorting
 

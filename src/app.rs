@@ -28,9 +28,25 @@ use crate::theme::{Theme, ThemeName};
 const PAGE: i64 = 500;
 /// Minimum length for an extracted rkyv string run.
 const MIN_STRING: usize = 4;
+/// How many values a column's frequency table shows.
+const FREQUENCY_ROWS: i64 = 20;
 /// Idle wake-up interval: how often the loop redraws with no input pending, so a
 /// toast dismisses itself on time (iftoprs's `event::poll` tick).
 const TICK: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// What the hex editor has open, which decides where `^s` writes.
+#[derive(Clone, PartialEq, Eq, Debug)]
+enum HexTarget {
+    /// A rkyv record's value, written through the archive's re-serialization.
+    Record,
+    /// A SQLite cell, written back as a blob parameter. Blob cells have no text
+    /// form, so the line editor cannot express them.
+    Cell {
+        table: String,
+        rowid: i64,
+        column: String,
+    },
+}
 
 /// Which pane has keyboard focus.
 #[derive(PartialEq, Eq, Clone, Copy)]
@@ -100,6 +116,10 @@ enum Screen {
     /// Database facts, integrity check and foreign-key lint (`.dbinfo`, `.intck`,
     /// `.lint fkey-indexes` in the sqlite3 shell).
     DbInfo,
+    /// Per-column statistics for the current table, and one column's frequency
+    /// table (VisiData's `describe` and frequency sheet, sqlite-utils'
+    /// `analyze-tables`).
+    Stats,
     /// SQLite schema (CREATE statements) view.
     Schema,
 }
@@ -191,6 +211,16 @@ pub struct App {
     top_area: Rect,
     /// The SQL editor, while `screen` is `Screen::Sql`.
     sql: Option<crate::sqledit::SqlEdit>,
+    /// What the open hex editor writes back to. A rkyv record by default; a
+    /// SQLite blob cell when the grid's cell could not be edited as text.
+    hex_target: HexTarget,
+    /// A statistics pass running on another thread, with the table it is for.
+    stats_pending: Option<(String, std::sync::mpsc::Receiver<StatsResult>)>,
+    /// Per-column statistics, built when the statistics screen opens.
+    stats: Vec<crate::sqlite::ColumnStat>,
+    stats_idx: usize,
+    /// The column whose frequency table is shown, with its top values.
+    stats_freq: Option<(String, Vec<(String, i64)>)>,
     /// Lines of the database-info screen, built when it opens.
     dbinfo: Vec<(String, String)>,
     /// Integrity-check and lint output, filled on demand (both can be slow).
@@ -270,6 +300,11 @@ impl App {
             top: None,
             top_area: Rect::ZERO,
             sql: None,
+            hex_target: HexTarget::Record,
+            stats_pending: None,
+            stats: Vec::new(),
+            stats_idx: 0,
+            stats_freq: None,
             dbinfo: Vec::new(),
             dbinfo_checks: Vec::new(),
             dbinfo_scroll: 0,
@@ -325,6 +360,9 @@ impl App {
         }
         if self.screen == Screen::DbInfo {
             return HelpCtx::DbInfo;
+        }
+        if self.screen == Screen::Stats {
+            return HelpCtx::Stats;
         }
         match &self.store {
             Store::Sqlite(_) => HelpCtx::Sqlite,
@@ -383,6 +421,7 @@ impl App {
     pub fn run(&mut self, terminal: &mut DefaultTerminal) -> Result<Outcome> {
         while !self.quit {
             self.poll_decode();
+            self.poll_stats();
             if let Some(w) = self.top.as_mut() {
                 w.tick();
             }
@@ -504,6 +543,7 @@ impl App {
             Screen::Top => return self.key_top(code),
             Screen::Sql => return self.key_sql(key),
             Screen::DbInfo => return self.key_dbinfo(code),
+            Screen::Stats => return self.key_stats(code),
             Screen::Detail => return self.key_detail(code),
             Screen::Schema => return self.key_schema(code),
             Screen::Main => {}
@@ -887,6 +927,9 @@ impl App {
             KeyCode::Char('S') => self.open_schema(),
             // `D` for the database's own facts, the shell's `.dbinfo`.
             KeyCode::Char('D') => self.open_dbinfo(),
+            // `A` analyzes the table's columns, `Y` copies the row as an INSERT.
+            KeyCode::Char('A') => self.open_stats(),
+            KeyCode::Char('Y') => self.copy_row_as_insert(),
             // Sorting: `s` toggles the cursor column (asc → desc → off), and
             // `<`/`>` walk the sort across columns keeping the direction.
             KeyCode::Char('s') => self.sort_by_current_column(),
@@ -1358,6 +1401,7 @@ impl App {
             None => return,
         };
         self.hex = Some(HexEdit::new(key, value));
+        self.hex_target = HexTarget::Record;
         self.screen = Screen::HexEdit;
     }
 
@@ -1386,6 +1430,29 @@ impl App {
             Some(ed) => ed.bytes.clone(),
             None => return,
         };
+        if let HexTarget::Cell {
+            table,
+            rowid,
+            column,
+        } = self.hex_target.clone()
+        {
+            let n = value.len();
+            let written = match self.sqlite() {
+                Some(s) => s.update_cell_blob(&table, rowid, &column, &value),
+                None => return,
+            };
+            match written {
+                Ok(()) => {
+                    self.load_table();
+                    self.notify(format!("{column} set ({n} bytes)"));
+                    if let Some(ed) = self.hex.as_mut() {
+                        ed.mark_saved();
+                    }
+                }
+                Err(e) => self.notify(format!("write failed: {e}")),
+            }
+            return;
+        }
         let (_, del_key, kind, bytes) = match self.rkyv_ctx() {
             Some(v) => v,
             None => return,
@@ -1720,11 +1787,45 @@ impl App {
             .and_then(|row| row.get(self.col_idx))
             .cloned()
             .unwrap_or_default();
-        if self.current_rowid().is_some() {
-            self.open_modal(Mode::EditCell(cur));
-        } else {
-            self.notify("row has no rowid — cannot edit (WITHOUT ROWID table)");
+        let rowid = match self.current_rowid() {
+            Some(r) => r,
+            None => {
+                self.notify("row has no rowid — cannot edit (WITHOUT ROWID table)");
+                return;
+            }
+        };
+        // A blob has no text form: editing it as a string would replace the bytes
+        // with their own description. Those cells open in the hex editor instead,
+        // which is what DB Browser's binary cell editor does.
+        let column = self
+            .rows
+            .as_ref()
+            .and_then(|r| r.columns.get(self.col_idx).cloned());
+        if let (Some(table), Some(column), Some(store)) =
+            (self.current_table(), column, self.sqlite())
+        {
+            if store.cell_is_blob(&table, rowid, &column).unwrap_or(false) {
+                match store.cell_bytes(&table, rowid, &column) {
+                    Ok(bytes) => {
+                        let n = bytes.len();
+                        self.hex = Some(HexEdit::new(format!("{table}.{column}"), bytes));
+                        self.hex_target = HexTarget::Cell {
+                            table,
+                            rowid,
+                            column,
+                        };
+                        self.screen = Screen::HexEdit;
+                        self.notify(format!("blob cell — {n} bytes in the hex editor"));
+                        return;
+                    }
+                    Err(e) => {
+                        self.notify(format!("cannot read the blob: {e}"));
+                        return;
+                    }
+                }
+            }
         }
+        self.open_modal(Mode::EditCell(cur));
     }
 
     fn commit_edit_cell(&mut self, val: &str) {
@@ -2004,6 +2105,7 @@ impl App {
                 }
             }
             Screen::DbInfo => self.render_dbinfo(f, outer[0]),
+            Screen::Stats => self.render_stats(f, outer[0]),
             Screen::Schema => self.render_schema(f, outer[0]),
             Screen::Main => match &self.store {
                 Store::Sqlite(_) => self.render_sqlite(f, outer[0]),
@@ -2130,6 +2232,222 @@ impl App {
         self.notify(format!("watching {} files for writes", n));
     }
 
+    /// Open the statistics screen for the current table: one row per column with
+    /// its nulls, distinct values, extremes and mean — VisiData's `describe`,
+    /// sqlite-utils' `analyze-tables`. Every column costs one pass over the table,
+    /// so this runs on request rather than alongside the grid.
+    fn open_stats(&mut self) {
+        let table = match self.current_table() {
+            Some(t) => t,
+            None => return,
+        };
+        let path = match self.sqlite() {
+            Some(s) => s.path.clone(),
+            None => return,
+        };
+        self.stats.clear();
+        self.stats_freq = None;
+        self.stats_idx = 0;
+        self.screen = Screen::Stats;
+        // Each column costs a pass over the table, and on a real database a wide
+        // blob column costs more than a second of it — so the pass runs on its own
+        // connection on another thread and the screen fills in when it lands.
+        self.stats_pending = Some((table.clone(), spawn_stats(path, table.clone())));
+        self.status = format!("{table} · analyzing columns …");
+    }
+
+    /// Install a finished statistics pass. Called from the event loop, like the
+    /// archive decode.
+    fn poll_stats(&mut self) {
+        let (table, result) = match self.stats_pending.as_ref() {
+            Some((t, rx)) => match rx.try_recv() {
+                Ok(r) => (t.clone(), r),
+                Err(std::sync::mpsc::TryRecvError::Empty) => return,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    (t.clone(), Err("the analysis thread stopped".into()))
+                }
+            },
+            None => return,
+        };
+        self.stats_pending = None;
+        match result {
+            Ok(v) => {
+                let n = v.len();
+                self.stats = v;
+                self.stats_idx = self.col_idx.min(n.saturating_sub(1));
+                self.status =
+                    format!("{table} · {n} columns · Enter frequency · j/k move · Esc back");
+            }
+            Err(e) => {
+                self.screen = Screen::Main;
+                self.notify(format!("stats failed: {e}"));
+            }
+        }
+    }
+
+    fn key_stats(&mut self, code: KeyCode) {
+        match code {
+            KeyCode::Char('q') => self.quit = true,
+            KeyCode::Esc | KeyCode::Char('A') => {
+                // The frequency table is a step deeper, so Esc closes that first.
+                if self.stats_freq.is_some() {
+                    self.stats_freq = None;
+                } else {
+                    self.screen = Screen::Main;
+                }
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.stats_idx = (self.stats_idx + 1).min(self.stats.len().saturating_sub(1));
+                self.stats_freq = None;
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.stats_idx = self.stats_idx.saturating_sub(1);
+                self.stats_freq = None;
+            }
+            KeyCode::Char('g') => {
+                self.stats_idx = 0;
+                self.stats_freq = None;
+            }
+            KeyCode::Char('G') => {
+                self.stats_idx = self.stats.len().saturating_sub(1);
+                self.stats_freq = None;
+            }
+            // A frequency table needs the column list the pass is still building.
+            KeyCode::Enter | KeyCode::Char('f') if self.stats_pending.is_none() => {
+                self.open_frequency()
+            }
+            _ => {}
+        }
+    }
+
+    /// The selected column's most common values with their counts.
+    fn open_frequency(&mut self) {
+        let (table, column) = match (
+            self.current_table(),
+            self.stats.get(self.stats_idx).map(|c| c.name.clone()),
+        ) {
+            (Some(t), Some(c)) => (t, c),
+            _ => return,
+        };
+        let rows = match self.sqlite() {
+            Some(s) => s.frequency(&table, &column, FREQUENCY_ROWS),
+            None => return,
+        };
+        match rows {
+            Ok(v) => self.stats_freq = Some((column, v)),
+            Err(e) => self.notify(format!("frequency failed: {e}")),
+        }
+    }
+
+    fn render_stats(&mut self, f: &mut Frame, area: Rect) {
+        let t = self.ov.theme;
+        let mut lines: Vec<Line> = Vec::new();
+        let head = format!(
+            "  {:<16} {:<8} {:>7} {:>6} {:>8} {:>7} {:>7} {:>9} {:>9} {:>9}",
+            "column",
+            "type",
+            "rows",
+            "nulls",
+            "distinct",
+            "numeric",
+            "longest",
+            "min",
+            "max",
+            "mean"
+        );
+        lines.push(Line::from(Span::styled(
+            head,
+            Style::default().fg(t.primary).add_modifier(Modifier::BOLD),
+        )));
+        for (i, c) in self.stats.iter().enumerate() {
+            // `numeric` is how many cells SQLite actually stores as a number,
+            // which is the only way to see that a column declared INTEGER is
+            // holding text — the declared type is an affinity hint, not a rule.
+            let mean = match c.avg {
+                Some(a) => format!("{a:.3}"),
+                None => "—".to_string(),
+            };
+            let text = format!(
+                "  {:<16} {:<8} {:>7} {:>6} {:>8} {:>7} {:>7} {:>9} {:>9} {:>9}",
+                truncate(&c.name, 16),
+                truncate(&c.declared, 8),
+                c.rows,
+                c.nulls,
+                c.distinct,
+                c.numeric,
+                c.longest,
+                truncate(&c.min, 9),
+                truncate(&c.max, 9),
+                truncate(&mean, 9),
+            );
+            // Same selection styling as every other list in the app.
+            let style = if i == self.stats_idx {
+                Style::default().add_modifier(Modifier::REVERSED)
+            } else {
+                Style::default().fg(t.primary)
+            };
+            lines.push(Line::from(Span::styled(text, style)));
+        }
+        if let Some((col, freq)) = &self.stats_freq {
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                format!("  {col} — most common values"),
+                Style::default().fg(t.primary).add_modifier(Modifier::BOLD),
+            )));
+            let widest = freq.iter().map(|(_, n)| *n).max().unwrap_or(1).max(1);
+            for (v, n) in freq {
+                // The bar is the point: a glance says whether a column is skewed.
+                let bar = "#".repeat(((*n as f64 / widest as f64) * 24.0).round() as usize);
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        format!("  {:<32} {:>9}  ", truncate(v, 32), n),
+                        Style::default().fg(t.primary),
+                    ),
+                    Span::styled(bar, Style::default().fg(t.accent)),
+                ]));
+            }
+        }
+        let height = area.height.saturating_sub(2) as usize;
+        // Keep the cursor row on screen without a separate scroll offset: the
+        // header plus the selected row is what must be visible.
+        let first = (self.stats_idx + 2).saturating_sub(height);
+        let shown: Vec<Line> = lines.into_iter().skip(first).take(height).collect();
+        let title = match (&self.stats_pending, self.current_table()) {
+            (Some((t, _)), _) => format!(" columns of {t} — analyzing … "),
+            (None, Some(t)) => format!(" columns of {t} — Enter frequency · Esc back "),
+            (None, None) => " columns ".to_string(),
+        };
+        f.render_widget(
+            Paragraph::new(shown).block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(t.accent))
+                    .title(title),
+            ),
+            area,
+        );
+    }
+
+    /// `Y`: the selected row as an `INSERT`, on the clipboard — DB Browser's
+    /// "Copy as INSERT", which is how a row moves into a bug report or a fixture.
+    fn copy_row_as_insert(&mut self) {
+        let (table, view) = match (self.current_table(), self.rows.as_ref()) {
+            (Some(t), Some(v)) => (t, v),
+            _ => return,
+        };
+        let row = match view.rows.get(self.row_idx) {
+            Some(r) => r.clone(),
+            None => return,
+        };
+        let sql = crate::export::insert_statement(&table, &view.columns, &row);
+        let ok = crate::clipboard::copy(&sql);
+        self.notify(if ok {
+            format!("copied INSERT ({} chars)", sql.len())
+        } else {
+            "clipboard unavailable (no tty)".to_string()
+        });
+    }
+
     /// Open the database-info screen: the pragmas the sqlite3 shell prints for
     /// `.dbinfo`, with the integrity check and foreign-key lint a keypress away
     /// since both can take a while on a large file.
@@ -2142,8 +2460,9 @@ impl App {
         self.dbinfo_checks.clear();
         self.dbinfo_scroll = 0;
         self.screen = Screen::DbInfo;
-        self.status =
-            "database · i integrity check · Q quick check · f foreign-key lint · Esc back".into();
+        self.status = "database · i integrity · Q quick · f fk lint · v vacuum · z analyze \
+                       · r reindex · Esc back"
+            .into();
     }
 
     fn key_dbinfo(&mut self, code: KeyCode) {
@@ -2172,6 +2491,12 @@ impl App {
                     Err(e) => vec![format!("check failed: {e}")],
                 };
             }
+            // The maintenance statements DB Browser calls "Compact Database" and
+            // sqlite-utils exposes as subcommands. Each rewrites the file, so they
+            // report what changed.
+            KeyCode::Char('v') => self.maintain(crate::sqlite::Maintenance::Vacuum),
+            KeyCode::Char('z') => self.maintain(crate::sqlite::Maintenance::Analyze),
+            KeyCode::Char('r') => self.maintain(crate::sqlite::Maintenance::Reindex),
             KeyCode::Char('f') => {
                 let out = match self.sqlite() {
                     Some(s) => s.missing_fk_indexes(),
@@ -2198,6 +2523,33 @@ impl App {
         }
     }
 
+    /// Run `VACUUM`, `ANALYZE` or `REINDEX` and re-read the pragmas, since all
+    /// three change what the screen is showing.
+    fn maintain(&mut self, op: crate::sqlite::Maintenance) {
+        let result = match self.sqlite() {
+            Some(s) => s.maintain(op),
+            None => return,
+        };
+        let line = match result {
+            Ok(delta) => {
+                let size = if delta == 0 {
+                    "no change in size".to_string()
+                } else if delta < 0 {
+                    format!("{} smaller", human_size((-delta) as u64))
+                } else {
+                    format!("{} larger", human_size(delta as u64))
+                };
+                format!("{}: done, {size}", op.label())
+            }
+            Err(e) => format!("{} failed: {e}", op.label()),
+        };
+        if let Some(s) = self.sqlite() {
+            self.dbinfo = s.db_info();
+        }
+        self.dbinfo_checks = vec![line.clone()];
+        self.notify(line);
+    }
+
     fn render_dbinfo(&mut self, f: &mut Frame, area: Rect) {
         let t = self.ov.theme;
         let mut lines: Vec<Line> = Vec::new();
@@ -2220,7 +2572,8 @@ impl App {
             lines.push(Line::from(""));
             for c in &self.dbinfo_checks {
                 // A clean result reads as a fact; anything else is a finding.
-                let ok = c.ends_with("ok") || c.contains("every foreign key");
+                let ok =
+                    c.ends_with("ok") || c.contains("every foreign key") || c.contains(": done");
                 lines.push(Line::from(Span::styled(
                     format!("  {c}"),
                     Style::default().fg(if ok { t.label } else { t.alt }),
@@ -2240,7 +2593,7 @@ impl App {
                 Block::default()
                     .borders(Borders::ALL)
                     .border_style(Style::default().fg(t.accent))
-                    .title(" database — i/Q check · f fk lint · Esc back "),
+                    .title(" database — i/Q check · f fk lint · v/z/r maintain · Esc back "),
             ),
             area,
         );
@@ -3222,6 +3575,22 @@ pub fn pick_mru(terminal: &mut DefaultTerminal, mut p: Picker<'_>) -> Result<Opt
 /// point where a person would notice the wait.
 const DECODE_INLINE_MAX: usize = 4 * 1024 * 1024;
 
+/// What a background statistics pass returns: the columns, or why it could not.
+type StatsResult = std::result::Result<Vec<crate::sqlite::ColumnStat>, String>;
+
+/// Describe `table`'s columns on another thread, over a connection of its own —
+/// `SqliteStore`'s connection belongs to the UI thread.
+fn spawn_stats(path: std::path::PathBuf, table: String) -> std::sync::mpsc::Receiver<StatsResult> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let result = SqliteStore::open(&path)
+            .and_then(|s| s.column_stats(&table))
+            .map_err(|e| e.to_string());
+        let _ = tx.send(result);
+    });
+    rx
+}
+
 /// Validate and decode `bytes` on another thread.
 fn spawn_decode(bytes: Vec<u8>) -> std::sync::mpsc::Receiver<Option<Decoded>> {
     let (tx, rx) = std::sync::mpsc::channel();
@@ -3815,6 +4184,158 @@ mod tests {
         app.on_key(KeyEvent::from(KeyCode::Char(c)));
     }
 
+    /// Wait for a background statistics pass, the way the event loop does.
+    fn await_stats(app: &mut App) {
+        for _ in 0..2000 {
+            app.poll_stats();
+            if app.stats_pending.is_none() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        panic!("the statistics pass never finished");
+    }
+
+    /// `Y` puts the row on the clipboard as an `INSERT`. With no tty the copy
+    /// cannot land, and the toast has to say so rather than claim success.
+    #[test]
+    fn y_copies_the_row_as_an_insert_statement() {
+        let (mut app, path) = sqlite_app();
+        app.on_key(KeyEvent::from(KeyCode::Tab)); // focus the row grid
+        press(&mut app, 'Y');
+        assert!(
+            app.status.contains("copied INSERT") || app.status.contains("clipboard unavailable"),
+            "got {:?}",
+            app.status
+        );
+        // The statement itself is built by the same writer the dump uses.
+        let view = app.rows.as_ref().unwrap();
+        let sql = crate::export::insert_statement("t", &view.columns, &view.rows[0]);
+        assert_eq!(
+            sql,
+            r#"INSERT INTO "t" ("a", "b", "c") VALUES ('x', 'y', 'z');"#
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// `A` describes the table's columns, Enter drills into one column's
+    /// frequency, and Esc unwinds one step at a time.
+    #[test]
+    fn stats_screen_describes_columns_and_counts_values() {
+        let path = scratch("db");
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE t (tag TEXT, qty INTEGER);
+             INSERT INTO t VALUES ('a', 1), ('a', 2), ('b', NULL);",
+        )
+        .unwrap();
+        drop(conn);
+        let mut app = App::with_theme(
+            Store::Sqlite(SqliteStore::open(&path).unwrap()),
+            Theme::from_name(ThemeName::NeonSprawl),
+        );
+        app.on_key(KeyEvent::from(KeyCode::Tab)); // focus the row grid
+
+        press(&mut app, 'A');
+        assert_eq!(app.screen, super::Screen::Stats);
+        // The pass runs off-thread, so the screen opens saying so and Enter does
+        // nothing until the columns land.
+        assert!(app.stats_pending.is_some());
+        let rows = frame_rows(&mut app, 110, 20);
+        assert!(contains(&rows, "analyzing"), "{:?}", rows[0]);
+        app.on_key(KeyEvent::from(KeyCode::Enter));
+        assert!(app.stats_freq.is_none(), "nothing to drill into yet");
+
+        await_stats(&mut app);
+        assert_eq!(app.stats.len(), 2, "one row per column");
+        let rows = frame_rows(&mut app, 110, 20);
+        assert!(contains(&rows, "distinct"), "{rows:?}");
+        assert!(contains(&rows, "columns of t"), "{:?}", rows[0]);
+
+        // The frequency table is a step deeper: Enter opens it, Esc closes it and
+        // only the second Esc leaves the screen.
+        app.on_key(KeyEvent::from(KeyCode::Enter));
+        let (col, freq) = app.stats_freq.as_ref().expect("a frequency table");
+        assert_eq!(col, "tag");
+        assert_eq!(freq[0], ("a".to_string(), 2), "the common value leads");
+        let rows = frame_rows(&mut app, 110, 20);
+        assert!(contains(&rows, "most common values"), "{rows:?}");
+        app.on_key(KeyEvent::from(KeyCode::Esc));
+        assert!(app.stats_freq.is_none());
+        assert_eq!(app.screen, super::Screen::Stats, "still on the screen");
+        app.on_key(KeyEvent::from(KeyCode::Esc));
+        assert_eq!(app.screen, super::Screen::Main);
+
+        // Moving the selection drops a stale frequency table for the old column.
+        press(&mut app, 'A');
+        await_stats(&mut app);
+        app.on_key(KeyEvent::from(KeyCode::Enter));
+        press(&mut app, 'j');
+        assert!(
+            app.stats_freq.is_none(),
+            "the table belonged to the old column"
+        );
+        assert_eq!(app.stats_idx, 1);
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// A blob cell cannot be edited as text — `e` must open the hex editor over
+    /// its bytes and `^s` must write bytes back, not a string.
+    #[test]
+    fn a_blob_cell_edits_in_the_hex_editor() {
+        let path = scratch("db");
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch("CREATE TABLE t (raw BLOB, txt TEXT)")
+            .unwrap();
+        conn.execute(
+            "INSERT INTO t VALUES (?1, 'plain')",
+            [&[0x00u8, 0xffu8][..]],
+        )
+        .unwrap();
+        drop(conn);
+        let mut app = App::with_theme(
+            Store::Sqlite(SqliteStore::open(&path).unwrap()),
+            Theme::from_name(ThemeName::NeonSprawl),
+        );
+        app.on_key(KeyEvent::from(KeyCode::Tab)); // focus the row grid
+
+        press(&mut app, 'e');
+        assert_eq!(
+            app.screen,
+            super::Screen::HexEdit,
+            "blob opens the hex editor"
+        );
+        assert_eq!(app.hex.as_ref().unwrap().bytes, [0x00, 0xff]);
+
+        // Set the first byte to 0x41 and save.
+        press(&mut app, 'i');
+        press(&mut app, '4');
+        press(&mut app, '1');
+        app.on_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+        let store = SqliteStore::open(&path).unwrap();
+        assert_eq!(
+            store.cell_bytes("t", 1, "raw").unwrap(),
+            [0x41, 0xff],
+            "the edited byte reached the database"
+        );
+        assert!(
+            store.cell_is_blob("t", 1, "raw").unwrap(),
+            "still a blob, not text"
+        );
+
+        // A text cell in the same row still uses the line editor.
+        app.on_key(KeyEvent::from(KeyCode::Esc)); // leave EDIT mode
+        app.on_key(KeyEvent::from(KeyCode::Char('q')));
+        app.on_key(KeyEvent::from(KeyCode::Right));
+        press(&mut app, 'e');
+        assert_eq!(app.screen, super::Screen::Main);
+        assert!(
+            matches!(app.mode, super::Mode::EditCell(_)),
+            "text edits inline"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
     /// `D` opens the database screen, its checks run on demand, and `q` still
     /// quits from there like it does everywhere else.
     #[test]
@@ -3856,7 +4377,33 @@ mod tests {
         press(&mut app, 'D');
         assert_eq!(app.screen, super::Screen::Main);
 
+        // The maintenance statements report what they did and refresh the pragmas
+        // behind them, since all three rewrite the file.
         press(&mut app, 'D');
+        press(&mut app, 'z');
+        assert_eq!(app.dbinfo_checks.len(), 1);
+        assert!(
+            app.dbinfo_checks[0].starts_with("ANALYZE: done"),
+            "got {:?}",
+            app.dbinfo_checks[0]
+        );
+        press(&mut app, 'v');
+        assert!(
+            app.dbinfo_checks[0].starts_with("VACUUM: done"),
+            "got {:?}",
+            app.dbinfo_checks[0]
+        );
+        press(&mut app, 'r');
+        assert!(
+            app.dbinfo_checks[0].starts_with("REINDEX: done"),
+            "got {:?}",
+            app.dbinfo_checks[0]
+        );
+        assert!(
+            app.dbinfo.iter().any(|(k, _)| k == "page count"),
+            "the pragmas are re-read after a rewrite"
+        );
+
         press(&mut app, 'q');
         assert!(app.quit, "q quits from the database screen too");
         let _ = std::fs::remove_file(path);

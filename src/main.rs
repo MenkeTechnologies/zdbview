@@ -17,6 +17,7 @@ mod disasm;
 mod export;
 mod formats;
 mod hexedit;
+mod import;
 mod monitor;
 mod mru;
 mod overlay;
@@ -30,7 +31,7 @@ mod theme;
 mod wal;
 mod watch;
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use clap::Parser;
 use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
 use crossterm::execute;
@@ -86,6 +87,7 @@ const AFTER_HELP: &str = concat!(
     "\x1b[36m  ── KEYS ───────────────────────────────────────────────\x1b[0m\n",
     "\x1b[32m  //\x1b[0m j/k ←/→ move   Tab focus   Enter detail   / search (n/N)\n",
     "\x1b[32m  //\x1b[0m e a d : edit/add/delete/SQL   s sort   S schema  (SQLite)\n",
+    "\x1b[32m  //\x1b[0m D database report   A column stats   Y row as INSERT  (SQLite)\n",
     "\x1b[32m  //\x1b[0m 0 1 2 3 views   a e r d record CRUD   e hex editor  (rkyv)\n",
     "\x1b[32m  //\x1b[0m v value render   y copy (OSC 52)   x export to file\n",
     "\x1b[32m  //\x1b[0m c scheme   C palette   o file list   h/? help   q quit\n",
@@ -94,6 +96,8 @@ const AFTER_HELP: &str = concat!(
     "\x1b[32m  //\x1b[0m zdbview                        \x1b[90mrecent files + saved scan\x1b[0m\n",
     "\x1b[32m  //\x1b[0m zdbview ~/.zshrs/scripts.rkyv  \x1b[90mrecords, or structural\x1b[0m\n",
     "\x1b[32m  //\x1b[0m zdbview data.db --export json  \x1b[90mdump every table\x1b[0m\n",
+    "\x1b[32m  //\x1b[0m zdbview data.db --export sql   \x1b[90mreplayable .dump\x1b[0m\n",
+    "\x1b[32m  //\x1b[0m zdbview d.db --import r.csv --table t  \x1b[90mload a CSV\x1b[0m\n",
     "\x1b[32m  //\x1b[0m zdbview --rescan               \x1b[90mwalk again now\x1b[0m\n",
     "\x1b[32m  //\x1b[0m zdbview --list-themes          \x1b[90mpreview the schemes\x1b[0m\n",
     "\n",
@@ -173,6 +177,13 @@ struct Cli {
     backup: Option<PathBuf>,
     #[arg(
         long,
+        value_name = "FILE",
+        help_heading = H_OUTPUT,
+        help = "\x1b[32m//\x1b[0m Load a CSV (or TSV) into --table and exit"
+    )]
+    import: Option<PathBuf>,
+    #[arg(
+        long,
         value_name = "NAME",
         help_heading = H_APPEARANCE,
         help = "\x1b[32m//\x1b[0m Colour scheme for this run (see --list-themes)"
@@ -239,6 +250,9 @@ fn main() -> Result<()> {
     // copy a file that may have writers.
     if let Some(dest) = &cli.backup {
         return run_backup(&cli, dest);
+    }
+    if let Some(src) = &cli.import {
+        return run_import(&cli, src);
     }
 
     // Resolve --theme before touching the terminal so a typo prints plainly
@@ -337,6 +351,38 @@ fn run_export(cli: &Cli, fmt: &str) -> Result<()> {
     let kind = store::detect(&file, cli.sqlite, cli.rkyv)?;
     let (store, _) = store::Store::open(&file, kind)?;
     print!("{}", export_store(&store, &fmt, cli.table.as_deref())?);
+    Ok(())
+}
+
+/// `--import`: load a CSV or TSV into an existing table, the shell's `.import`.
+/// The separator follows the file's extension, since that is what distinguishes
+/// the two formats.
+fn run_import(cli: &Cli, src: &std::path::Path) -> Result<()> {
+    let file = cli
+        .file
+        .clone()
+        .ok_or_else(|| anyhow!("--import requires a file argument (the database)"))?;
+    let table = cli
+        .table
+        .clone()
+        .ok_or_else(|| anyhow!("--import requires --table to say where the rows go"))?;
+    let kind = store::detect(&file, cli.sqlite, cli.rkyv)?;
+    if kind != store::Kind::Sqlite {
+        return Err(anyhow!("--import only applies to a SQLite database"));
+    }
+    let text =
+        std::fs::read_to_string(src).with_context(|| format!("cannot read {}", src.display()))?;
+    let sep = match src.extension().and_then(|e| e.to_str()) {
+        Some("tsv") | Some("tab") => '\t',
+        _ => ',',
+    };
+    let csv = import::parse(&text, sep)?;
+    let (store, _) = store::Store::open(&file, kind)?;
+    let n = match &store {
+        Store::Sqlite(s) => s.import_rows(&table, &csv.header, &csv.rows)?,
+        _ => return Err(anyhow!("not a SQLite database")),
+    };
+    println!("imported {} rows into {}", n, table);
     Ok(())
 }
 

@@ -103,6 +103,24 @@ stopping them. An existing
 .I FILE
 is an error rather than an overwrite.
 .TP
+.BI \-\-import " FILE"
+Load
+.I FILE
+into the table named by
+.BR \-\-table ,
+the shell's
+.BR .import ,
+and exit. The separator follows the extension:
+.B .tsv
+and
+.B .tab
+are tab-separated, anything else is comma-separated. The header row names the
+columns, so a file ordered differently from the table still lands correctly, and a
+header naming a column the table does not have is an error rather than a silent
+drop. The whole file is one transaction, so a row with the wrong field count rolls
+all of it back. Quoted fields may contain the separator, newlines and doubled
+quotes; CRLF and a missing final newline are both accepted.
+.TP
 .BI \-\-theme " NAME"
 Use color scheme
 .I NAME
@@ -165,7 +183,14 @@ Edit the selected cell in place; Enter commits an
 .B UPDATE
 of that column for the row's
 .BR rowid ,
-Esc cancels.
+Esc cancels. A
+.B blob
+cell has no text form, so
+.B e
+opens it in the hex editor instead and
+.B Ctrl\-s
+writes the bytes back as a blob \(em editing one as a string would store the
+description of the bytes.
 .TP
 .B a
 Insert one row with
@@ -443,16 +468,37 @@ runs
 .B Q
 the cheaper
 .BR "PRAGMA quick_check" ,
-and
 .B f
 reports foreign keys with no index to serve them \(em the shell's
-.BR ".lint fkey\-indexes" .
+.BR ".lint fkey\-indexes" \(em
+and
+.BR v ", " z " and " r
+run
+.BR VACUUM ", " ANALYZE " and " REINDEX ,
+reporting the change in file size.
 Those three run on a keypress rather than on open because each walks the whole
 file.
 .B Esc
 or
 .B D
 returns to the data.
+.TP
+.B A
+Describe the current table's columns: rows, nulls, distinct values, how many cells
+are stored as numbers, the longest value, the extremes and the mean of the numeric
+cells \(em VisiData's
+.B describe
+and sqlite\-utils'
+.BR analyze\-tables .
+.B Enter
+on a column shows its most common values with bars. Each column costs a pass over
+the table, so the work runs on a background thread and the screen fills in when it
+lands.
+.TP
+.B Y
+Copy the selected row to the clipboard as an
+.B INSERT
+statement, which is DB Browser's "Copy as INSERT".
 .TP
 .B s
 Sort the row grid by the column under the cursor: ascending, descending on a
@@ -730,6 +776,12 @@ Copy a live database consistently:
 .PP
 .RS 4
 .B zdbview ~/.zshrs/history.db \-\-backup /tmp/history\-copy.db
+.RE
+.PP
+Load a CSV into an existing table:
+.PP
+.RS 4
+.B zdbview data.db \-\-import rows.csv \-\-table people
 .RE
 .SH SEE ALSO
 .BR zdbviewall (1),

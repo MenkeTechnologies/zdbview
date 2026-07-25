@@ -673,3 +673,205 @@ fn backup_writes_a_second_readable_database() {
         let _ = std::fs::remove_file(p);
     }
 }
+
+// ----- what the GUI/CLI tools show: column stats, blob cells, maintenance -----
+
+#[test]
+fn column_stats_describe_each_column() {
+    let path = tmp("stats.db");
+    let _ = std::fs::remove_file(&path);
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE t (id INTEGER, tag TEXT, qty INTEGER);
+         INSERT INTO t VALUES (1, 'a', 10), (2, 'a', 20), (3, NULL, 30), (4, 'bbbb', NULL);
+         -- A column declared INTEGER holding text: SQLite allows it, and the
+         -- numeric count is the only place that shows up.
+         INSERT INTO t VALUES (5, 'c', 'not a number');",
+    )
+    .unwrap();
+    drop(conn);
+    let store = SqliteStore::open(&path).unwrap();
+    let stats = store.column_stats("t").unwrap();
+    let by = |name: &str| stats.iter().find(|c| c.name == name).unwrap();
+
+    let tag = by("tag");
+    assert_eq!(tag.declared, "TEXT");
+    assert_eq!(tag.rows, 5);
+    assert_eq!(tag.nulls, 1);
+    assert_eq!(tag.distinct, 3, "a, bbbb, c — NULL is not a distinct value");
+    assert_eq!(tag.min, "a");
+    assert_eq!(tag.max, "c");
+    assert_eq!(tag.longest, 4, "bbbb");
+    assert_eq!(tag.numeric, 0);
+    assert!(tag.avg.is_none(), "text has no mean");
+
+    let qty = by("qty");
+    assert_eq!(qty.nulls, 1);
+    assert_eq!(
+        qty.numeric, 3,
+        "three of the five cells are stored as numbers"
+    );
+    assert_eq!(
+        qty.avg,
+        Some(20.0),
+        "mean of 10, 20, 30 — the text is skipped"
+    );
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn frequency_ranks_values_by_count() {
+    let path = tmp("freq.db");
+    let _ = std::fs::remove_file(&path);
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE t (k TEXT);
+         INSERT INTO t VALUES ('x'),('x'),('x'),('y'),('y'),('z'),(NULL);",
+    )
+    .unwrap();
+    drop(conn);
+    let store = SqliteStore::open(&path).unwrap();
+    let freq = store.frequency("t", "k", 3).unwrap();
+    assert_eq!(
+        freq,
+        vec![
+            ("x".to_string(), 3),
+            ("y".to_string(), 2),
+            ("NULL".to_string(), 1)
+        ],
+        "counted descending, and NULL is a value here — it is a row that exists"
+    );
+    assert_eq!(
+        store.frequency("t", "k", 1).unwrap().len(),
+        1,
+        "limit applies"
+    );
+    let _ = std::fs::remove_file(&path);
+}
+
+/// A blob cell has no text form, so it is read and written as bytes. Editing it
+/// through `update_cell` would store the description of the bytes instead.
+#[test]
+fn blob_cells_round_trip_as_bytes() {
+    let path = tmp("blob.db");
+    let _ = std::fs::remove_file(&path);
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute_batch("CREATE TABLE t (raw BLOB, txt TEXT)")
+        .unwrap();
+    conn.execute(
+        "INSERT INTO t VALUES (?1, 'plain')",
+        [&[0x00u8, 0xff, 0x41][..]],
+    )
+    .unwrap();
+    drop(conn);
+    let store = SqliteStore::open(&path).unwrap();
+
+    assert!(store.cell_is_blob("t", 1, "raw").unwrap());
+    assert!(
+        !store.cell_is_blob("t", 1, "txt").unwrap(),
+        "text stays with the line editor"
+    );
+    assert_eq!(store.cell_bytes("t", 1, "raw").unwrap(), [0x00, 0xff, 0x41]);
+
+    store
+        .update_cell_blob("t", 1, "raw", &[0xde, 0xad, 0xbe, 0xef])
+        .unwrap();
+    assert_eq!(
+        store.cell_bytes("t", 1, "raw").unwrap(),
+        [0xde, 0xad, 0xbe, 0xef]
+    );
+    assert!(
+        store.cell_is_blob("t", 1, "raw").unwrap(),
+        "it must still be a blob, not a string of hex digits"
+    );
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn maintenance_statements_run_and_report_the_size_change() {
+    use sqlite::Maintenance;
+    let path = tmp("maint.db");
+    let _ = std::fs::remove_file(&path);
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute_batch("CREATE TABLE t (a TEXT); CREATE INDEX t_a ON t(a);")
+        .unwrap();
+    for i in 0..500 {
+        conn.execute(
+            "INSERT INTO t VALUES (?1)",
+            [format!("row {i} padding padding")],
+        )
+        .unwrap();
+    }
+    conn.execute_batch("DELETE FROM t WHERE rowid % 2 = 0")
+        .unwrap();
+    drop(conn);
+
+    let store = SqliteStore::open(&path).unwrap();
+    // Half the rows are gone, so a vacuum has pages to reclaim.
+    let delta = store.maintain(Maintenance::Vacuum).unwrap();
+    assert!(delta < 0, "vacuum must shrink this file, got {delta}");
+    // ANALYZE's visible result is the statistics table it writes.
+    store.maintain(Maintenance::Analyze).unwrap();
+    // The store hides `sqlite_%` tables, so ask the file directly.
+    let probe = rusqlite::Connection::open(&path).unwrap();
+    let stat1: i64 = probe
+        .query_row(
+            "SELECT count(*) FROM sqlite_master WHERE name = 'sqlite_stat1'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(stat1, 1, "ANALYZE writes sqlite_stat1");
+    drop(probe);
+    store.maintain(Maintenance::Reindex).unwrap();
+    // The data survived all three.
+    assert_eq!(store.count("t").unwrap(), 250);
+    assert_eq!(Maintenance::Vacuum.label(), "VACUUM");
+    let _ = std::fs::remove_file(&path);
+}
+
+/// `.import`: the header names the columns, so a file ordered differently from the
+/// table still lands correctly, and a bad row takes the whole file with it rather
+/// than leaving half of it inserted.
+#[test]
+fn import_maps_columns_by_header_and_rolls_back_a_bad_file() {
+    let path = tmp("import.db");
+    let _ = std::fs::remove_file(&path);
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute_batch("CREATE TABLE p (id INTEGER PRIMARY KEY, name TEXT, score REAL, note TEXT)")
+        .unwrap();
+    drop(conn);
+    let store = SqliteStore::open(&path).unwrap();
+
+    // Header order is score, name — the reverse of the table's.
+    let header = vec!["score".to_string(), "name".to_string()];
+    let rows = vec![
+        vec!["9.5".to_string(), "ada".to_string()],
+        vec!["8".to_string(), "grace".to_string()],
+    ];
+    assert_eq!(store.import_rows("p", &header, &rows).unwrap(), 2);
+    let view = store.rows("p", 10, 0, None, "").unwrap();
+    assert_eq!(view.rows[0][1], "ada");
+    assert_eq!(view.rows[0][2], "9.5", "the value went to the named column");
+
+    // A column the table does not have is an error, before anything is written.
+    let bad_header = vec!["name".to_string(), "nope".to_string()];
+    assert!(store
+        .import_rows("p", &bad_header, &rows)
+        .unwrap_err()
+        .to_string()
+        .contains("nope"));
+
+    // A row with the wrong field count rolls the whole import back.
+    let ragged = vec![
+        vec!["1".to_string(), "fine".to_string()],
+        vec!["2".to_string()],
+    ];
+    assert!(store.import_rows("p", &header, &ragged).is_err());
+    assert_eq!(
+        store.count("p").unwrap(),
+        2,
+        "the good row from the ragged file must not survive"
+    );
+    let _ = std::fs::remove_file(&path);
+}

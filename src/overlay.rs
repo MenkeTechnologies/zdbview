@@ -62,6 +62,8 @@ pub enum HelpCtx {
     Sql,
     /// The database-info screen.
     DbInfo,
+    /// The per-column statistics screen.
+    Stats,
 }
 
 /// The overlay layer: active scheme plus help / chooser / editor / toast state.
@@ -729,6 +731,7 @@ impl HelpCtx {
             HelpCtx::Top => "write monitor",
             HelpCtx::Sql => "SQL editor",
             HelpCtx::DbInfo => "database",
+            HelpCtx::Stats => "column statistics",
         }
     }
 }
@@ -787,6 +790,33 @@ fn help_sections(ctx: HelpCtx) -> Vec<HelpSection> {
             },
         ];
     }
+    if ctx == HelpCtx::Stats {
+        return vec![
+            HelpSection {
+                title: "COLUMNS",
+                keys: &[
+                    ("j/k ↑↓", "Select a column"),
+                    ("Enter / f", "Frequency table"),
+                    ("g / G", "First / last"),
+                    ("Esc", "Close frequency, then back"),
+                    ("A", "Back to the data"),
+                ],
+            },
+            HelpSection {
+                title: "READING",
+                keys: &[
+                    ("nulls", "Cells with no value"),
+                    ("distinct", "Different values"),
+                    ("min / max", "Extremes, as displayed"),
+                    ("mean", "Of the numeric cells"),
+                ],
+            },
+            HelpSection {
+                title: "DISPLAY",
+                keys: DISPLAY_KEYS,
+            },
+        ];
+    }
     if ctx == HelpCtx::DbInfo {
         return vec![
             HelpSection {
@@ -795,8 +825,10 @@ fn help_sections(ctx: HelpCtx) -> Vec<HelpSection> {
                     ("i", "Integrity check"),
                     ("Q", "Quick check"),
                     ("f", "Foreign-key lint"),
+                    ("v", "VACUUM (compact)"),
+                    ("z", "ANALYZE"),
+                    ("r", "REINDEX"),
                     ("j/k ↑↓", "Scroll"),
-                    ("PgUp/PgDn", "Page"),
                     ("D / Esc", "Back to the data"),
                 ],
             },
@@ -920,6 +952,8 @@ fn help_sections(ctx: HelpCtx) -> Vec<HelpSection> {
                 (":", "Raw SQL"),
                 ("S", "Schema view"),
                 ("D", "Database info"),
+                ("A", "Column statistics"),
+                ("Y", "Copy row as INSERT"),
                 ("s", "Sort column"),
                 ("< / >", "Sort prev/next col"),
             ],

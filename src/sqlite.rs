@@ -61,6 +61,43 @@ impl Sort {
 }
 
 /// A page of rows for one table, stringified for display.
+/// What one column looks like, for the statistics screen.
+#[derive(Debug, Clone)]
+pub struct ColumnStat {
+    pub name: String,
+    /// The type in the schema, which SQLite treats as an affinity hint only.
+    pub declared: String,
+    pub rows: i64,
+    pub nulls: i64,
+    pub distinct: i64,
+    pub min: String,
+    pub max: String,
+    /// Mean of the cells actually stored as numbers, if any.
+    pub avg: Option<f64>,
+    /// How many cells are stored as a number, which is what says whether the
+    /// declared type is being honoured.
+    pub numeric: i64,
+    pub longest: i64,
+}
+
+/// The three maintenance statements.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Maintenance {
+    Vacuum,
+    Analyze,
+    Reindex,
+}
+
+impl Maintenance {
+    pub fn label(self) -> &'static str {
+        match self {
+            Maintenance::Vacuum => "VACUUM",
+            Maintenance::Analyze => "ANALYZE",
+            Maintenance::Reindex => "REINDEX",
+        }
+    }
+}
+
 pub struct RowsView {
     pub columns: Vec<String>,
     pub rows: Vec<Vec<String>>,
@@ -704,6 +741,179 @@ impl SqliteStore {
         self.conn
             .execute_batch(&format!("VACUUM INTO '{target}'"))?;
         Ok(())
+    }
+
+    /// One column's shape: what a `describe` in VisiData or `analyze-tables` in
+    /// sqlite-utils reports. `min`/`max` come back as the display strings the grid
+    /// would show, so a blob reads as its size rather than as bytes.
+    pub fn column_stats(&self, table: &str) -> Result<Vec<ColumnStat>> {
+        let columns = self.columns(table)?;
+        let mut out = Vec::with_capacity(columns.len());
+        let types: std::collections::HashMap<String, String> = self
+            .conn
+            .prepare(&format!("PRAGMA table_info(\"{}\")", esc(table)))?
+            .query_map([], |r| Ok((r.get::<_, String>(1)?, r.get::<_, String>(2)?)))?
+            .filter_map(|r| r.ok())
+            .collect();
+        for c in &columns {
+            // One pass per column. `avg` and the numeric count look only at cells
+            // SQLite actually stores as numbers, so a text column of digits is not
+            // averaged into nonsense.
+            let sql = format!(
+                "SELECT count(*), count(\"{c}\"), count(DISTINCT \"{c}\"), \
+                 min(\"{c}\"), max(\"{c}\"), \
+                 avg(CASE WHEN typeof(\"{c}\") IN ('integer','real') THEN \"{c}\" END), \
+                 sum(typeof(\"{c}\") IN ('integer','real')), \
+                 max(length(\"{c}\")) \
+                 FROM \"{t}\"",
+                c = esc(c),
+                t = esc(table)
+            );
+            let mut stmt = self.conn.prepare(&sql)?;
+            let mut q = stmt.query([])?;
+            let row = match q.next()? {
+                Some(r) => r,
+                None => continue,
+            };
+            let rows: i64 = row.get(0)?;
+            let non_null: i64 = row.get(1)?;
+            out.push(ColumnStat {
+                name: c.clone(),
+                declared: types.get(c).cloned().unwrap_or_default(),
+                rows,
+                nulls: rows - non_null,
+                distinct: row.get(2)?,
+                min: value_to_string(row, 3),
+                max: value_to_string(row, 4),
+                avg: row.get::<_, Option<f64>>(5)?,
+                numeric: row.get::<_, Option<i64>>(6)?.unwrap_or(0),
+                longest: row.get::<_, Option<i64>>(7)?.unwrap_or(0),
+            });
+        }
+        Ok(out)
+    }
+
+    /// The most common values in one column with their counts — VisiData's
+    /// frequency table. Ties break by value so the list is stable between runs.
+    pub fn frequency(&self, table: &str, column: &str, limit: i64) -> Result<Vec<(String, i64)>> {
+        let sql = format!(
+            "SELECT \"{c}\", count(*) AS n FROM \"{t}\" \
+             GROUP BY \"{c}\" ORDER BY n DESC, \"{c}\" LIMIT ?1",
+            c = esc(column),
+            t = esc(table)
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let mut q = stmt.query([limit])?;
+        let mut out = Vec::new();
+        while let Some(row) = q.next()? {
+            out.push((value_to_string(row, 0), row.get(1)?));
+        }
+        Ok(out)
+    }
+
+    /// Write a cell as a blob. `update_cell` binds a string, which cannot express
+    /// arbitrary bytes; this is what the hex editor commits through.
+    pub fn update_cell_blob(&self, table: &str, rowid: i64, col: &str, bytes: &[u8]) -> Result<()> {
+        self.conn.execute(
+            &format!(
+                "UPDATE \"{}\" SET \"{}\" = ?1 WHERE rowid = ?2",
+                esc(table),
+                esc(col)
+            ),
+            params![bytes, rowid],
+        )?;
+        Ok(())
+    }
+
+    /// Whether a cell is stored as a blob, which is what decides between the text
+    /// editor and the hex editor.
+    pub fn cell_is_blob(&self, table: &str, rowid: i64, col: &str) -> Result<bool> {
+        let sql = format!(
+            "SELECT typeof(\"{}\") FROM \"{}\" WHERE rowid = ?1",
+            esc(col),
+            esc(table)
+        );
+        let t: String = self.conn.query_row(&sql, params![rowid], |r| r.get(0))?;
+        Ok(t == "blob")
+    }
+
+    /// `VACUUM`, `ANALYZE` or `REINDEX` — the maintenance DB Browser calls
+    /// "Compact Database" and sqlite-utils exposes as its own subcommands. Returns
+    /// the change in file size, which is the only visible result of a vacuum.
+    pub fn maintain(&self, op: Maintenance) -> Result<i64> {
+        let before = std::fs::metadata(&self.path).map(|m| m.len()).unwrap_or(0) as i64;
+        self.conn.execute_batch(match op {
+            Maintenance::Vacuum => "VACUUM",
+            Maintenance::Analyze => "ANALYZE",
+            Maintenance::Reindex => "REINDEX",
+        })?;
+        let after = std::fs::metadata(&self.path).map(|m| m.len()).unwrap_or(0) as i64;
+        Ok(after - before)
+    }
+
+    /// Insert rows into `table` from parsed CSV, the shell's `.import`. The header
+    /// row names the columns, so a file whose columns are ordered differently from
+    /// the table still lands correctly; a header naming a column the table does
+    /// not have is an error rather than a silent drop.
+    ///
+    /// Everything is inserted as text and left to SQLite's own affinity rules,
+    /// which is what the shell does.
+    pub fn import_rows(
+        &self,
+        table: &str,
+        header: &[String],
+        rows: &[Vec<String>],
+    ) -> Result<usize> {
+        let columns = self.columns(table)?;
+        for h in header {
+            if !columns.iter().any(|c| c == h) {
+                return Err(anyhow::anyhow!("{table} has no column {h:?}"));
+            }
+        }
+        let cols = header
+            .iter()
+            .map(|c| format!("\"{}\"", esc(c)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let marks = (1..=header.len())
+            .map(|i| format!("?{i}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "INSERT INTO \"{}\" ({}) VALUES ({})",
+            esc(table),
+            cols,
+            marks
+        );
+        // One transaction, or a thousand-row file is a thousand fsyncs.
+        self.conn.execute_batch("BEGIN")?;
+        let mut done = 0usize;
+        let result = (|| -> Result<()> {
+            let mut stmt = self.conn.prepare(&sql)?;
+            for row in rows {
+                if row.len() != header.len() {
+                    return Err(anyhow::anyhow!(
+                        "row {} has {} fields, the header has {}",
+                        done + 1,
+                        row.len(),
+                        header.len()
+                    ));
+                }
+                stmt.execute(rusqlite::params_from_iter(row.iter()))?;
+                done += 1;
+            }
+            Ok(())
+        })();
+        match result {
+            Ok(()) => {
+                self.conn.execute_batch("COMMIT")?;
+                Ok(done)
+            }
+            Err(e) => {
+                self.conn.execute_batch("ROLLBACK")?;
+                Err(e)
+            }
+        }
     }
 
     /// Table and view names with their columns, for the SQL editor's completion.

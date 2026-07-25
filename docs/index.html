@@ -214,12 +214,14 @@ zdbview</pre>
             <tr><td>Ctrl-f / Ctrl-b</td><td>Page forward / back (also PageDown / PageUp)</td></tr>
             <tr><td>/</td><td>Filter the list as you type — <code>Enter</code> keeps it, <code>Esc</code> clears it</td></tr>
             <tr><td>n / N</td><td>Next / previous match — in the displayed order, so sorting is respected</td></tr>
-            <tr><td>e a d</td><td>Edit cell / insert row / delete row (SQLite)</td></tr>
+            <tr><td>e a d</td><td>Edit cell / insert row / delete row (SQLite) — a blob cell opens in the hex editor, since bytes have no text form</td></tr>
             <tr><td>:</td><td>SQL editor — multi-line, Tab completion, transcript, history, per-statement timing, <code>Alt-e</code>/<code>F5</code> for the query plan (SQLite)</td></tr>
             <tr><td>s</td><td>Sort by the column under the cursor: ascending &rarr; descending &rarr; off (SQLite)</td></tr>
             <tr><td>&lt; / &gt;</td><td>Move the sort to the previous / next column, keeping the direction</td></tr>
             <tr><td>S</td><td>Schema view for the selected table (SQLite)</td></tr>
-            <tr><td>D</td><td>Database report — <code>.dbinfo</code> pragmas and object counts, then <code>i</code> integrity check, <code>Q</code> quick check, <code>f</code> foreign-key lint (SQLite)</td></tr>
+            <tr><td>D</td><td>Database report — <code>.dbinfo</code> pragmas and object counts, then <code>i</code> integrity check, <code>Q</code> quick check, <code>f</code> foreign-key lint, <code>v</code>/<code>z</code>/<code>r</code> VACUUM/ANALYZE/REINDEX (SQLite)</td></tr>
+            <tr><td>A</td><td>Column statistics — rows, nulls, distinct, numeric cells, longest, min/max, mean; <code>Enter</code> for a column's frequency table (SQLite)</td></tr>
+            <tr><td>Y</td><td>Copy the selected row as an <code>INSERT</code> statement (SQLite)</td></tr>
             <tr><td>0 1 2 3</td><td>Records / Info / Strings / Hex (rkyv — <code>0</code> only when the format was recognized)</td></tr>
             <tr><td>a e r d</td><td>Create / hex-edit value / rename key / delete record (rkyv Records)</td></tr>
             <tr><td>i Tab o x ^s</td><td>Inside the hex editor: EDIT mode / hex&harr;ascii column / insert / delete / save</td></tr>
@@ -276,6 +278,17 @@ zdbview cache.rkyv --export json            # decoded records; each value blob a
       </section>
 
       <section class="tutorial-section">
+        <h2>Column statistics and frequency</h2>
+        <p><code>A</code> describes every column of the current table — rows, nulls, distinct values, how many cells SQLite actually stores as numbers, the longest value, the extremes, and the mean of the numeric cells. That <em>numeric</em> count is the only place a column declared <code>INTEGER</code> but holding text shows up, because a declared type in SQLite is an affinity hint rather than a constraint. <code>Enter</code> on a column adds its most common values with bars, so a glance says whether the column is skewed.</p>
+        <p class="doc-note">Every column costs one pass over the table, and a wide blob column costs more than a second of it on a real database — 1.6s for <code>count(DISTINCT body)</code> across 46,716 rows of a 196&nbsp;MB cache. The pass therefore runs on its own connection on a background thread: the screen opens saying <code>analyzing …</code> and fills in when the work lands, so the UI never blocks.</p>
+      </section>
+
+      <section class="tutorial-section">
+        <h2>Import</h2>
+        <p><code>--import rows.csv --table people</code> loads a CSV (or TSV, chosen by extension) into an existing table — the shell's <code>.import</code>. The header row names the columns, so a file ordered differently from the table still lands correctly, and a header naming a column the table does not have is an error rather than a silent drop. The whole file is one transaction, so a row with the wrong field count rolls all of it back. The reader is RFC 4180 by hand, like the writers: quoted fields may hold the separator, newlines and doubled quotes, and CRLF or a missing final newline are both accepted.</p>
+      </section>
+
+      <section class="tutorial-section">
         <h2>Clipboard</h2>
         <p><code>y</code> copies through the <strong>OSC 52</strong> terminal escape, written straight to <code>/dev/tty</code>. That means no clipboard library, no X/Wayland/pbcopy dependency, and it works over SSH — the terminal emulator on your side sets the clipboard. It is best-effort: with no controlling terminal (output redirected), the copy silently does nothing.</p>
       </section>
@@ -296,6 +309,7 @@ zdbview cache.rkyv --export json            # decoded records; each value blob a
             <tr><td>&nbsp;&nbsp;&nbsp;&nbsp;--export FORMAT</td><td>Dump the file to stdout and exit — <code>json</code>, <code>csv</code>, <code>tsv</code>, <code>markdown</code>, <code>insert</code>, <code>line</code> or <code>sql</code>; requires a file argument</td></tr>
             <tr><td>&nbsp;&nbsp;&nbsp;&nbsp;--table TABLE</td><td>Restrict <code>--export</code> to one table</td></tr>
             <tr><td>&nbsp;&nbsp;&nbsp;&nbsp;--backup FILE</td><td>Copy the database with <code>VACUUM INTO</code> and exit</td></tr>
+            <tr><td>&nbsp;&nbsp;&nbsp;&nbsp;--import FILE</td><td>Load a CSV (or TSV, by extension) into <code>--table</code> and exit</td></tr>
             <tr><td>-h, --help</td><td>Print usage</td></tr>
             <tr><td>-V, --version</td><td>Print the version</td></tr>
           </tbody>
