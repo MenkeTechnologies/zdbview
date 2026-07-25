@@ -756,7 +756,10 @@ fn help_sections(ctx: HelpCtx) -> Vec<HelpSection> {
             HelpSection {
                 title: "WATCH",
                 keys: &[
-                    ("s", "Cycle sort order"),
+                    ("< / >", "Sort column (F6)"),
+                    ("I", "Invert the sort"),
+                    ("click", "Sort by that header"),
+                    ("/", "Filter by path"),
                     ("p", "Pause / resume"),
                     ("+ / -", "Sample faster/slower"),
                     ("Enter", "Open the file"),

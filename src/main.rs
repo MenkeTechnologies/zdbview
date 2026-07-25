@@ -26,6 +26,7 @@ mod scan;
 mod sqlite;
 mod store;
 mod theme;
+mod wal;
 mod watch;
 
 use anyhow::{anyhow, Result};

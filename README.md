@@ -381,7 +381,10 @@ screen shared by both, so the keys and columns are identical.
 
 | Key | Action |
 |-----|--------|
-| `s` | cycle the sort: recent / rate / written / size / name |
+| `<` / `>` / `F6` | move the sort to the previous / next column (`s` does `>`) |
+| `I` | invert the sort direction |
+| click a header | sort by that column; click it again to invert |
+| `/` | filter the watched list by path — `Enter` keeps it, `Esc` clears it |
 | `p` | pause and resume sampling |
 | `+` / `-` | sample faster / slower (100 ms … 5 s, 500 ms default) |
 | `Enter` | open the selected file |
@@ -406,6 +409,33 @@ Two things it gets right that a naive size watch does not:
 `written` is bytes seen since the monitor opened, `rate` averages the last four
 samples so one quiet tick does not read as "stopped", and `activity` is the last 24
 samples scaled against the busiest row on screen.
+
+Sorting is by column with a direction, the way htop does it — the sorted column
+carries an arrow in its header (`size▼`) and the title repeats it. Each column's
+two directions are exact mirrors, and the path breaks ties so rows do not shuffle
+between samples. Text columns start ascending, numeric ones descending.
+
+### The WAL frame
+
+Under the table sits a second frame: the selected database's write-ahead log,
+newest frame last. A `-wal` holds transactions that are already durable but not
+yet folded into the database file, so this is the file's immediate future — the
+pages it is about to become.
+
+| Column | Meaning |
+|--------|---------|
+| `frame` | position in the log |
+| `page` | which database page this frame carries |
+| `commit` | `commit` ends a transaction; `stale` means a checkpoint has since rolled the salts, so the frame belongs to a log that is already folded away |
+| `db pages` | database size in pages after a commit frame |
+
+The title line counts live frames against total, commits, distinct pages pending
+checkpoint, log size, the checkpoint sequence number, and any frames written
+since the last commit (an open transaction). Only frame *headers* are read — 24
+bytes and a seek each — so tailing a 190 MB log costs what tailing an empty one
+does. Selecting an rkyv archive, or a database in `journal_mode=delete`, says so
+in the frame rather than sitting blank. Below 12 rows of terminal the frame is
+dropped so the table stays readable.
 
 ## Large archives
 

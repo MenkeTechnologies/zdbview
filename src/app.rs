@@ -184,6 +184,8 @@ pub struct App {
     hex_area: Rect,
     /// The write monitor, while `screen` is `Screen::Top`.
     top: Option<crate::monitor::Monitor>,
+    /// Rect the monitor last rendered into, for its header hit test.
+    top_area: Rect,
     /// Set by `o`: leave the app loop and show the file picker again.
     reopen: bool,
     /// A file the monitor asked to open, taking precedence over the picker.
@@ -254,6 +256,7 @@ impl App {
             hex: None,
             hex_area: Rect::ZERO,
             top: None,
+            top_area: Rect::ZERO,
             reopen: false,
             open_next: None,
             search_origin: None,
@@ -490,6 +493,17 @@ impl App {
     fn on_mouse(&mut self, m: MouseEvent) {
         // An open overlay owns the event (wheel drives it, a click confirms).
         if self.ov.on_mouse(m) {
+            return;
+        }
+        // The write monitor takes the wheel and clicks (its header sorts).
+        if self.screen == Screen::Top {
+            let area = self.top_area;
+            if let Some(mon) = self.top.as_mut() {
+                mon.on_mouse(m, area);
+                if let Some(note) = mon.note.take() {
+                    self.notify(note);
+                }
+            }
             return;
         }
         // In the hex editor the wheel scrolls the dump and a click places the
@@ -1966,6 +1980,7 @@ impl App {
             Screen::HexEdit => self.render_hex(f, outer[0]),
             Screen::Top => {
                 let t = self.ov.theme;
+                self.top_area = outer[0];
                 if let Some(m) = self.top.as_ref() {
                     m.render(f, outer[0], &t);
                 }
@@ -2817,8 +2832,12 @@ pub fn pick_mru(terminal: &mut DefaultTerminal, mut p: Picker<'_>) -> Result<Opt
                         }
                     }
                 }
-                Event::Mouse(mouse) => {
-                    ov.on_mouse(mouse);
+                Event::Mouse(mouse) if !ov.on_mouse(mouse) => {
+                    let size = terminal.size().unwrap_or_default();
+                    m.on_mouse(mouse, Rect::new(0, 0, size.width, size.height));
+                    if let Some(note) = m.note.take() {
+                        ov.toast(note);
+                    }
                 }
                 _ => {}
             }
@@ -2993,9 +3012,10 @@ fn spawn_decode(bytes: Vec<u8>) -> std::sync::mpsc::Receiver<Option<Decoded>> {
     rx
 }
 
-/// What a key did to the picker's filter prompt.
+/// What a key did to a `/` filter prompt. Shared by the picker and the write
+/// monitor so both prompts behave identically.
 #[derive(Debug, PartialEq, Eq)]
-enum Prompt {
+pub enum Prompt {
     /// Still typing.
     Open,
     /// Enter: keep the filter and close the prompt.
@@ -3004,10 +3024,10 @@ enum Prompt {
     Cancel,
 }
 
-/// Handle one key of the picker's `/` prompt. The list stays navigable while the
+/// Handle one key of a `/` filter prompt. The list stays navigable while the
 /// pattern is typed, so the arrows and paging move the selection instead of being
 /// swallowed; only Left/Right belong to the pattern itself.
-fn filter_prompt_key(
+pub fn filter_prompt_key(
     code: KeyCode,
     filter: &mut String,
     sel: &mut usize,
@@ -4303,9 +4323,9 @@ mod tests {
         );
 
         // Sorting, pausing and the sample interval are all reachable.
-        let before = app.top.as_ref().unwrap().order;
+        let before = app.top.as_ref().unwrap().sort;
         press(&mut app, 's');
-        assert_ne!(app.top.as_ref().unwrap().order, before);
+        assert_ne!(app.top.as_ref().unwrap().sort, before);
         assert!(app.status.contains("sorted by"));
         press(&mut app, 'p');
         assert!(app.top.as_ref().unwrap().watcher.paused);

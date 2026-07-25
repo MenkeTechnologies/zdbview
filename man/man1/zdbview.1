@@ -514,8 +514,17 @@ size, the bytes seen since the monitor opened, the current rate, the age of the
 last write, and a sparkline of the last twenty-four samples scaled against the
 busiest row.
 .PP
+.BR < / >
+(and
+.BR F6 ,
+or
 .B s
-cycles the ordering (recent, rate, written, size, name),
+for the next one) move the sort to another column and
+.B I
+inverts its direction; clicking a column header sorts by it, and clicking the
+sorted one inverts it. The sorted column carries an arrow in its header.
+.B /
+filters the watched list by path, as it does elsewhere.
 .B p
 pauses and resumes,
 .BR + / \-

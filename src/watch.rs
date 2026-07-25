@@ -33,43 +33,99 @@ pub const DEFAULT_INTERVAL: Duration = Duration::from_millis(500);
 /// A file counts as "active" if it was written within this long.
 pub const ACTIVE_WINDOW: Duration = Duration::from_secs(5);
 
-/// How the monitor's rows are ordered.
+/// A sortable column of the monitor, in the order they are displayed. Sorting is
+/// by column with a direction, as in htop (`<` / `>` pick the column, `I` inverts
+/// it) rather than a flat list of modes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Order {
-    /// Most recently written first — the default, and what a `top` implies.
-    Recent,
-    /// Highest current write rate first.
-    Rate,
-    /// Most bytes written since the monitor opened.
-    Total,
-    /// Largest file first.
-    Size,
-    /// Path order, for a stable list to read.
+pub enum Column {
+    Kind,
     Name,
+    Size,
+    Written,
+    Rate,
+    Last,
 }
 
-impl Order {
-    pub const ALL: &'static [Order] = &[
-        Order::Recent,
-        Order::Rate,
-        Order::Total,
-        Order::Size,
-        Order::Name,
+impl Column {
+    pub const ALL: &'static [Column] = &[
+        Column::Kind,
+        Column::Name,
+        Column::Size,
+        Column::Written,
+        Column::Rate,
+        Column::Last,
     ];
 
+    /// Header text, which is also what the help and toasts call it.
     pub fn label(self) -> &'static str {
         match self {
-            Order::Recent => "recent",
-            Order::Rate => "rate",
-            Order::Total => "written",
-            Order::Size => "size",
-            Order::Name => "name",
+            Column::Kind => "kind",
+            Column::Name => "file",
+            Column::Size => "size",
+            Column::Written => "written",
+            Column::Rate => "rate",
+            Column::Last => "last",
         }
     }
 
-    pub fn next(self) -> Order {
-        let i = Order::ALL.iter().position(|&o| o == self).unwrap_or(0);
-        Order::ALL[(i + 1) % Order::ALL.len()]
+    /// Descending is the useful default for the numeric columns; the two text
+    /// ones read better ascending.
+    pub fn descending_by_default(self) -> bool {
+        !matches!(self, Column::Kind | Column::Name)
+    }
+
+    pub fn next(self) -> Column {
+        let i = Column::ALL.iter().position(|&c| c == self).unwrap_or(0);
+        Column::ALL[(i + 1) % Column::ALL.len()]
+    }
+
+    pub fn prev(self) -> Column {
+        let i = Column::ALL.iter().position(|&c| c == self).unwrap_or(0);
+        Column::ALL[(i + Column::ALL.len() - 1) % Column::ALL.len()]
+    }
+}
+
+/// Which column the rows are ordered by, and in which direction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Sort {
+    pub column: Column,
+    pub desc: bool,
+}
+
+impl Sort {
+    pub fn by(column: Column) -> Self {
+        Sort {
+            column,
+            desc: column.descending_by_default(),
+        }
+    }
+
+    /// Move to another column, taking that column's natural direction.
+    pub fn to(self, column: Column) -> Self {
+        Sort::by(column)
+    }
+
+    pub fn inverted(self) -> Self {
+        Sort {
+            column: self.column,
+            desc: !self.desc,
+        }
+    }
+
+    /// Arrow for the header of the sorted column.
+    pub fn arrow(self) -> &'static str {
+        if self.desc {
+            "▼"
+        } else {
+            "▲"
+        }
+    }
+}
+
+impl Default for Sort {
+    /// Most recently written first: what a monitor is for.
+    fn default() -> Self {
+        Sort::by(Column::Last)
     }
 }
 
@@ -229,25 +285,45 @@ impl Watcher {
     }
 
     /// Row indices in `order`, newest/busiest first as appropriate.
-    pub fn sorted(&self, order: Order) -> Vec<usize> {
-        let mut idx: Vec<usize> = (0..self.targets.len()).collect();
+    #[cfg(test)]
+    pub fn sorted(&self, sort: Sort) -> Vec<usize> {
+        self.sorted_filtered(sort, "")
+    }
+
+    /// Row indices matching `filter` (a case-insensitive substring of the path,
+    /// empty matching everything), ordered by `sort`. Sorting is always applied
+    /// ascending and reversed afterwards, so a column's two directions are exact
+    /// mirrors, and the path breaks ties so the order never wobbles between
+    /// samples.
+    pub fn sorted_filtered(&self, sort: Sort, filter: &str) -> Vec<usize> {
+        let needle = filter.to_lowercase();
+        let mut idx: Vec<usize> = (0..self.targets.len())
+            .filter(|&i| {
+                needle.is_empty()
+                    || self.targets[i]
+                        .path
+                        .to_str()
+                        .map(|p| p.to_lowercase().contains(&needle))
+                        .unwrap_or(false)
+            })
+            .collect();
         let interval = self.interval;
-        match order {
-            Order::Recent => idx.sort_by_key(|&i| {
-                // Never-written files sort last, most recent first.
-                match self.targets[i].last_write {
-                    Some(t) => (0u8, t.elapsed()),
-                    None => (1, Duration::MAX),
-                }
-            }),
-            Order::Rate => idx.sort_by(|&a, &b| {
-                self.targets[b]
-                    .rate(interval)
-                    .total_cmp(&self.targets[a].rate(interval))
-            }),
-            Order::Total => idx.sort_by_key(|&i| std::cmp::Reverse(self.targets[i].written)),
-            Order::Size => idx.sort_by_key(|&i| std::cmp::Reverse(self.targets[i].size)),
-            Order::Name => idx.sort_by(|&a, &b| self.targets[a].path.cmp(&self.targets[b].path)),
+        idx.sort_by(|&a, &b| {
+            let (x, y) = (&self.targets[a], &self.targets[b]);
+            let ord = match sort.column {
+                Column::Kind => format!("{:?}", x.kind).cmp(&format!("{:?}", y.kind)),
+                Column::Name => x.name().to_lowercase().cmp(&y.name().to_lowercase()),
+                Column::Size => x.size.cmp(&y.size),
+                Column::Written => x.written.cmp(&y.written),
+                Column::Rate => x.rate(interval).total_cmp(&y.rate(interval)),
+                // A file never written sorts as infinitely old.
+                Column::Last => write_age(x).cmp(&write_age(y)).reverse(),
+            };
+            ord.then_with(|| x.path.cmp(&y.path))
+        });
+        if sort.desc {
+            // Reverse the rows but keep the tie-break stable by re-sorting ties.
+            idx.reverse();
         }
         idx
     }
@@ -270,6 +346,12 @@ impl Watcher {
     pub fn elapsed(&self) -> Duration {
         self.started.elapsed()
     }
+}
+
+/// How long ago a file was written, `Duration::MAX` when it never was, so the
+/// `last` column can order both together.
+fn write_age(t: &Target) -> Duration {
+    t.last_write.map(|w| w.elapsed()).unwrap_or(Duration::MAX)
 }
 
 /// Eight-level block bar for one sample, scaled against `peak`.
@@ -477,36 +559,103 @@ mod tests {
         append(&a, &[b'a'; 10]);
         sample(&mut w);
 
-        let by = |o: Order| -> Vec<String> {
-            w.sorted(o)
+        let by = |s: Sort| -> Vec<String> {
+            w.sorted(s)
                 .iter()
                 .map(|&i| w.targets[i].name().to_string())
                 .collect()
         };
-        assert_eq!(by(Order::Total)[0], "c.rkyv", "most bytes first");
-        assert_eq!(by(Order::Rate)[0], "c.rkyv", "fastest first");
-        assert_eq!(by(Order::Size)[0], "b.rkyv", "largest file first");
-        assert_eq!(by(Order::Name), vec!["a.rkyv", "b.rkyv", "c.rkyv"]);
-        // Written files come before untouched ones under Recent.
-        let recent = by(Order::Recent);
+        assert_eq!(
+            by(Sort::by(Column::Written))[0],
+            "c.rkyv",
+            "most bytes first"
+        );
+        assert_eq!(by(Sort::by(Column::Rate))[0], "c.rkyv", "fastest first");
+        assert_eq!(
+            by(Sort::by(Column::Size))[0],
+            "b.rkyv",
+            "largest file first"
+        );
+        assert_eq!(
+            by(Sort::by(Column::Name)),
+            vec!["a.rkyv", "b.rkyv", "c.rkyv"],
+            "names ascend by default"
+        );
+        // Each column's two directions are exact mirrors.
+        let asc = by(Sort::by(Column::Size).inverted());
+        let mut desc = by(Sort::by(Column::Size));
+        desc.reverse();
+        assert_eq!(asc, desc, "inverting a column mirrors it");
+        // Written files come before untouched ones when sorting by last write.
+        let recent = by(Sort::by(Column::Last));
         assert_eq!(recent.last().unwrap(), "b.rkyv", "idle file sorts last");
         assert_eq!(w.active_count(ACTIVE_WINDOW), 2);
         let _ = std::fs::remove_dir_all(&d);
     }
 
+    /// `<` and `>` walk the columns both ways and wrap, and every column has a
+    /// header label.
     #[test]
-    fn order_cycles_through_every_mode() {
-        let mut o = Order::Recent;
-        let mut seen = vec![o];
-        for _ in 0..Order::ALL.len() - 1 {
-            o = o.next();
-            assert!(!seen.contains(&o), "{o:?} repeated early");
-            seen.push(o);
+    fn columns_cycle_both_ways() {
+        let mut c = Column::Kind;
+        let mut seen = vec![c];
+        for _ in 0..Column::ALL.len() - 1 {
+            c = c.next();
+            assert!(!seen.contains(&c), "{c:?} repeated early");
+            seen.push(c);
         }
-        assert_eq!(o.next(), Order::Recent, "wraps back to the start");
-        for o in Order::ALL {
-            assert!(!o.label().is_empty());
+        assert_eq!(c.next(), Column::Kind, "wraps forward");
+        assert_eq!(
+            Column::Kind.prev(),
+            *Column::ALL.last().unwrap(),
+            "wraps back"
+        );
+        for c in Column::ALL {
+            assert!(!c.label().is_empty());
+            // Text columns read ascending, numbers descending.
+            assert_eq!(
+                Sort::by(*c).desc,
+                !matches!(c, Column::Kind | Column::Name),
+                "{c:?} default direction"
+            );
         }
+        // Inverting flips the arrow and nothing else.
+        let s = Sort::by(Column::Size);
+        assert_eq!(s.arrow(), "▼");
+        assert_eq!(s.inverted().arrow(), "▲");
+        assert_eq!(s.inverted().column, Column::Size);
+        assert_eq!(Sort::default().column, Column::Last, "recent writes first");
+    }
+
+    /// The filter narrows the rows the monitor lists.
+    #[test]
+    fn sorted_filtered_narrows_to_matching_paths() {
+        let d = dir("filter");
+        for name in ["alpha.rkyv", "beta.db", "alpha2.rkyv"] {
+            append(&d.join(name), b"x");
+        }
+        let w = Watcher::new([
+            (d.join("alpha.rkyv"), Kind::Rkyv),
+            (d.join("beta.db"), Kind::Sqlite),
+            (d.join("alpha2.rkyv"), Kind::Rkyv),
+        ]);
+        let names = |f: &str| -> Vec<String> {
+            w.sorted_filtered(Sort::by(Column::Name), f)
+                .iter()
+                .map(|&i| w.targets[i].name().to_string())
+                .collect()
+        };
+        assert_eq!(names("").len(), 3);
+        assert_eq!(names("alpha"), vec!["alpha.rkyv", "alpha2.rkyv"]);
+        assert_eq!(
+            names("BETA"),
+            vec!["beta.db"],
+            "matching is case-insensitive"
+        );
+        // The directory counts as part of the path.
+        assert_eq!(names("zdbview_watch").len(), 3);
+        assert!(names("nothing-here").is_empty());
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]
