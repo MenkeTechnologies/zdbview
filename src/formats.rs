@@ -728,6 +728,36 @@ pub fn rename_record(
     }
 }
 
+/// Serialize a one-entry zshrs script shard. Test-only fixture, kept next to the
+/// archive types so tests elsewhere in the crate don't need them made public.
+#[cfg(test)]
+pub(crate) fn test_script_shard_bytes(key: &str, blob: &[u8]) -> Vec<u8> {
+    let mut entries = HashMap::new();
+    entries.insert(
+        key.to_string(),
+        ScriptEntry {
+            mtime_secs: 1,
+            mtime_nsecs: 2,
+            binary_mtime_at_cache: 3,
+            cached_at_secs: 4,
+            chunk_blob: blob.to_vec(),
+        },
+    );
+    let shard = ScriptShard {
+        header: ShardHeader {
+            magic: ZSHRS_MAGIC,
+            format_version: 1,
+            zshrs_version: "9.9.9".into(),
+            pointer_width: 8,
+            built_at_secs: 5,
+        },
+        entries,
+    };
+    rkyv::to_bytes::<_, 256>(&shard)
+        .expect("serialize test shard")
+        .to_vec()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

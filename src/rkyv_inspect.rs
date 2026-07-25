@@ -65,31 +65,11 @@ impl RkyvStore {
         hits
     }
 
-    /// One 16-byte `offset  hex bytes  |ascii|` line, `xxd` style.
+    /// One 16-byte `offset  hex bytes  |ascii|` line, `xxd` style. Formatting
+    /// lives in `crate::hexedit` so every hex view in the app shares one layout.
     pub fn hex_row(&self, offset: usize) -> String {
         let end = (offset + 16).min(self.bytes.len());
         let chunk = &self.bytes[offset.min(self.bytes.len())..end];
-        let mut hex = String::with_capacity(50);
-        for i in 0..16 {
-            if i < chunk.len() {
-                hex.push_str(&format!("{:02x} ", chunk[i]));
-            } else {
-                hex.push_str("   ");
-            }
-            if i == 7 {
-                hex.push(' ');
-            }
-        }
-        let ascii: String = chunk
-            .iter()
-            .map(|&b| {
-                if (0x20..0x7f).contains(&b) {
-                    b as char
-                } else {
-                    '.'
-                }
-            })
-            .collect();
-        format!("{:08x}  {} |{}|", offset, hex, ascii)
+        crate::hexedit::hex_dump_line(offset, chunk)
     }
 }

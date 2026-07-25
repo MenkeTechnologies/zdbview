@@ -16,6 +16,7 @@ use ratatui::{DefaultTerminal, Frame};
 use std::path::PathBuf;
 
 use crate::formats::{self, Decoded, FormatKind};
+use crate::hexedit::{self, HexEdit};
 use crate::mru::{self, Entry};
 use crate::overlay::{HelpCtx, Overlays};
 use crate::rkyv_inspect::RkyvStore;
@@ -49,9 +50,6 @@ enum Mode {
     Search(String),
     /// Adding a new rkyv record; buffer holds the key being typed.
     AddRecord(String),
-    /// Editing a rkyv record's value; buffer holds the new value (text, or a
-    /// `0x…` hex string for binary).
-    EditValue(String),
     /// Renaming a rkyv record's key; buffer holds the new key.
     RenameRecord(String),
     /// Confirm a destructive action (delete row).
@@ -69,11 +67,13 @@ enum RkyvView {
 }
 
 /// Top-level screen. Overlaid modals (`Mode`) and the help overlay sit on top.
-#[derive(PartialEq, Eq, Clone, Copy)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
 enum Screen {
     Main,
     /// Full-screen detail of one row/record with a scrollable value pane.
     Detail,
+    /// Hex editor over one record's value bytes.
+    HexEdit,
     /// SQLite schema (CREATE statements) view.
     Schema,
 }
@@ -155,6 +155,10 @@ pub struct App {
     off_records: usize,
     /// Byte offset of the text cursor within the active input modal's buffer.
     input_cursor: usize,
+    /// The open hex editor, while `screen` is `Screen::HexEdit`.
+    hex: Option<HexEdit>,
+    /// Rect the hex editor last rendered into, for click hit-testing.
+    hex_area: Rect,
     /// Active row-grid ordering, or `None` for the table's natural `rowid`
     /// order. Reset when another table is selected.
     sort: Option<Sort>,
@@ -207,14 +211,19 @@ impl App {
             off_records: 0,
             input_cursor: 0,
             sort: None,
+            hex: None,
+            hex_area: Rect::ZERO,
             ov: Overlays::new(theme),
         };
         app.init();
         app
     }
 
-    /// Which key sections the help overlay lists for the open file.
+    /// Which key sections the help overlay lists for what is on screen.
     fn help_ctx(&self) -> HelpCtx {
+        if self.screen == Screen::HexEdit {
+            return HelpCtx::HexEdit;
+        }
         match &self.store {
             Store::Sqlite(_) => HelpCtx::Sqlite,
             Store::Rkyv(_) => HelpCtx::Rkyv,
@@ -243,7 +252,7 @@ impl App {
                 if let Some(d) = &self.decoded {
                     self.rkyv_view = RkyvView::Records;
                     self.status = format!(
-                        "{} · {} records · Enter detail · a add e edit r rename d delete · / search · 0/1/2/3 views · c scheme · h help · q quit",
+                        "{} · {} records · Enter detail · a add e hex-edit r rename d delete · / search · 0/1/2/3 views · c scheme · h help · q quit",
                         d.format,
                         d.records.len()
                     );
@@ -289,7 +298,6 @@ impl App {
             Cmd(String),
             Search(String),
             Add(String),
-            EditVal(String),
             Rename(String),
             Confirm,
             None,
@@ -299,7 +307,6 @@ impl App {
             Mode::Command(buf) => Modal::Cmd(buf.clone()),
             Mode::Search(buf) => Modal::Search(buf.clone()),
             Mode::AddRecord(buf) => Modal::Add(buf.clone()),
-            Mode::EditValue(buf) => Modal::EditVal(buf.clone()),
             Mode::RenameRecord(buf) => Modal::Rename(buf.clone()),
             Mode::ConfirmDelete => Modal::Confirm,
             Mode::Normal => Modal::None,
@@ -315,9 +322,6 @@ impl App {
             Modal::Add(buf) => {
                 return self.key_input(key, buf, Mode::AddRecord, App::commit_add_record)
             }
-            Modal::EditVal(buf) => {
-                return self.key_input(key, buf, Mode::EditValue, App::commit_edit_value)
-            }
             Modal::Rename(buf) => {
                 return self.key_input(key, buf, Mode::RenameRecord, App::commit_rename_record)
             }
@@ -326,12 +330,16 @@ impl App {
         }
 
         // The overlay openers (`h`/`?` help, `c` chooser, `C` editor) work from
-        // every screen, exactly as on the recent-files picker.
-        if self.ov.on_key(code) {
+        // every screen, exactly as on the recent-files picker — except inside the
+        // hex editor, where those keys are motions and data.
+        if self.screen != Screen::HexEdit && self.ov.on_key(code) {
             return;
         }
 
         match self.screen {
+            // The hex editor is modal: it owns every key, including `h` and `c`,
+            // because those are its own motions and data.
+            Screen::HexEdit => return self.key_hex(key),
             Screen::Detail => return self.key_detail(code),
             Screen::Schema => return self.key_schema(code),
             Screen::Main => {}
@@ -348,6 +356,15 @@ impl App {
     fn on_mouse(&mut self, m: MouseEvent) {
         // An open overlay owns the event (wheel drives it, a click confirms).
         if self.ov.on_mouse(m) {
+            return;
+        }
+        // In the hex editor the wheel scrolls the dump and a click places the
+        // cursor on the byte under it.
+        if self.screen == Screen::HexEdit {
+            let area = self.hex_area;
+            if let Some(ed) = self.hex.as_mut() {
+                ed.on_mouse(m, area);
+            }
             return;
         }
         // Scroll wheel reuses the existing up/down navigation for the active
@@ -791,7 +808,7 @@ impl App {
             }
             KeyCode::Char('e') => {
                 if self.rkyv_view == RkyvView::Records && self.has_current_record() {
-                    self.open_modal(Mode::EditValue(String::new()));
+                    self.open_hex_editor();
                 }
             }
             KeyCode::Char('r') => {
@@ -887,7 +904,6 @@ impl App {
             | Mode::Command(s)
             | Mode::Search(s)
             | Mode::AddRecord(s)
-            | Mode::EditValue(s)
             | Mode::RenameRecord(s) => s.len(),
             _ => 0,
         };
@@ -1000,17 +1016,58 @@ impl App {
         );
     }
 
-    fn commit_edit_value(&mut self, val: &str) {
+    /// Open the hex editor on the selected record's value, pre-filled with its
+    /// current bytes (ported editor; see `crate::hexedit`).
+    fn open_hex_editor(&mut self) {
+        let (key, value) = match self
+            .decoded
+            .as_ref()
+            .and_then(|d| d.records.get(self.record_idx))
+        {
+            Some(rec) => (rec.key.clone(), rec.value.clone()),
+            None => return,
+        };
+        self.hex = Some(HexEdit::new(key, value));
+        self.screen = Screen::HexEdit;
+    }
+
+    fn key_hex(&mut self, key: KeyEvent) {
+        let action = match self.hex.as_mut() {
+            Some(ed) => ed.on_key(key),
+            None => {
+                self.screen = Screen::Main;
+                return;
+            }
+        };
+        match action {
+            hexedit::Action::None => {}
+            hexedit::Action::Save => self.commit_hex_value(),
+            hexedit::Action::Close => {
+                self.hex = None;
+                self.screen = Screen::Main;
+            }
+        }
+    }
+
+    /// Write the edited bytes back into the archive (same write-back path the
+    /// other record edits use), leaving the editor open on the saved value.
+    fn commit_hex_value(&mut self) {
+        let value = match self.hex.as_ref() {
+            Some(ed) => ed.bytes.clone(),
+            None => return,
+        };
         let (_, del_key, kind, bytes) = match self.rkyv_ctx() {
             Some(v) => v,
             None => return,
         };
-        let value = parse_value_input(val);
         let n = value.len();
         self.rkyv_apply(
             crate::formats::set_value(&bytes, kind, &del_key, value),
             format!("value set ({} bytes)", n),
         );
+        if let Some(ed) = self.hex.as_mut() {
+            ed.mark_saved();
+        }
     }
 
     fn commit_rename_record(&mut self, new_key: &str) {
@@ -1455,6 +1512,7 @@ impl App {
 
         match self.screen {
             Screen::Detail => self.render_detail(f, outer[0]),
+            Screen::HexEdit => self.render_hex(f, outer[0]),
             Screen::Schema => self.render_schema(f, outer[0]),
             Screen::Main => match &self.store {
                 Store::Sqlite(_) => self.render_sqlite(f, outer[0]),
@@ -1469,11 +1527,6 @@ impl App {
             Mode::Command(buf) => self.render_input(f, "SQL (Enter=run, Esc=cancel)", buf),
             Mode::Search(buf) => self.render_input(f, "search / (Enter, Esc)", buf),
             Mode::AddRecord(buf) => self.render_input(f, "new record key (Enter=add, Esc)", buf),
-            Mode::EditValue(buf) => self.render_input(
-                f,
-                "new value — text, or 0x<hex> for binary (Enter, Esc)",
-                buf,
-            ),
             Mode::RenameRecord(buf) => self.render_input(f, "rename key to (Enter, Esc)", buf),
             Mode::ConfirmDelete => {
                 let what = match self.store {
@@ -1566,6 +1619,14 @@ impl App {
             ))),
             rows[1],
         );
+    }
+
+    fn render_hex(&mut self, f: &mut Frame, area: Rect) {
+        let theme = self.ov.theme;
+        self.hex_area = area;
+        if let Some(ed) = self.hex.as_mut() {
+            ed.render(f, area, &theme);
+        }
     }
 
     fn render_schema(&self, f: &mut Frame, area: Rect) {
@@ -1771,7 +1832,10 @@ impl App {
                 if off >= rec.value.len() {
                     break;
                 }
-                lines.push(Line::from(hex_row(&rec.value, off)));
+                lines.push(Line::from(hexedit::hex_dump_line(
+                    off,
+                    &rec.value[off.min(rec.value.len())..(off + 16).min(rec.value.len())],
+                )));
             }
         }
         let p =
@@ -2268,32 +2332,7 @@ fn input_delete_word(buf: &mut String, cur: usize) -> usize {
 }
 
 /// Parse a value-input string: a `0x…` prefix is decoded as hex bytes (spaces
-/// ignored), otherwise the string's UTF-8 bytes are used verbatim.
-fn parse_value_input(s: &str) -> Vec<u8> {
-    if let Some(hex) = s.strip_prefix("0x") {
-        let clean: String = hex.chars().filter(|c| !c.is_whitespace()).collect();
-        if !clean.is_empty() && clean.len().is_multiple_of(2) {
-            if let Some(b) = hex_to_bytes(&clean) {
-                return b;
-            }
-        }
-    }
-    s.as_bytes().to_vec()
-}
-
-fn hex_to_bytes(s: &str) -> Option<Vec<u8>> {
-    let b = s.as_bytes();
-    let mut out = Vec::with_capacity(b.len() / 2);
-    let mut i = 0;
-    while i + 1 < b.len() {
-        let hi = (b[i] as char).to_digit(16)?;
-        let lo = (b[i + 1] as char).to_digit(16)?;
-        out.push((hi * 16 + lo) as u8);
-        i += 2;
-    }
-    Some(out)
-}
-
+/// Lowercase hex of a byte slice.
 /// Whether a byte slice is mostly printable/UTF-8 text (heuristic for Auto
 /// value rendering): valid UTF-8 and < 10% control bytes.
 fn looks_textual(bytes: &[u8]) -> bool {
@@ -2310,7 +2349,6 @@ fn looks_textual(bytes: &[u8]) -> bool {
     ctrl * 10 < bytes.len()
 }
 
-/// Lowercase hex of a byte slice.
 fn hex_string(bytes: &[u8]) -> String {
     let mut s = String::with_capacity(bytes.len() * 2);
     for b in bytes {
@@ -2361,7 +2399,10 @@ fn value_lines(
             if off >= bytes.len() {
                 break;
             }
-            lines.push(Line::from(hex_row(bytes, off)));
+            lines.push(Line::from(hexedit::hex_dump_line(
+                off,
+                &bytes[off.min(bytes.len())..(off + 16).min(bytes.len())],
+            )));
         }
     }
     lines
@@ -2389,33 +2430,6 @@ fn disasm_lines(_bytes: &[u8], _scroll: usize, _height: usize) -> Vec<Line<'stat
     )]
 }
 
-/// One 16-byte `offset  hex  |ascii|` line for an arbitrary slice.
-fn hex_row(bytes: &[u8], offset: usize) -> String {
-    let end = (offset + 16).min(bytes.len());
-    let chunk = &bytes[offset.min(bytes.len())..end];
-    let mut hex = String::with_capacity(50);
-    for i in 0..16 {
-        if i < chunk.len() {
-            hex.push_str(&format!("{:02x} ", chunk[i]));
-        } else {
-            hex.push_str("   ");
-        }
-        if i == 7 {
-            hex.push(' ');
-        }
-    }
-    let ascii: String = chunk
-        .iter()
-        .map(|&b| {
-            if (0x20..0x7f).contains(&b) {
-                b as char
-            } else {
-                '.'
-            }
-        })
-        .collect();
-    format!("{:08x}  {} |{}|", offset, hex, ascii)
-}
 
 /// Truncate a display string to `max` chars, appending an ellipsis.
 /// Sort-direction marker for a column header.
@@ -2458,7 +2472,7 @@ mod tests {
     use crate::rkyv_inspect::RkyvStore;
     use crate::sqlite::SqliteStore;
     use crate::theme::ThemeName;
-    use crossterm::event::{KeyCode, KeyEvent};
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::backend::TestBackend;
     use ratatui::layout::Rect;
     use ratatui::Terminal;
@@ -2599,12 +2613,106 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    /// Help lists the section for the open store.
+    /// An App over a real recognized shard on disk, so record edits exercise the
+    /// actual rkyv write-back.
+    fn script_shard_app() -> (App, std::path::PathBuf) {
+        let path = scratch("rkyv");
+        std::fs::write(
+            &path,
+            crate::formats::test_script_shard_bytes("/tmp/a.sh", b"old"),
+        )
+        .unwrap();
+        let store = Store::Rkyv(RkyvStore::open(&path).unwrap());
+        (App::new(store, Some(ThemeName::NeonSprawl)), path)
+    }
+
+    /// `e` on a record opens the ported hex editor pre-filled with the record's
+    /// current bytes — the point of the port: no retyping the whole value.
     #[test]
-    fn help_ctx_follows_the_store() {
+    fn e_opens_the_hex_editor_on_the_current_value() {
+        let (mut app, path) = script_shard_app();
+        assert_eq!(app.screen, super::Screen::Main);
+        press(&mut app, 'e');
+        assert_eq!(app.screen, super::Screen::HexEdit);
+        let ed = app.hex.as_ref().expect("editor open");
+        assert_eq!(ed.bytes, b"old", "pre-filled with the record's value");
+        assert_eq!(ed.label, "/tmp/a.sh");
+
+        let rows = frame_rows(&mut app, 90, 16);
+        assert!(contains(&rows, "hex editor"), "editor not drawn");
+        assert!(contains(&rows, "6f 6c 64"), "hex cells for \"old\"");
+        assert!(contains(&rows, "|old"), "ascii gutter");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Edits written with `^s` go through the real archive write-back and are
+    /// visible in the reloaded records.
+    #[test]
+    fn hex_editor_saves_edited_bytes_back_into_the_archive() {
+        let (mut app, path) = script_shard_app();
+        press(&mut app, 'e');
+        // EDIT mode, ascii column, overwrite "old" with "new".
+        press(&mut app, 'i');
+        app.on_key(KeyEvent::from(KeyCode::Tab));
+        for c in "new".chars() {
+            press(&mut app, c);
+        }
+        assert_eq!(app.hex.as_ref().unwrap().bytes, b"new");
+        assert!(app.hex.as_ref().unwrap().dirty);
+
+        app.on_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+        assert!(!app.hex.as_ref().unwrap().dirty, "save clears dirty");
+        assert_eq!(
+            app.decoded.as_ref().unwrap().records[0].value,
+            b"new".to_vec(),
+            "the reloaded record must carry the edited bytes"
+        );
+        // And the file on disk really changed.
+        let on_disk = std::fs::read(&path).unwrap();
+        assert!(
+            crate::formats::try_decode(&on_disk).unwrap().records[0].value == b"new".to_vec(),
+            "write-back must reach the file"
+        );
+
+        // In EDIT mode letters are data, so leave it first; then `q` closes on a
+        // single press because the buffer is clean.
+        app.on_key(KeyEvent::from(KeyCode::Esc));
+        press(&mut app, 'q');
+        assert_eq!(app.screen, super::Screen::Main);
+        assert!(app.hex.is_none());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Inside the editor the overlay openers must not steal `h` or `c` — they are
+    /// motions and hex digits there.
+    #[test]
+    fn hex_editor_keeps_h_and_c_for_itself() {
+        let (mut app, path) = script_shard_app();
+        press(&mut app, 'e');
+        press(&mut app, 'l');
+        press(&mut app, 'h'); // motion, not help
+        assert!(!app.ov.help, "h must not open help inside the editor");
+        assert_eq!(app.screen, super::Screen::HexEdit);
+
+        press(&mut app, 'i');
+        press(&mut app, 'c'); // a hex digit, not the chooser
+        assert!(!app.ov.chooser, "c must not open the chooser inside the editor");
+        // 'c' set the high nibble of 'o' (0x6f), keeping the low one.
+        assert_eq!(app.hex.as_ref().unwrap().bytes[0], 0xcf);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Help lists the section for what is on screen.
+    #[test]
+    fn help_ctx_follows_the_screen() {
         assert_eq!(rkyv_app().help_ctx(), HelpCtx::Rkyv);
         let (app, path) = sqlite_app();
         assert_eq!(app.help_ctx(), HelpCtx::Sqlite);
+        let _ = std::fs::remove_file(&path);
+
+        let (mut app, path) = script_shard_app();
+        press(&mut app, 'e');
+        assert_eq!(app.help_ctx(), HelpCtx::HexEdit);
         let _ = std::fs::remove_file(&path);
     }
 

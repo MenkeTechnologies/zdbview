@@ -11,6 +11,11 @@ use std::io::Write;
 // the tests below don't call looks dead here even though the real binary uses
 // it — hence the per-module allow. It is scoped to the re-inclusion, so dead
 // code in the test file itself is still reported.
+// `rkyv_inspect` formats its hex rows through `hexedit` (one shared layout for
+// every hex view), which in turn styles from `theme`, so both come along.
+#[allow(dead_code)]
+#[path = "../src/hexedit.rs"]
+mod hexedit;
 #[allow(dead_code)]
 #[path = "../src/mru.rs"]
 mod mru;
@@ -23,6 +28,9 @@ mod sqlite;
 #[allow(dead_code)]
 #[path = "../src/store.rs"]
 mod store;
+#[allow(dead_code)]
+#[path = "../src/theme.rs"]
+mod theme;
 
 use rkyv_inspect::RkyvStore;
 use sqlite::{Sort, SqliteStore};

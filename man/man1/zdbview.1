@@ -265,6 +265,42 @@ over SSH).
 Export the current table (SQLite, CSV) or all records (rkyv, JSON) to a file in
 the working directory.
 .TP
+.B e
+In the rkyv Records view, open the
+.B hex editor
+over the selected record's value, pre-filled with its current bytes (ported from
+zmax's hex viewer/editor). The editor opens read-only:
+.B i
+or
+.B R
+enters EDIT mode,
+.B Tab
+switches the focused column between hex and ASCII,
+.BR h / l / j / k
+and the arrows move by byte and row,
+.BR 0 / $
+and
+.BR g / G
+jump to the row or buffer ends, and the wheel scrolls while a click places the
+cursor. In EDIT mode a hex digit sets the high nibble of the byte under the
+cursor, the next digit sets the low nibble and advances; in the ASCII column a
+printable character overwrites the byte and advances.
+.B o
+and
+.B O
+insert a
+.B 00
+byte after / before the cursor and
+.B x
+deletes the byte under it \(em a value, unlike a file, may change length.
+.B Ctrl\-s
+writes the value back through the same atomic re-serialization as every other
+record edit;
+.B q
+leaves the editor, twice when there are unsaved edits. The editor is modal, so
+.BR h " and " c
+are its own motions and digits there rather than the help and scheme keys.
+.TP
 .B S
 Show the SQLite schema (CREATE statements for tables, views, and indexes).
 .TP

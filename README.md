@@ -148,8 +148,7 @@ Recognized archives are editable in place, not just readable. In the Records
 view:
 
 - `a` — **create** a record (prompt for a key; inserted with an empty value).
-- `e` — **update** the selected record's value (type text, or `0x<hex>` for
-  binary).
+- `e` — **update** the selected record's value in a **hex editor** (see below).
 - `r` — **rename** a record's key (map-keyed formats).
 - `d` — **delete** the record (confirm with `y`).
 
@@ -187,7 +186,7 @@ is published on crates.io); disable with `--no-default-features`.
 | `e` `a` `d` `:` | edit / add / delete / SQL (SQLite) |
 | `s` | sort by the cursor column (ascending → descending → off) |
 | `<` / `>` | move the sort to the previous / next column |
-| `a` `e` `r` `d` | create / update-value / rename / delete record (rkyv) |
+| `a` `e` `r` `d` | create / hex-edit value / rename / delete record (rkyv) |
 | `S` | schema view (SQLite) |
 | `0` `1` `2` `3` | Records / Info / Strings / Hex (rkyv) |
 | `v` | cycle value render (auto / hex / text / disasm) — detail screen |
@@ -236,6 +235,39 @@ Input prompts (search, SQL, cell/value edit, add/rename) have a movable text
 cursor: `←`/`→`, `Home`/`End`, and the readline chords `Ctrl-a`/`Ctrl-e`
 (line start/end), `Ctrl-w` (delete word), `Ctrl-u`/`Ctrl-k` (kill to
 start/end). Mouse support and the cursor model are ported from `iftoprs`.
+
+## Hex editor
+
+`e` on a record opens a full-screen **hex editor** over that record's value —
+ported from [`zmax`](https://github.com/MenkeTechnologies/zmax)'s
+`zmax-term/src/ui/hex.rs`. It opens pre-filled with the current bytes, so there
+is nothing to retype:
+
+```
+ plugins/foo.zsh [+]  —  40 bytes  ·  cursor 0x00000004  ·  -- EDIT (hex) --
+00000000  40 07 0e 15 1c 23 2a 31  38 3f 46 4d 54 5b 62 69 |@....#*18?FMT[bi|
+00000010  70 77 7e 85 8c 93 9a a1  a8 af b6 bd c4 cb d2 d9 |pw~.............|
+```
+
+| Key | Action |
+|-----|--------|
+| `h` `l` `j` `k`, arrows | move a byte / a row; `0` `$` row start / end; `g` `G` first / last |
+| `Ctrl-f` / `Ctrl-b` | page; the wheel scrolls, a click places the cursor |
+| `i` / `R` | enter EDIT mode (the editor opens read-only) |
+| `Tab` | switch the focused column between hex and ASCII |
+| `0`-`9` `a`-`f` | in EDIT + hex: set the high nibble, then the low one, then advance |
+| any printable | in EDIT + ASCII: overwrite the byte and advance |
+| `o` / `O` | insert a `00` byte after / before the cursor |
+| `x` | delete the byte under the cursor |
+| `Ctrl-s` | write the value back into the archive |
+| `Esc` | leave EDIT mode; `q` leaves the editor (twice when there are unsaved edits) |
+
+The editor is modal — `h` and `c` are its own motions and hex digits there, not
+the help and scheme keys. Saving goes through the same write-back as every other
+record edit: deserialize, mutate, re-serialize byte-identically, atomic rename.
+
+`o`/`O`/`x` are a zdbview addition: zmax edits a fixed-length file, while a
+record's value can legitimately change length.
 
 ## Sorting
 

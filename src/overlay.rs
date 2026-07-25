@@ -54,6 +54,8 @@ pub enum HelpCtx {
     Sqlite,
     Rkyv,
     Picker,
+    /// The hex editor over a record's value.
+    HexEdit,
 }
 
 /// The overlay layer: active scheme plus help / chooser / editor / toast state.
@@ -650,6 +652,7 @@ impl HelpCtx {
             HelpCtx::Sqlite => "SQLite database",
             HelpCtx::Rkyv => "rkyv archive",
             HelpCtx::Picker => "recent files",
+            HelpCtx::HexEdit => "hex editor",
         }
     }
 }
@@ -676,6 +679,47 @@ const MOUSE_KEYS: &[(&str, &str)] = &[
 
 /// The help overlay's contents for a screen.
 fn help_sections(ctx: HelpCtx) -> Vec<HelpSection> {
+    if ctx == HelpCtx::HexEdit {
+        // The editor is modal: it owns h and c, so its help is reachable from
+        // the Records view before opening it (and from `?` inside it).
+        return vec![
+            HelpSection {
+                title: "HEX NAV",
+                keys: &[
+                    ("h/l ←→", "Byte back / fwd"),
+                    ("j/k ↑↓", "Row up / down"),
+                    ("0 / $", "Row start / end"),
+                    ("g / G", "First / last byte"),
+                    ("^F / ^B", "Page"),
+                    ("click", "Place cursor"),
+                ],
+            },
+            HelpSection {
+                title: "HEX EDIT",
+                keys: &[
+                    ("i / R", "Enter edit mode"),
+                    ("Tab", "Hex / ascii column"),
+                    ("0-9 a-f", "Set nibble (hex)"),
+                    ("any char", "Byte (ascii)"),
+                    ("Esc", "Leave edit mode"),
+                ],
+            },
+            HelpSection {
+                title: "LENGTH",
+                keys: &[
+                    ("o / O", "Insert 00 after/before"),
+                    ("x", "Delete byte"),
+                ],
+            },
+            HelpSection {
+                title: "SAVE",
+                keys: &[
+                    ("^s", "Write value back"),
+                    ("q", "Back (twice if dirty)"),
+                ],
+            },
+        ];
+    }
     if ctx == HelpCtx::Picker {
         return vec![
             HelpSection {
@@ -724,7 +768,7 @@ fn help_sections(ctx: HelpCtx) -> Vec<HelpSection> {
                 ("2", "Strings"),
                 ("3", "Hex"),
                 ("a", "Add record"),
-                ("e", "Edit value"),
+                ("e", "Edit value (hex)"),
                 ("r", "Rename key"),
                 ("d", "Delete record"),
             ],
