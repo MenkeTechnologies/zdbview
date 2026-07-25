@@ -21,6 +21,7 @@ mod mru;
 mod overlay;
 mod prefs;
 mod rkyv_inspect;
+mod scan;
 mod sqlite;
 mod store;
 mod theme;
@@ -46,7 +47,8 @@ use store::Store;
     about = "Terminal inspector and CRUD editor for rkyv archives and SQLite databases"
 )]
 struct Cli {
-    /// File to open. With no file, shows a picker of recently opened files.
+    /// File to open. With no file, shows a picker of recent files plus the
+    /// results of a scan for databases and rkyv shards.
     file: Option<PathBuf>,
     /// Force treating the file as a SQLite database
     #[arg(long, conflicts_with = "rkyv")]
@@ -64,6 +66,13 @@ struct Cli {
     /// Preview every built-in color scheme with its palette and exit.
     #[arg(long)]
     list_themes: bool,
+    /// Extra directory to scan for databases and rkyv shards when no file is
+    /// given (repeatable). Replaces the default roots.
+    #[arg(long, value_name = "DIR")]
+    scan: Vec<PathBuf>,
+    /// Skip the startup scan and list only recently opened files.
+    #[arg(long, conflicts_with = "scan")]
+    no_scan: bool,
 }
 
 fn main() -> Result<()> {
@@ -222,7 +231,8 @@ fn export_store(store: &Store, fmt: &str) -> Result<String> {
 }
 
 fn run(cli: &Cli, terminal: &mut DefaultTerminal, theme: Option<theme::ThemeName>) -> Result<()> {
-    // Resolve the file to open: explicit argument, or a pick from the MRU list.
+    // Resolve the file to open: explicit argument, or a pick from the recent
+    // files plus whatever the background scan finds.
     let file = match &cli.file {
         Some(f) => f.clone(),
         None => {
@@ -230,7 +240,22 @@ fn run(cli: &Cli, terminal: &mut DefaultTerminal, theme: Option<theme::ThemeName
                 .into_iter()
                 .filter(|e| e.path.exists())
                 .collect();
-            match app::pick_mru(terminal, &recent, theme)? {
+            let scan = if cli.no_scan {
+                None
+            } else {
+                let roots = if cli.scan.is_empty() {
+                    scan::default_roots()
+                } else {
+                    // Explicit roots are taken at face value, walked as deeply
+                    // as a producer's own directory.
+                    cli.scan
+                        .iter()
+                        .map(|p| scan::Root::new(p.clone(), scan::DEEP))
+                        .collect()
+                };
+                Some(scan::spawn(roots))
+            };
+            match app::pick_mru(terminal, &recent, theme, scan)? {
                 Some(p) => p,
                 None => return Ok(()), // user quit the picker
             }

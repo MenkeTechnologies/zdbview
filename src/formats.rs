@@ -197,20 +197,47 @@ pub struct Decoded {
     pub records: Vec<KvRecord>,
 }
 
+/// Every shard magic with its display name — the one place they are listed, used
+/// both by [`try_decode`] and by the startup scan's cheap header sniff.
+const MAGICS: &[(u32, &str)] = &[
+    (ZSHRS_MAGIC, "zshrs script cache (ZRSC)"),
+    (AWKRS_MAGIC, "awkrs script cache (AWKR)"),
+    (VIMLRS_MAGIC, "vimlrs script cache (VIML)"),
+    (STRYKE_MAGIC, "strykelang script cache (STRY)"),
+    (AUTOLOAD_MAGIC, "zshrs autoload cache (ZRAL)"),
+    (ELISP_MAGIC, "elisprs heap-image cache (ELSP)"),
+];
+
+/// Display name for a known magic.
+fn magic_name(magic: u32) -> &'static str {
+    MAGICS
+        .iter()
+        .find(|(m, _)| *m == magic)
+        .map(|(_, n)| *n)
+        .unwrap_or("rkyv archive")
+}
+
+/// The format named by whichever known magic appears in `bytes`, if any. This is
+/// a *sniff*, not a decode: it says the bytes carry a producer's header, which is
+/// enough for the scan to offer the file. Opening it still validates properly
+/// through [`try_decode`].
+pub fn magic_in(bytes: &[u8]) -> Option<&'static str> {
+    MAGICS
+        .iter()
+        .find(|(m, _)| contains_u32_le(bytes, *m))
+        .map(|(_, n)| *n)
+}
+
 /// Detect the archive format and decode it to key/value records. Magic-bearing
 /// formats are matched by their header magic; the header-less hash-keyed shards
 /// are attempted last, gated by rkyv validation. `None` → structural fallback.
 pub fn try_decode(bytes: &[u8]) -> Option<Decoded> {
     // Family A — shared script-cache template, one type, per-host magic + name.
-    for (magic, name) in [
-        (ZSHRS_MAGIC, "zshrs script cache (ZRSC)"),
-        (AWKRS_MAGIC, "awkrs script cache (AWKR)"),
-        (VIMLRS_MAGIC, "vimlrs script cache (VIML)"),
-    ] {
+    for magic in [ZSHRS_MAGIC, AWKRS_MAGIC, VIMLRS_MAGIC] {
         if contains_u32_le(bytes, magic) {
             if let Ok(s) = rkyv::check_archived_root::<ScriptShard>(bytes) {
                 if u32::from(s.header.magic) == magic {
-                    return Some(decode_script(s, name));
+                    return Some(decode_script(s, magic_name(magic)));
                 }
             }
         }

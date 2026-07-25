@@ -2017,15 +2017,97 @@ impl App {
 
 /// Recent-files picker shown when zdbview is launched with no file argument.
 /// Returns the chosen file, or `None` if the user quits.
+/// One row of the picker: a remembered file, or one the startup scan found.
+pub struct Choice {
+    pub path: PathBuf,
+    pub kind: Kind,
+    /// When this file was last opened (recent files only).
+    pub opened: Option<std::time::SystemTime>,
+    /// Recognized rkyv format, when the scan's magic sniff named one.
+    pub format: Option<&'static str>,
+    /// File size, for scan hits (recent rows show their age instead).
+    pub size: Option<u64>,
+    /// Last modification time, used to order scan hits newest-first.
+    pub modified: Option<std::time::SystemTime>,
+    /// Scan display priority (see `scan::Hit::rank`).
+    rank: u8,
+}
+
+impl Choice {
+    fn from_entry(e: &Entry) -> Self {
+        Choice {
+            path: e.path.clone(),
+            kind: e.kind,
+            opened: Some(e.opened),
+            format: None,
+            size: None,
+            modified: None,
+            rank: 0,
+        }
+    }
+
+    fn from_hit(h: crate::scan::Hit) -> Self {
+        Choice {
+            path: h.path,
+            kind: h.kind,
+            opened: None,
+            format: h.format,
+            size: Some(h.size),
+            modified: Some(h.modified),
+            rank: h.rank,
+        }
+    }
+
+    fn name(&self) -> &str {
+        self.path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("?")
+    }
+}
+
+/// Merge scan hits into the list, dropping any path already present (a recent
+/// file the scan also found stays a recent file, keeping its age column).
+fn merge_hits(choices: &mut Vec<Choice>, hits: Vec<crate::scan::Hit>) {
+    for hit in hits {
+        let dup = choices.iter().any(|c| {
+            c.path == hit.path
+                || (c.path.canonicalize().ok() == hit.path.canonicalize().ok()
+                    && c.path.canonicalize().is_ok())
+        });
+        if !dup {
+            choices.push(Choice::from_hit(hit));
+        }
+    }
+    // Recent files keep their recency order at the top. Scan hits below them go
+    // by rank first (recognized shards, then other rkyv archives, then
+    // databases), newest-first within a rank, shallowest path breaking ties.
+    let first_scanned = choices
+        .iter()
+        .position(|c| c.opened.is_none())
+        .unwrap_or(choices.len());
+    choices[first_scanned..].sort_by_key(|c| {
+        (
+            c.rank,
+            std::cmp::Reverse(c.modified),
+            c.path.components().count(),
+        )
+    });
+}
+
 pub fn pick_mru(
     terminal: &mut DefaultTerminal,
     entries: &[Entry],
     theme_override: Option<ThemeName>,
+    scan: Option<crate::scan::Scan>,
 ) -> Result<Option<PathBuf>> {
     let mut idx = 0usize;
     let mut pending_g = false;
     let mut search = String::new();
     let mut searching = false;
+    // Recent files first, then whatever the scan turns up.
+    let mut choices: Vec<Choice> = entries.iter().map(Choice::from_entry).collect();
+    let mut scan = scan;
     // The picker carries the same overlay layer as the main screens, so `h`,
     // `c` and `C` work here too — and a scheme picked here is the one the file
     // opens with.
@@ -2041,8 +2123,17 @@ pub fn pick_mru(
         } else {
             None
         };
+        // Pull in whatever the scan thread produced since the last frame.
+        let scanning = match scan.as_mut() {
+            Some(sc) => {
+                let hits = sc.drain();
+                merge_hits(&mut choices, hits);
+                sc.running.then_some(sc.found)
+            }
+            None => None,
+        };
         terminal.draw(|f| {
-            render_picker(f, entries, idx, query, &ov.theme);
+            render_picker(f, &choices, idx, query, scanning, &ov.theme);
             ov.render(f, HelpCtx::Picker);
         })?;
         if !event::poll(TICK)? {
@@ -2058,7 +2149,7 @@ pub fn pick_mru(
             }
             match m.kind {
                 MouseEventKind::ScrollDown => {
-                    if idx + 1 < entries.len() {
+                    if idx + 1 < choices.len() {
                         idx += 1;
                     }
                 }
@@ -2066,8 +2157,8 @@ pub fn pick_mru(
                 MouseEventKind::Down(_) => {
                     // The list starts one row below the block's top border.
                     let clicked = (m.row as usize).saturating_sub(1);
-                    if clicked < entries.len() {
-                        return Ok(Some(entries[clicked].path.clone()));
+                    if clicked < choices.len() {
+                        return Ok(Some(choices[clicked].path.clone()));
                     }
                 }
                 _ => {}
@@ -2088,7 +2179,7 @@ pub fn pick_mru(
                     }
                     KeyCode::Enter => {
                         searching = false;
-                        if let Some(i) = picker_find(entries, idx, true, &search) {
+                        if let Some(i) = picker_find(&choices, idx, true, &search) {
                             idx = i;
                         }
                     }
@@ -2117,31 +2208,40 @@ pub fn pick_mru(
             }
             pending_g = false;
             match key.code {
-                KeyCode::Char('q') | KeyCode::Esc => return Ok(None),
+                KeyCode::Char('q') | KeyCode::Esc => {
+                    if let Some(sc) = &scan {
+                        sc.cancel();
+                    }
+                    return Ok(None);
+                }
                 KeyCode::Char('/') => {
                     searching = true;
                     search.clear();
                 }
                 KeyCode::Char('n') => {
-                    if let Some(i) = picker_find(entries, idx, true, &search) {
+                    if let Some(i) = picker_find(&choices, idx, true, &search) {
                         idx = i;
                     }
                 }
                 KeyCode::Char('N') => {
-                    if let Some(i) = picker_find(entries, idx, false, &search) {
+                    if let Some(i) = picker_find(&choices, idx, false, &search) {
                         idx = i;
                     }
                 }
-                KeyCode::Char('G') => idx = entries.len().saturating_sub(1),
+                KeyCode::Char('G') => idx = choices.len().saturating_sub(1),
                 KeyCode::Up | KeyCode::Char('k') => idx = idx.saturating_sub(1),
                 KeyCode::Down | KeyCode::Char('j') => {
-                    if idx + 1 < entries.len() {
+                    if idx + 1 < choices.len() {
                         idx += 1;
                     }
                 }
                 KeyCode::Enter => {
-                    if let Some(e) = entries.get(idx) {
-                        return Ok(Some(e.path.clone()));
+                    if let Some(c) = choices.get(idx) {
+                        // Nothing more to walk once a file is chosen.
+                        if let Some(sc) = &scan {
+                            sc.cancel();
+                        }
+                        return Ok(Some(c.path.clone()));
                     }
                 }
                 _ => {}
@@ -2150,87 +2250,128 @@ pub fn pick_mru(
     }
 }
 
-/// Find the next/previous MRU entry whose filename contains `q`.
-fn picker_find(entries: &[Entry], from: usize, forward: bool, q: &str) -> Option<usize> {
+/// Find the next/previous picker row whose path contains `q` (the whole path, so
+/// a scan hit can be found by its directory as well as its name).
+fn picker_find(choices: &[Choice], from: usize, forward: bool, q: &str) -> Option<usize> {
     if q.is_empty() {
         return None;
     }
     let ql = q.to_lowercase();
-    find_next(entries.len(), from, forward, |i| {
-        entries[i]
+    find_next(choices.len(), from, forward, |i| {
+        choices[i]
             .path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .map(|n| n.to_lowercase().contains(&ql))
+            .to_str()
+            .map(|p| p.to_lowercase().contains(&ql))
             .unwrap_or(false)
     })
 }
 
-fn render_picker(f: &mut Frame, entries: &[Entry], idx: usize, query: Option<&str>, t: &Theme) {
+fn render_picker(
+    f: &mut Frame,
+    choices: &[Choice],
+    idx: usize,
+    query: Option<&str>,
+    scanning: Option<usize>,
+    t: &Theme,
+) {
     let outer = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(f.area());
 
-    if entries.is_empty() {
-        let p = Paragraph::new(vec![
-            Line::from(""),
-            Line::from("  No recent files."),
-            Line::from(""),
-            Line::from(Span::styled(
-                "  Open one with:  zdbview <file>",
-                Style::default().fg(t.dim),
-            )),
-        ])
-        .block(
+    if choices.is_empty() {
+        let body = match scanning {
+            Some(_) => vec![
+                Line::from(""),
+                Line::from("  Scanning for databases and rkyv shards…"),
+            ],
+            None => vec![
+                Line::from(""),
+                Line::from("  Nothing found."),
+                Line::from(""),
+                Line::from(Span::styled(
+                    "  Open one with:  zdbview <file>",
+                    Style::default().fg(t.dim),
+                )),
+                Line::from(Span::styled(
+                    "  Or scan elsewhere:  zdbview --scan <dir>",
+                    Style::default().fg(t.dim),
+                )),
+            ],
+        };
+        let p = Paragraph::new(body).block(
             Block::default()
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(t.accent))
-                .title(" zdbview — recent "),
+                .title(" zdbview — files "),
         );
         f.render_widget(p, outer[0]);
     } else {
-        let items: Vec<ListItem> = entries
+        let items: Vec<ListItem> = choices
             .iter()
-            .map(|e| {
-                let name = e.path.file_name().and_then(|n| n.to_str()).unwrap_or("?");
-                let dir = e.path.parent().and_then(|p| p.to_str()).unwrap_or("");
-                let (badge, color) = match e.kind {
+            .map(|c| {
+                let dir = c.path.parent().and_then(|p| p.to_str()).unwrap_or("");
+                let (badge, color) = match c.kind {
                     Kind::Sqlite => ("sqlite", t.primary),
                     Kind::Rkyv => ("rkyv  ", t.alt),
+                };
+                // Recent files show their age; scanned ones show a marker, so it
+                // is obvious which rows came from where.
+                let (age, age_style) = match (c.opened, c.size) {
+                    (Some(when), _) => (mru::rel_age(when), Style::default().fg(t.dim)),
+                    (None, Some(size)) => (human_size(size), Style::default().fg(t.label)),
+                    (None, None) => ("found".to_string(), Style::default().fg(t.label)),
                 };
                 ListItem::new(Line::from(vec![
                     Span::styled(format!(" {} ", badge), Style::default().fg(color)),
                     Span::styled(
-                        format!("{:<28}", truncate(name, 28)),
+                        format!("{:<28}", truncate(c.name(), 28)),
                         Style::default().fg(t.accent).add_modifier(Modifier::BOLD),
                     ),
-                    Span::styled(
-                        format!("{:>10}  ", mru::rel_age(e.opened)),
-                        Style::default().fg(t.dim),
-                    ),
-                    Span::styled(truncate(dir, 60), Style::default().fg(t.label)),
+                    Span::styled(format!("{:>10}  ", age), age_style),
+                    Span::styled(truncate(dir, 52), Style::default().fg(t.label)),
                 ]))
             })
             .collect();
         let mut st = ListState::default();
-        st.select(Some(idx.min(entries.len().saturating_sub(1))));
+        st.select(Some(idx.min(choices.len().saturating_sub(1))));
+        let recent = choices.iter().filter(|c| c.opened.is_some()).count();
+        let title = match scanning {
+            Some(found) => format!(
+                " zdbview — {} files ({} recent, scanning… {} found) ",
+                choices.len(),
+                recent,
+                found
+            ),
+            None => format!(" zdbview — {} files ({} recent) ", choices.len(), recent),
+        };
         let list = List::new(items)
             .block(
                 Block::default()
                     .borders(Borders::ALL)
                     .border_style(Style::default().fg(t.accent))
-                    .title(format!(" zdbview — recent files ({}) ", entries.len())),
+                    .title(title),
             )
             .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
         f.render_stateful_widget(list, outer[0], &mut st);
     }
 
+    // Bottom line: the search prompt, else the selected row's format / size.
     let help = match query {
         Some(q) => {
             Paragraph::new(format!("/{}_", q)).style(Style::default().fg(Color::Black).bg(t.accent))
         }
-        None => Paragraph::new(
-            "j/k move · / search · n/N next/prev · Enter open · c scheme · h help · q quit",
-        )
-        .style(Style::default().fg(Color::Black).bg(t.help_key)),
+        None => {
+            let detail = choices
+                .get(idx)
+                .and_then(|c| c.format)
+                .map(|fmt| format!("  ·  {}", fmt))
+                .unwrap_or_default();
+            // Kept short so the selected row's format still fits beside it on a
+            // narrow terminal; `h` lists the rest.
+            Paragraph::new(format!(
+                "j/k move · / search · Enter open · c scheme · h help · q quit{}",
+                detail
+            ))
+            .style(Style::default().fg(Color::Black).bg(t.help_key))
+        }
     };
     f.render_widget(help, outer[1]);
 }
@@ -2429,6 +2570,24 @@ fn disasm_lines(_bytes: &[u8], _scroll: usize, _height: usize) -> Vec<Line<'stat
 }
 
 /// Truncate a display string to `max` chars, appending an ellipsis.
+/// Byte count in the largest unit that keeps it under four digits.
+fn human_size(n: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "K", "M", "G", "T"];
+    let mut size = n as f64;
+    let mut unit = 0;
+    while size >= 1024.0 && unit + 1 < UNITS.len() {
+        size /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{} {}", n, UNITS[0])
+    } else if size < 10.0 {
+        format!("{:.1} {}", size, UNITS[unit])
+    } else {
+        format!("{:.0} {}", size, UNITS[unit])
+    }
+}
+
 /// Sort-direction marker for a column header.
 fn arrow(desc: bool) -> &'static str {
     if desc {
@@ -2465,9 +2624,11 @@ mod tests {
     use super::{
         find_bytes, find_next, hit, input_delete_word, input_left, input_right, App, Store,
     };
+    use crate::mru::Entry;
     use crate::overlay::HelpCtx;
     use crate::rkyv_inspect::RkyvStore;
     use crate::sqlite::SqliteStore;
+    use crate::store::Kind;
     use crate::theme::ThemeName;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::backend::TestBackend;
@@ -2707,6 +2868,140 @@ mod tests {
         // 'c' set the high nibble of 'o' (0x6f), keeping the low one.
         assert_eq!(app.hex.as_ref().unwrap().bytes[0], 0xcf);
         let _ = std::fs::remove_file(&path);
+    }
+
+    fn scan_hit(
+        path: &str,
+        kind: Kind,
+        format: Option<&'static str>,
+        secs: u64,
+        rank: u8,
+    ) -> crate::scan::Hit {
+        crate::scan::Hit {
+            path: path.into(),
+            kind,
+            format,
+            size: 1024,
+            modified: std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs),
+            rank,
+        }
+    }
+
+    /// Scan hits are ordered by what the tool is for: recognized shards, then
+    /// other rkyv archives, then databases — newest first within each group.
+    #[test]
+    fn scan_hits_are_ranked_before_being_shown() {
+        let mut choices: Vec<super::Choice> = Vec::new();
+        super::merge_hits(
+            &mut choices,
+            vec![
+                scan_hit("/h/.zshrs/compsys.db", Kind::Sqlite, None, 300, 2),
+                scan_hit("/h/.zshrs/images/a.rkyv", Kind::Rkyv, None, 100, 1),
+                scan_hit(
+                    "/h/.zshrs/scripts.rkyv",
+                    Kind::Rkyv,
+                    Some("zshrs script cache (ZRSC)"),
+                    50,
+                    0,
+                ),
+                scan_hit("/h/.zshrs/index.rkyv", Kind::Rkyv, None, 200, 1),
+            ],
+        );
+        let order: Vec<&str> = choices.iter().map(|c| c.name()).collect();
+        assert_eq!(
+            order,
+            vec!["scripts.rkyv", "index.rkyv", "a.rkyv", "compsys.db"],
+            "recognized shard first, then rkyv newest-first, then databases"
+        );
+    }
+
+    /// A recent file the scan also finds must not appear twice, and must keep its
+    /// recency position and age column.
+    #[test]
+    fn scan_hits_do_not_duplicate_recent_files() {
+        let path = scratch("db");
+        std::fs::write(&path, b"x").unwrap();
+        let entry = Entry {
+            path: path.clone(),
+            kind: Kind::Sqlite,
+            opened: std::time::SystemTime::now(),
+        };
+        let mut choices: Vec<super::Choice> = vec![super::Choice::from_entry(&entry)];
+        super::merge_hits(
+            &mut choices,
+            vec![
+                crate::scan::Hit {
+                    path: path.clone(),
+                    kind: Kind::Sqlite,
+                    format: None,
+                    size: 1,
+                    modified: std::time::SystemTime::now(),
+                    rank: 2,
+                },
+                scan_hit("/h/other.db", Kind::Sqlite, None, 10, 2),
+            ],
+        );
+        assert_eq!(choices.len(), 2, "the duplicate must be dropped");
+        assert_eq!(choices[0].path, path);
+        assert!(choices[0].opened.is_some(), "still a recent file");
+        assert!(choices[1].path.ends_with("other.db"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The picker shows scan progress, the recent/scanned split, and the
+    /// recognized format of the selected row.
+    #[test]
+    fn picker_shows_scan_progress_and_row_details() {
+        let theme = crate::theme::Theme::from_name(ThemeName::NeonSprawl);
+        let mut choices: Vec<super::Choice> = Vec::new();
+        super::merge_hits(
+            &mut choices,
+            vec![scan_hit(
+                "/h/.zshrs/scripts.rkyv",
+                Kind::Rkyv,
+                Some("zshrs script cache (ZRSC)"),
+                50,
+                0,
+            )],
+        );
+        let render = |choices: &[super::Choice], scanning: Option<usize>| -> Vec<String> {
+            let mut term = Terminal::new(TestBackend::new(100, 8)).unwrap();
+            term.draw(|f| super::render_picker(f, choices, 0, None, scanning, &theme))
+                .unwrap();
+            let buf = term.backend().buffer().clone();
+            (0..buf.area().height)
+                .map(|y| {
+                    (0..buf.area().width)
+                        .map(|x| buf[(x, y)].symbol())
+                        .collect::<String>()
+                })
+                .collect()
+        };
+
+        let rows = render(&choices, Some(1));
+        assert!(
+            contains(&rows, "scanning… 1 found"),
+            "no progress in the title"
+        );
+        assert!(contains(&rows, "1 files (0 recent)") || contains(&rows, "1 files"));
+        assert!(contains(&rows, "scripts.rkyv"));
+        assert!(contains(&rows, "1.0 K"), "size column for a scanned row");
+        assert!(
+            contains(&rows, "zshrs script cache (ZRSC)"),
+            "selected row's format on the bottom line"
+        );
+
+        // Once the scan is done the progress text goes away.
+        let rows = render(&choices, None);
+        assert!(!contains(&rows, "scanning"));
+
+        // With nothing found at all, the empty state explains what to do.
+        let rows = render(&[], None);
+        assert!(contains(&rows, "Nothing found."));
+        assert!(contains(&rows, "--scan"));
+        // While still scanning, it says so instead.
+        let rows = render(&[], Some(0));
+        assert!(contains(&rows, "Scanning for databases"));
     }
 
     /// Help lists the section for what is on screen.

@@ -75,18 +75,52 @@ covers the glibc targets; the static musl tarballs — for Alpine, distroless an
 other non-glibc hosts — are attached to the same GitHub release, with their
 sha256 sums listed at the bottom of the formula.
 
-## Recent files (no args)
+## No args — recent files plus a scan
 
-Every opened file is recorded to `$XDG_CACHE_HOME/zdbview/recent` (or
-`~/.cache/zdbview/recent`), most-recent-first. Running `zdbview` with no argument
-shows that list as a picker — `j`/`k` to move, `Enter` to open, `q` to quit. The
-overlay keys work here too: `h` help, `c` scheme chooser, `C` palette editor, and
-a scheme picked here is the one the opened file uses.
+Running `zdbview` with no argument opens a picker of everything it can open:
+recently used files first, then whatever a **background scan** finds, so a shard
+does not have to be located by hand.
 
-Paths are canonicalized, so the same file reached through different relative
-paths or symlinks dedupes to one entry that moves back to the front on re-open.
-The list is capped at 50 entries and written via temp-file-plus-rename, so a
-concurrent reader never sees a half-written list.
+```
+┌ zdbview — 127 files (3 recent, scanning… 127 found) ─────────────────────────┐
+│ rkyv   scripts.rkyv                     608 B  /Users/me/.awkrs             │
+│ rkyv   scripts.rkyv                     760 B  /Users/me/.zshrs             │
+│ rkyv   scripts.compat.rkyv              1.3 K  /Users/me/.stryke            │
+│ sqlite compsys.db                        187 M  /Users/me/.zshrs            │
+└──────────────────────────────────────────────────────────────────────────────┘
+j/k move · / search · Enter open · c scheme · h help · q quit  ·  awkrs script cache (AWKR)
+```
+
+The scan runs on its own thread, so the picker is usable immediately and fills in
+as results arrive; the title counts what has been found and `/` searches the whole
+path, not just the file name. Recent rows show their age, scanned rows their size,
+and the bottom line names the recognized format of the selected row.
+
+**Where it looks** — the producers keep their stores in their own home directory
+(`~/.zshrs/scripts.rkyv`, `~/.zshrs/compsys.db`, `~/.pythonrs/scripts.rkyv`), so
+the default roots are the dot-directories of `$HOME` (most-recently-touched
+first), the XDG cache and data directories, the working directory, and `$HOME`'s
+own files. `~/Library`, VCS and package-manager caches, and Chromium profile
+stores are skipped — that is what keeps the list about your data. The walk is
+bounded (5 levels, 60k entries, 500 hits, 20 s) and stops as soon as you pick.
+
+**What counts as a hit** — the SQLite header magic, or one of the rkyv shard
+magics, or a `.rkyv` name (the header-less hash-keyed shards carry no magic).
+Nothing else is offered, and files are only read when their extension makes them a
+candidate. Ordering puts recognized shards first, then other rkyv archives, then
+databases, newest-first within each group.
+
+```sh
+zdbview --scan ~/Library --scan /srv   # scan these instead of the defaults
+zdbview --no-scan                      # recent files only
+```
+
+Recent files are recorded in `$XDG_CACHE_HOME/zdbview/recent` (or
+`~/.cache/zdbview/recent`), most-recent-first. Paths are canonicalized, so the
+same file reached through different relative paths or symlinks dedupes to one
+entry that moves back to the front on re-open; the list is capped at 50 entries
+and written via temp-file-plus-rename, so a concurrent reader never sees a
+half-written list. A recent file the scan also finds stays a recent row.
 
 ## SQLite — full generic CRUD
 

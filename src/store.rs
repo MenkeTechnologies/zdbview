@@ -14,6 +14,12 @@ pub enum Kind {
 /// The SQLite file header magic (first 16 bytes of every SQLite database).
 const SQLITE_MAGIC: &[u8] = b"SQLite format 3\0";
 
+/// Whether `head` starts with the SQLite header magic. The scanner uses this so
+/// there is one definition of "is a SQLite file" in the crate.
+pub fn is_sqlite_header(head: &[u8]) -> bool {
+    head.len() >= SQLITE_MAGIC.len() && &head[..SQLITE_MAGIC.len()] == SQLITE_MAGIC
+}
+
 /// Decide how to open `path`. Explicit `--sqlite`/`--rkyv` win; otherwise the
 /// SQLite header magic is authoritative — its presence means SQLite, its
 /// absence in a readable header means NOT SQLite (extension is ignored, because
@@ -33,7 +39,7 @@ pub fn detect(path: &Path, force_sqlite: bool, force_rkyv: bool) -> Result<Kind>
 
     if n >= SQLITE_MAGIC.len() {
         // Full header available: magic is the sole authority.
-        return Ok(if &buf[..SQLITE_MAGIC.len()] == SQLITE_MAGIC {
+        return Ok(if is_sqlite_header(&buf) {
             Kind::Sqlite
         } else {
             Kind::Rkyv

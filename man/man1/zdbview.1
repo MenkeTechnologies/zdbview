@@ -30,7 +30,10 @@ hex/ascii dump).
 .PP
 Invoked with no
 .IR FILE ,
-zdbview shows a picker of recently opened files.
+zdbview shows a picker of recently opened files followed by the results of a
+background scan for databases and rkyv shards \(em see
+.B STARTUP SCAN
+below.
 .SH OPTIONS
 .TP
 .B \-\-sqlite
@@ -72,6 +75,16 @@ An unknown name is an error listing where to find the valid ones.
 Print every built-in color scheme \(em token, display name and a swatch of its
 six palette colors \(em then exit. Requires a 256-color terminal to show the
 swatches.
+.TP
+.BI \-\-scan " DIR"
+Scan
+.I DIR
+for openable files when no
+.I FILE
+was given, instead of the default roots. Repeatable.
+.TP
+.B \-\-no\-scan
+Skip the startup scan; list only recently opened files.
 .TP
 .B \-h ", " \-\-help
 Print usage and exit.
@@ -392,6 +405,38 @@ and the readline chords
 Leave the current screen or quit. On the detail, schema, or help screen, return
 to the main view. Inside a modal (edit, SQL, search, confirm), Esc cancels the
 modal only.
+.SH STARTUP SCAN
+With no
+.I FILE
+argument the picker is filled from two sources: the recent-files list, and a scan
+that runs on a background thread so the picker is usable immediately and fills in
+as results arrive.
+.PP
+The default roots are the dot-directories of
+.BR $HOME ,
+most-recently-modified first \(em the producers keep their stores in their own
+home directory, as in
+.IR ~/.zshrs/scripts.rkyv " and " ~/.zshrs/compsys.db
+\(em followed by
+.BR $XDG_CACHE_HOME , $XDG_DATA_HOME ,
+the working directory, and the files directly in
+.BR $HOME .
+Version-control, package-manager and toolchain caches, Chromium profile stores,
+and
+.I ~/Library
+are skipped; pass
+.B \-\-scan
+to look there anyway. The walk descends at most five levels and stops after
+60000 directory entries, 500 hits or 20 seconds, whichever comes first, and is
+cancelled as soon as a file is chosen.
+.PP
+A file is offered only when its contents say so: the SQLite header magic, a known
+rkyv shard magic, or a
+.B .rkyv
+name (the header-less hash-keyed shards carry no magic). Files are read only when
+their extension makes them a candidate. Recognized shards are listed first, then
+other rkyv archives, then databases, newest-first within each group; a file that
+is already in the recent list is not repeated.
 .SH RECENT FILES
 Every successful open is recorded, most-recent-first, deduplicated by absolute
 path and capped at 50 entries. The list is written atomically (temp file plus
