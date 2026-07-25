@@ -31,12 +31,14 @@ use crate::store::Kind;
 /// the working directory: deep enough for `~/.zshrs/pkg/<plugin>/cache`.
 pub const DEEP: usize = 5;
 /// Give up after this long, so no filesystem can keep the scan running forever.
+/// This is the limit that is meant to bind, since it is the one the user feels.
 const TIME_BUDGET: Duration = Duration::from_secs(20);
-/// Stop after examining this many directory entries, so a scan can never run
-/// away on a huge tree.
-const MAX_ENTRIES: usize = 60_000;
-/// Stop after this many hits — well past a usable picker length.
-const MAX_HITS: usize = 500;
+/// Backstop for a pathological tree, well above what [`TIME_BUDGET`] allows on
+/// any normal filesystem (a warm macOS home walks ~90k entries per second, so
+/// the clock runs out first). It used to be 60k, which a single machine's
+/// dot-directories exhausted in 0.6 s — the walk then stopped with 19 s of its
+/// budget unspent and never reached the later roots at all.
+const MAX_ENTRIES: usize = 1_000_000;
 /// How much of a file is read when looking for a magic.
 const SNIFF: usize = 64 * 1024;
 /// Files larger than this are only sniffed at their head and tail.
@@ -57,7 +59,11 @@ const SKIP_DIRS: &[&str] = &[
     ".pyenv",
     ".nvm",
     ".rbenv",
-    // Application data, not cache stores; reachable with --scan when wanted.
+    // Not walked as part of a wider tree: `~/Library` is thousands of
+    // application-private files, and `Applications` is program code. The one
+    // part of `~/Library` that holds databases a user cares about is
+    // `Application Support`, which `default_roots` names explicitly — a root is
+    // never matched against this list, only the directories below it.
     "Library",
     "Applications",
     // Chromium/Electron profile stores: hundreds of SQLite files that are the
@@ -309,9 +315,15 @@ pub fn clear_cache() {
 /// directory — `~/.zshrs/scripts.rkyv`, `~/.zshrs/compsys.db` and so on — so the
 /// dot-directories of `$HOME` are the primary roots, most-recently-touched
 /// first, followed by the XDG cache/data directories and the working directory.
-/// `$HOME` itself contributes its own files but is not descended into, and
-/// `~/Library` is left out (thousands of application-private databases); reach
-/// those with `--scan`.
+/// `$HOME` itself contributes its own files but is not descended into.
+///
+/// `~/Library/Application Support` comes last. It is where every macOS
+/// application keeps its databases — Ableton's `Live Database`, a browser
+/// profile, a DAW's plugin index — so leaving it out meant the picker could not
+/// offer the databases most worth opening on a Mac. It is walked last because it
+/// is by far the largest root (~230k entries on a working machine), and only
+/// this one subdirectory of `~/Library` is walked; the rest (`Caches`,
+/// `Containers`, `Preferences`, …) still needs `--scan`.
 pub fn default_roots() -> Vec<Root> {
     let home = std::env::var_os("HOME").map(PathBuf::from);
     let mut roots: Vec<Root> = Vec::new();
@@ -351,9 +363,13 @@ pub fn default_roots() -> Vec<Root> {
     if let Ok(cwd) = std::env::current_dir() {
         roots.push(Root::new(cwd, DEEP));
     }
-    // `$HOME` last, files only: a stray `~/foo.db` counts, the whole home tree
-    // does not.
-    roots.extend(home.map(|h| Root::new(h, 0)));
+    // `$HOME` files only: a stray `~/foo.db` counts, the whole home tree does
+    // not. It is one `read_dir`, so it goes before the expensive root below and
+    // can never be starved by it.
+    roots.extend(home.as_ref().map(|h| Root::new(h.clone(), 0)));
+    // Where macOS applications keep their databases. Last, being the largest.
+    // On Linux the path does not exist and the `is_dir` filter below drops it.
+    roots.extend(home.map(|h| Root::new(h.join("Library/Application Support"), DEEP)));
 
     roots.retain(|r| r.path.is_dir());
     // Drop roots already covered by an earlier (equal-or-deeper) one.
@@ -378,7 +394,6 @@ pub fn spawn(roots: Vec<Root>) -> Scan {
     std::thread::spawn(move || {
         let mut budget = Budget {
             examined: 0,
-            hits: 0,
             deadline: Instant::now() + TIME_BUDGET,
         };
         for root in roots {
@@ -397,16 +412,18 @@ pub fn spawn(roots: Vec<Root>) -> Scan {
 
 use std::ops::ControlFlow;
 
-/// The limits that stop a walk: entries seen, hits produced, wall clock.
+/// The limits that stop a walk: entries seen and wall clock. Both measure what
+/// the walk *costs*. The number of hits is deliberately not a limit: a hit is a
+/// path the user asked to be shown, and stopping on them truncated the walk
+/// mid-root, so the roots after it were never looked at at all.
 struct Budget {
     examined: usize,
-    hits: usize,
     deadline: Instant,
 }
 
 impl Budget {
     fn spent(&self) -> bool {
-        self.examined > MAX_ENTRIES || self.hits >= MAX_HITS || Instant::now() > self.deadline
+        self.examined > MAX_ENTRIES || Instant::now() > self.deadline
     }
 }
 
@@ -452,7 +469,6 @@ fn walk(
                     // The picker closed.
                     return ControlFlow::Break(());
                 }
-                budget.hits += 1;
             }
         }
     }
@@ -827,5 +843,53 @@ mod tests {
         assert_eq!(hits.len(), 1, "got {hits:?}");
         assert!(hits[0].path.ends_with("top.db"));
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `~/Library/Application Support` is where a macOS application keeps its
+    /// database — Ableton's `Live Database` being the case that exposed its
+    /// absence — so it must be a default root, and it must be the last one so
+    /// the cheap roots are never starved by the largest.
+    #[test]
+    fn application_support_is_the_last_default_root() {
+        let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+            return;
+        };
+        let want = home.join("Library/Application Support");
+        if !want.is_dir() {
+            return; // Not macOS.
+        }
+        let roots = default_roots();
+        let want = want.canonicalize().unwrap_or(want);
+        assert_eq!(
+            roots.last().map(|r| (r.path.clone(), r.depth)),
+            Some((want, DEEP)),
+            "roots: {:?}",
+            roots.iter().map(|r| &r.path).collect::<Vec<_>>()
+        );
+    }
+
+    /// A hit is not a cost, so producing one must never stop the walk: a cap on
+    /// hits used to cut the walk mid-root and lose every root after it.
+    #[test]
+    fn hits_do_not_exhaust_the_budget() {
+        let root = tmpdir("many_hits");
+        for i in 0..600 {
+            write(&root.join(format!("f{i}.db")), &sqlite_bytes());
+        }
+        assert_eq!(collect(&root).len(), 600);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The clock is the limit meant to bind; the entry cap is only a backstop
+    /// for a pathological tree, so it must sit far above one machine's home.
+    #[test]
+    fn the_entry_cap_is_a_backstop_not_the_binding_limit() {
+        // A constant, so this holds at build time rather than at test time.
+        const {
+            assert!(
+                MAX_ENTRIES >= 500_000,
+                "an entry cap this low stops the walk long before TIME_BUDGET"
+            )
+        };
     }
 }
