@@ -36,7 +36,7 @@ treated as binary), falling back to the extension only for files too short to
 carry a header.
 
 ```
-zdbview                        # no args → pick from recently opened files
+zdbview                        # no args → recent files + a scan (cached)
 zdbview path/to/file.db        # SQLite → full CRUD
 zdbview path/to/archive.rkyv   # rkyv   → full CRUD if recognized, else structural
 zdbview --sqlite file          # force SQLite
@@ -96,6 +96,15 @@ as results arrive; the title counts what has been found and `/` searches the who
 path, not just the file name. Recent rows show their age, scanned rows their size,
 and the bottom line names the recognized format of the selected row.
 
+**The walk does not repeat on every start.** A completed scan is saved to
+`$XDG_CACHE_HOME/zdbview/scan` (or `~/.cache/zdbview/scan`) and reused for 24
+hours, so later starts show the list immediately — measured here, 127 hits take
+~550 ms to walk and ~0.4 ms to load back from the 12 KB cache. The title says how
+old the saved list is (`scan 3h old · r rescans`); `r` walks again, `R` walks again
+after discarding the saved list, and `--rescan` does the same from the command
+line. Entries whose file has since disappeared are dropped on load, and `--scan`
+roots neither read nor write the cache since they are not the default set.
+
 **Where it looks** — the producers keep their stores in their own home directory
 (`~/.zshrs/scripts.rkyv`, `~/.zshrs/compsys.db`, `~/.pythonrs/scripts.rkyv`), so
 the default roots are the dot-directories of `$HOME` (most-recently-touched
@@ -113,6 +122,7 @@ databases, newest-first within each group.
 ```sh
 zdbview --scan ~/Library --scan /srv   # scan these instead of the defaults
 zdbview --no-scan                      # recent files only
+zdbview --rescan                       # ignore the saved scan and walk now
 ```
 
 Recent files are recorded in `$XDG_CACHE_HOME/zdbview/recent` (or
@@ -226,6 +236,7 @@ is published on crates.io); disable with `--no-default-features`.
 | `v` | cycle value render (auto / hex / text / disasm) — detail screen |
 | `y` | copy cell / value / key to clipboard (OSC 52) |
 | `x` | export table (CSV) / records (JSON) to a file |
+| `o` | back to the file list (open another file) |
 | `c` | color-scheme chooser |
 | `C` | palette editor |
 | `h` / `?` | help overlay |

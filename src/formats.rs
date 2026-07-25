@@ -228,6 +228,12 @@ pub fn magic_in(bytes: &[u8]) -> Option<&'static str> {
         .map(|(_, n)| *n)
 }
 
+/// The known format whose display name is `name`, so a cached scan result can be
+/// restored to the same `&'static str` it was saved from.
+pub fn magic_label(name: &str) -> Option<&'static str> {
+    MAGICS.iter().find(|(_, n)| *n == name).map(|(_, n)| *n)
+}
+
 /// Detect the archive format and decode it to key/value records. Magic-bearing
 /// formats are matched by their header magic; the header-less hash-keyed shards
 /// are attempted last, gated by rkyv validation. `None` → structural fallback.

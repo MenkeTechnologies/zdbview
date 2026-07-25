@@ -86,6 +86,9 @@ was given, instead of the default roots. Repeatable.
 .B \-\-no\-scan
 Skip the startup scan; list only recently opened files.
 .TP
+.B \-\-rescan
+Walk the filesystem now, ignoring the saved scan.
+.TP
 .B \-h ", " \-\-help
 Print usage and exit.
 .TP
@@ -369,6 +372,12 @@ rather than
 which edits data on every other screen. See also
 .BR \-\-list\-themes " and " \-\-theme .
 .TP
+.B o
+Leave the open file and return to the picker, to open another one. In the hex
+editor
+.B o
+inserts a byte instead.
+.TP
 .BR h ", " ?
 Show the key help overlay: a themed box listing every binding in three columns,
 with the section matching what is open \(em SQLite, rkyv, or the recent-files
@@ -437,12 +446,32 @@ name (the header-less hash-keyed shards carry no magic). Files are read only whe
 their extension makes them a candidate. Recognized shards are listed first, then
 other rkyv archives, then databases, newest-first within each group; a file that
 is already in the recent list is not repeated.
+.PP
+A completed walk is saved to
+.I $XDG_CACHE_HOME/zdbview/scan
+and reused for 24 hours, so a later start lists the files without walking again.
+The picker's title gives the saved list's age;
+.B r
+walks again,
+.B R
+walks again after discarding the saved list, and
+.B \-\-rescan
+does the same at startup. Entries whose file has disappeared are dropped when the
+list is loaded. Roots given with
+.B \-\-scan
+neither read nor write the saved scan, being a different set from the default
+roots.
 .SH RECENT FILES
 Every successful open is recorded, most-recent-first, deduplicated by absolute
 path and capped at 50 entries. The list is written atomically (temp file plus
 rename) so a concurrent reader never sees a partial list. Entries whose file no
 longer exists are filtered out of the picker.
 .SH FILES
+.TP
+.I $XDG_CACHE_HOME/zdbview/scan
+The saved startup scan: a header line with a format version and the time of the
+walk, then one tab-separated record per file (kind, rank, size, mtime, format,
+path). Reused for 24 hours, rewritten whenever a walk completes.
 .TP
 .I $XDG_CACHE_HOME/zdbview/recent
 The recent-files list. Falls back to

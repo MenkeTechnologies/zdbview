@@ -40,39 +40,169 @@ use std::path::PathBuf;
 
 use store::Store;
 
+/// Help layout, ported from temprs (`tp --help`): banner, coloured usage line,
+/// grouped options, then a footer of keys, examples and files.
+const HELP_TEMPLATE: &str = "
+{before-help}
+{about}
+
+\x1b[33m  USAGE:\x1b[0m {usage}
+
+{all-args}
+{after-help}";
+
+/// Inner width of the banner's status box.
+const BOX_W: usize = 54;
+
+/// The `zdbview` block letters plus a status box, built at runtime so the box
+/// stays square whatever the version string's length is.
+fn banner() -> String {
+    const ART: &str = concat!(
+        "\x1b[36m ███████╗██████╗ ██████╗ ██╗   ██╗██╗███████╗██╗    ██╗\x1b[0m\n",
+        "\x1b[36m ╚══███╔╝██╔══██╗██╔══██╗██║   ██║██║██╔════╝██║    ██║\x1b[0m\n",
+        "\x1b[35m   ███╔╝ ██║  ██║██████╔╝██║   ██║██║█████╗  ██║ █╗ ██║\x1b[0m\n",
+        "\x1b[35m  ███╔╝  ██║  ██║██╔══██╗╚██╗ ██╔╝██║██╔══╝  ██║███╗██║\x1b[0m\n",
+        "\x1b[31m ███████╗██████╔╝██████╔╝ ╚████╔╝ ██║███████╗╚███╔███╔╝\x1b[0m\n",
+        "\x1b[31m ╚══════╝╚═════╝ ╚═════╝   ╚═══╝  ╚═╝╚══════╝ ╚══╝╚══╝\x1b[0m\n",
+    );
+    let status = format!(
+        " rkyv + sqlite  //  magic detection  //  v{}",
+        env!("CARGO_PKG_VERSION")
+    );
+    let rule = "─".repeat(BOX_W);
+    format!(
+        "{ART}\x1b[36m ┌{rule}┐\x1b[0m\n\
+         \x1b[36m │\x1b[0m{status:<BOX_W$}\x1b[36m│\x1b[0m\n\
+         \x1b[36m └{rule}┘\x1b[0m\n\
+         \x1b[35m  >> BOTH HALVES OF THE CACHE // ONE BINARY <<\x1b[0m"
+    )
+}
+
+const AFTER_HELP: &str = concat!(
+    "\x1b[36m  ── KEYS ───────────────────────────────────────────────\x1b[0m\n",
+    "\x1b[32m  //\x1b[0m j/k ←/→ move   Tab focus   Enter detail   / search (n/N)\n",
+    "\x1b[32m  //\x1b[0m e a d : edit/add/delete/SQL   s sort   S schema  (SQLite)\n",
+    "\x1b[32m  //\x1b[0m 0 1 2 3 views   a e r d record CRUD   e hex editor  (rkyv)\n",
+    "\x1b[32m  //\x1b[0m v value render   y copy (OSC 52)   x export to file\n",
+    "\x1b[32m  //\x1b[0m c scheme   C palette   o file list   h/? help   q quit\n",
+    "\n",
+    "\x1b[36m  ── EXAMPLES ───────────────────────────────────────────\x1b[0m\n",
+    "\x1b[32m  //\x1b[0m zdbview                        \x1b[90mrecent files + saved scan\x1b[0m\n",
+    "\x1b[32m  //\x1b[0m zdbview ~/.zshrs/scripts.rkyv  \x1b[90mrecords, or structural\x1b[0m\n",
+    "\x1b[32m  //\x1b[0m zdbview data.db --export json  \x1b[90mdump every table\x1b[0m\n",
+    "\x1b[32m  //\x1b[0m zdbview --rescan               \x1b[90mwalk again now\x1b[0m\n",
+    "\x1b[32m  //\x1b[0m zdbview --list-themes          \x1b[90mpreview the schemes\x1b[0m\n",
+    "\n",
+    "\x1b[36m  ── FILES ──────────────────────────────────────────────\x1b[0m\n",
+    "\x1b[32m  //\x1b[0m $XDG_CACHE_HOME/zdbview/recent  \x1b[90mrecent-files list\x1b[0m\n",
+    "\x1b[32m  //\x1b[0m $XDG_CACHE_HOME/zdbview/scan    \x1b[90msaved scan results\x1b[0m\n",
+    "\x1b[32m  //\x1b[0m $XDG_CONFIG_HOME/zdbview/prefs  \x1b[90mscheme + palette\x1b[0m\n",
+    "\n",
+    "\x1b[36m  ── SYSTEM ─────────────────────────────────────────────\x1b[0m\n",
+    "\x1b[35m  v",
+    env!("CARGO_PKG_VERSION"),
+    " \x1b[0m// \x1b[33mratatui + crossterm // rkyv 0.7 // bundled sqlite\x1b[0m\n",
+    "\x1b[35m  The magic decides the backend, never the file name.\x1b[0m\n",
+    "\x1b[33m  >>> OPEN THE SHARD. EDIT THE BYTES. WRITE IT BACK. <<<\x1b[0m\n",
+    "\x1b[36m ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░\x1b[0m"
+);
+
+/// Option-group headings; clap appends the colon.
+const H_POSITIONAL: &str = "\x1b[36m  ── FILE\x1b[0m";
+const H_BACKEND: &str = "\x1b[36m  ── BACKEND\x1b[0m";
+const H_OUTPUT: &str = "\x1b[36m  ── OUTPUT\x1b[0m";
+const H_DISCOVERY: &str = "\x1b[36m  ── DISCOVERY\x1b[0m";
+const H_APPEARANCE: &str = "\x1b[36m  ── APPEARANCE\x1b[0m";
+const H_GENERAL: &str = "\x1b[36m  ── GENERAL\x1b[0m";
+
 #[derive(Parser)]
 #[command(
     name = "zdbview",
     version,
-    about = "Terminal inspector and CRUD editor for rkyv archives and SQLite databases"
+    about = "\x1b[0m  A terminal inspector and CRUD editor for rkyv archives and SQLite databases.",
+    help_template = HELP_TEMPLATE,
+    before_help = banner(),
+    after_help = AFTER_HELP,
+    disable_help_flag = true,
+    disable_version_flag = true
 )]
 struct Cli {
-    /// File to open. With no file, shows a picker of recent files plus the
-    /// results of a scan for databases and rkyv shards.
+    #[arg(
+        value_name = "FILE",
+        help_heading = H_POSITIONAL,
+        help = "\x1b[32m//\x1b[0m File to open; omit for the picker (recent + scan)"
+    )]
     file: Option<PathBuf>,
-    /// Force treating the file as a SQLite database
-    #[arg(long, conflicts_with = "rkyv")]
+    #[arg(
+        long,
+        conflicts_with = "rkyv",
+        help_heading = H_BACKEND,
+        help = "\x1b[32m//\x1b[0m Force the SQLite backend, skipping detection"
+    )]
     sqlite: bool,
-    /// Force treating the file as a rkyv archive
-    #[arg(long)]
+    #[arg(
+        long,
+        help_heading = H_BACKEND,
+        help = "\x1b[32m//\x1b[0m Force the rkyv/binary backend, skipping detection"
+    )]
     rkyv: bool,
-    /// Non-interactively dump the file's contents and exit (json | csv).
-    #[arg(long, value_name = "FORMAT")]
+    #[arg(
+        long,
+        value_name = "FORMAT",
+        help_heading = H_OUTPUT,
+        help = "\x1b[32m//\x1b[0m Dump contents to stdout and exit: json | csv"
+    )]
     export: Option<String>,
-    /// Color scheme for this run, by token (see --list-themes). Overrides the
-    /// saved preference without replacing it.
-    #[arg(long, value_name = "NAME")]
+    #[arg(
+        long,
+        value_name = "NAME",
+        help_heading = H_APPEARANCE,
+        help = "\x1b[32m//\x1b[0m Colour scheme for this run (see --list-themes)"
+    )]
     theme: Option<String>,
-    /// Preview every built-in color scheme with its palette and exit.
-    #[arg(long)]
+    #[arg(
+        long,
+        help_heading = H_APPEARANCE,
+        help = "\x1b[32m//\x1b[0m Preview every scheme with its palette and exit"
+    )]
     list_themes: bool,
-    /// Extra directory to scan for databases and rkyv shards when no file is
-    /// given (repeatable). Replaces the default roots.
-    #[arg(long, value_name = "DIR")]
+    #[arg(
+        long,
+        value_name = "DIR",
+        help_heading = H_DISCOVERY,
+        help = "\x1b[32m//\x1b[0m Scan DIR instead of the default roots (repeatable)"
+    )]
     scan: Vec<PathBuf>,
-    /// Skip the startup scan and list only recently opened files.
-    #[arg(long, conflicts_with = "scan")]
+    #[arg(
+        long,
+        conflicts_with = "scan",
+        help_heading = H_DISCOVERY,
+        help = "\x1b[32m//\x1b[0m Skip the scan; list only recent files"
+    )]
     no_scan: bool,
+    #[arg(
+        long,
+        conflicts_with = "no_scan",
+        help_heading = H_DISCOVERY,
+        help = "\x1b[32m//\x1b[0m Walk again now, ignoring the saved scan"
+    )]
+    rescan: bool,
+    #[arg(
+        short,
+        long,
+        action = clap::ArgAction::Help,
+        help_heading = H_GENERAL,
+        help = "\x1b[32m//\x1b[0m Print this help"
+    )]
+    help: Option<bool>,
+    #[arg(
+        short = 'V',
+        long,
+        action = clap::ArgAction::Version,
+        help_heading = H_GENERAL,
+        help = "\x1b[32m//\x1b[0m Print the version"
+    )]
+    version: Option<bool>,
 }
 
 fn main() -> Result<()> {
@@ -231,37 +361,82 @@ fn export_store(store: &Store, fmt: &str) -> Result<String> {
 }
 
 fn run(cli: &Cli, terminal: &mut DefaultTerminal, theme: Option<theme::ThemeName>) -> Result<()> {
-    // Resolve the file to open: explicit argument, or a pick from the recent
-    // files plus whatever the background scan finds.
-    let file = match &cli.file {
-        Some(f) => f.clone(),
-        None => {
-            let recent: Vec<mru::Entry> = mru::load()
-                .into_iter()
-                .filter(|e| e.path.exists())
-                .collect();
-            let scan = if cli.no_scan {
-                None
-            } else {
-                let roots = if cli.scan.is_empty() {
-                    scan::default_roots()
-                } else {
-                    // Explicit roots are taken at face value, walked as deeply
-                    // as a producer's own directory.
-                    cli.scan
-                        .iter()
-                        .map(|p| scan::Root::new(p.clone(), scan::DEEP))
-                        .collect()
-                };
-                Some(scan::spawn(roots))
-            };
-            match app::pick_mru(terminal, &recent, theme, scan)? {
-                Some(p) => p,
-                None => return Ok(()), // user quit the picker
-            }
+    // An explicit FILE has nothing to pick. Otherwise loop, because `o` in the
+    // app comes back here to choose another file.
+    if let Some(file) = &cli.file {
+        open_and_run(cli, terminal, theme, file.clone())?;
+        return Ok(());
+    }
+    loop {
+        let file = match pick(cli, terminal, theme)? {
+            Some(f) => f,
+            None => return Ok(()), // user quit the picker
+        };
+        if open_and_run(cli, terminal, theme, file)? == app::Outcome::Quit {
+            return Ok(());
         }
+    }
+}
+
+/// Show the picker: recent files, plus scan rows taken from appdata while they
+/// are still fresh, else from a walk started here.
+fn pick(
+    cli: &Cli,
+    terminal: &mut DefaultTerminal,
+    theme: Option<theme::ThemeName>,
+) -> Result<Option<PathBuf>> {
+    let recent: Vec<mru::Entry> = mru::load()
+        .into_iter()
+        .filter(|e| e.path.exists())
+        .collect();
+
+    // Explicit --scan roots are not the default set, so they neither read nor
+    // write the saved scan.
+    let custom_roots = !cli.scan.is_empty();
+    let roots: Vec<scan::Root> = if custom_roots {
+        cli.scan
+            .iter()
+            .map(|p| scan::Root::new(p.clone(), scan::DEEP))
+            .collect()
+    } else {
+        scan::default_roots()
     };
 
+    let saved = if cli.no_scan || cli.rescan || custom_roots {
+        None
+    } else {
+        scan::load_cache().filter(|c| c.fresh())
+    };
+    // A fresh saved scan is used as-is, so no walk runs on this start.
+    let (cached, cache_age, walk) = match saved {
+        Some(c) => {
+            let age = c.age();
+            (c.hits, Some(age), false)
+        }
+        None => (Vec::new(), None, !cli.no_scan),
+    };
+
+    app::pick_mru(
+        terminal,
+        app::Picker {
+            recent: &recent,
+            theme_override: theme,
+            cached,
+            cache_age,
+            scan: walk.then(|| scan::spawn(roots.clone())),
+            roots,
+            persist: !custom_roots,
+        },
+    )
+}
+
+/// Open `file` and run the app over it.
+fn open_and_run(
+    cli: &Cli,
+    terminal: &mut DefaultTerminal,
+    theme: Option<theme::ThemeName>,
+    file: PathBuf,
+) -> Result<app::Outcome> {
     let kind = store::detect(&file, cli.sqlite, cli.rkyv)?;
     let (store, actual) = store::Store::open(&file, kind)?;
     mru::record(&file, actual);

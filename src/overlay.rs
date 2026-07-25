@@ -674,6 +674,7 @@ struct HelpSection {
 const DISPLAY_KEYS: &[(&str, &str)] = &[
     ("c", "Scheme chooser"),
     ("C", "Palette editor"),
+    ("o", "Back to file list"),
     ("h / ?", "Toggle help"),
     ("q", "Quit"),
 ];
@@ -734,7 +735,11 @@ fn help_sections(ctx: HelpCtx) -> Vec<HelpSection> {
             },
             HelpSection {
                 title: "SEARCH",
-                keys: &[("/", "Filename search"), ("n / N", "Next / prev")],
+                keys: &[("/", "Path search"), ("n / N", "Next / prev")],
+            },
+            HelpSection {
+                title: "SCAN",
+                keys: &[("r", "Rescan now"), ("R", "Rescan, ignore cache")],
             },
             HelpSection {
                 title: "DISPLAY",
@@ -935,7 +940,11 @@ mod tests {
         let r = rows(&ov, HelpCtx::Picker, 100, 40);
         assert!(has(&r, "recent files"));
         assert!(has(&r, "Open file"));
-        assert!(has(&r, "Filename search"));
+        assert!(has(&r, "Path search"));
+        assert!(
+            has(&r, "Rescan now"),
+            "picker help must list the rescan key"
+        );
         assert!(!has(&r, "Raw SQL") && !has(&r, "Rename key"));
     }
 

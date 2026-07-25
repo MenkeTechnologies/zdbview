@@ -103,6 +103,11 @@ const CANDIDATE_EXTS: &[&str] = &[
     "db", "sqlite", "sqlite3", "sqlitedb", "rkyv", "bin", "cache", "shard", "dat", "zwc",
 ];
 
+/// How long a saved scan is reused before the walk runs again.
+pub const CACHE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+/// Format marker for the cache file, bumped if its layout changes.
+const CACHE_VERSION: u32 = 1;
+
 /// One place to look, and how far down.
 #[derive(Debug, Clone)]
 pub struct Root {
@@ -164,6 +169,137 @@ impl Scan {
     /// Ask the walk to stop; it checks between entries.
     pub fn cancel(&self) {
         self.cancel.store(true, Ordering::Relaxed);
+    }
+}
+
+/// A previously saved scan, loaded from appdata.
+pub struct Cached {
+    pub hits: Vec<Hit>,
+    pub scanned_at: SystemTime,
+}
+
+impl Cached {
+    pub fn age(&self) -> Duration {
+        SystemTime::now()
+            .duration_since(self.scanned_at)
+            .unwrap_or_default()
+    }
+
+    pub fn fresh(&self) -> bool {
+        self.age() < CACHE_TTL
+    }
+}
+
+/// `$XDG_CACHE_HOME/zdbview/scan`, beside the recent-files list.
+fn cache_file() -> Option<PathBuf> {
+    let base = std::env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))?;
+    Some(base.join("zdbview").join("scan"))
+}
+
+/// Load the saved scan, dropping entries whose file has since gone away. A
+/// missing, unreadable or foreign-version file simply yields `None`, which makes
+/// the caller walk the filesystem instead.
+pub fn load_cache() -> Option<Cached> {
+    load_cache_from(&cache_file()?)
+}
+
+pub(crate) fn load_cache_from(path: &Path) -> Option<Cached> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let mut lines = text.lines();
+    // Header: `# zdbview scan <version> <unix-seconds>`
+    let header: Vec<&str> = lines.next()?.split_whitespace().collect();
+    if header.len() != 5 || header[1] != "zdbview" || header[2] != "scan" {
+        return None;
+    }
+    if header[3].parse::<u32>().ok()? != CACHE_VERSION {
+        return None;
+    }
+    let secs: u64 = header[4].parse().ok()?;
+    let scanned_at = SystemTime::UNIX_EPOCH + Duration::from_secs(secs);
+
+    let mut hits = Vec::new();
+    for line in lines {
+        let f: Vec<&str> = line.split('\t').collect();
+        if f.len() != 6 {
+            continue;
+        }
+        let kind = match f[0] {
+            "sqlite" => Kind::Sqlite,
+            "rkyv" => Kind::Rkyv,
+            _ => continue,
+        };
+        let path = PathBuf::from(f[5]);
+        // A cached path that no longer resolves is not offered.
+        if !path.is_file() {
+            continue;
+        }
+        hits.push(Hit {
+            path,
+            kind,
+            format: crate::formats::magic_label(f[4]),
+            size: f[2].parse().unwrap_or(0),
+            modified: SystemTime::UNIX_EPOCH + Duration::from_secs(f[3].parse().unwrap_or(0)),
+            rank: f[1].parse().unwrap_or(3),
+        });
+    }
+    Some(Cached { hits, scanned_at })
+}
+
+/// Save a completed scan so the next start does not have to walk again.
+/// Best-effort: a failure here only costs a rescan next time.
+pub fn save_cache(hits: &[Hit]) {
+    if let Some(path) = cache_file() {
+        save_cache_to(&path, hits);
+    }
+}
+
+pub(crate) fn save_cache_to(path: &Path, hits: &[Hit]) {
+    let now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let mut body = format!("# zdbview scan {CACHE_VERSION} {now}\n");
+    for h in hits {
+        let mtime = h
+            .modified
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        // Tab-separated so a path may contain spaces; paths with tabs or
+        // newlines are skipped rather than corrupting the file.
+        let p = match h.path.to_str() {
+            Some(p) if !p.contains('\t') && !p.contains('\n') => p,
+            _ => continue,
+        };
+        body.push_str(&format!(
+            "{}\t{}\t{}\t{}\t{}\t{}\n",
+            match h.kind {
+                Kind::Sqlite => "sqlite",
+                Kind::Rkyv => "rkyv",
+            },
+            h.rank,
+            h.size,
+            mtime,
+            h.format.unwrap_or(""),
+            p
+        ));
+    }
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    // Write via temp + rename so a reader never sees a half-written list.
+    let tmp = path.with_extension("tmp");
+    if std::fs::write(&tmp, body).is_ok() {
+        let _ = std::fs::rename(&tmp, path);
+    }
+}
+
+/// Forget the saved scan, so the next walk starts from nothing.
+pub fn clear_cache() {
+    if let Some(path) = cache_file() {
+        let _ = std::fs::remove_file(path);
     }
 }
 
@@ -550,6 +686,89 @@ mod tests {
 
     /// The producers keep their stores in their own dot-directory, so those must
     /// be roots, and none of the roots may be redundant.
+    /// The cache is what stops a walk on every start: a saved scan must come
+    /// back with every field intact, including the recognized format label.
+    #[test]
+    fn cache_round_trips_every_field() {
+        let dir = tmpdir("cache_rt");
+        let db = dir.join("real.db");
+        write(&db, &sqlite_bytes());
+        let shard = dir.join("scripts.rkyv");
+        write(
+            &shard,
+            &crate::formats::test_script_shard_bytes("/tmp/x.sh", b"blob"),
+        );
+        let hits = collect(&dir);
+        assert_eq!(hits.len(), 2);
+
+        let file = dir.join("scan-cache");
+        save_cache_to(&file, &hits);
+        let back = load_cache_from(&file).expect("cache must load");
+        assert_eq!(back.hits.len(), 2);
+        for (a, b) in hits.iter().zip(&back.hits) {
+            assert_eq!(a.path, b.path);
+            assert_eq!(a.kind, b.kind);
+            assert_eq!(a.format, b.format, "format label must survive");
+            assert_eq!(a.size, b.size);
+            assert_eq!(a.rank, b.rank);
+            // Whole seconds only, which is all the file stores.
+            let secs = |t: SystemTime| {
+                t.duration_since(SystemTime::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs()
+            };
+            assert_eq!(secs(a.modified), secs(b.modified));
+        }
+        assert!(back.fresh(), "a scan saved just now is fresh");
+        assert!(back.age() < Duration::from_secs(5));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Entries whose file has gone away must not be offered from the cache.
+    #[test]
+    fn cache_drops_vanished_files() {
+        let dir = tmpdir("cache_gone");
+        let db = dir.join("gone.db");
+        write(&db, &sqlite_bytes());
+        let hits = collect(&dir);
+        assert_eq!(hits.len(), 1);
+        let file = dir.join("scan-cache");
+        save_cache_to(&file, &hits);
+        std::fs::remove_file(&db).unwrap();
+        let back = load_cache_from(&file).expect("header still parses");
+        assert!(back.hits.is_empty(), "a deleted file must be dropped");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A stale saved scan is reported as such, so the caller walks again.
+    #[test]
+    fn cache_older_than_the_ttl_is_not_fresh() {
+        let cached = Cached {
+            hits: Vec::new(),
+            scanned_at: SystemTime::now() - CACHE_TTL - Duration::from_secs(60),
+        };
+        assert!(!cached.fresh());
+        assert!(cached.age() > CACHE_TTL);
+    }
+
+    /// Garbage, a foreign version, or a missing file must all fall back to a walk
+    /// rather than surfacing broken rows.
+    #[test]
+    fn unreadable_or_foreign_cache_yields_none() {
+        let dir = tmpdir("cache_bad");
+        let f = dir.join("c");
+        write(&f, b"not a zdbview cache\n");
+        assert!(load_cache_from(&f).is_none());
+        write(&f, b"# zdbview scan 99 1700000000\n");
+        assert!(load_cache_from(&f).is_none(), "version must be checked");
+        assert!(load_cache_from(&dir.join("absent")).is_none());
+        // A valid header with a corrupt row keeps the header and skips the row.
+        write(&f, b"# zdbview scan 1 1700000000\nnonsense\n");
+        let back = load_cache_from(&f).expect("header parses");
+        assert!(back.hits.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn default_roots_cover_home_dot_dirs_without_redundancy() {
         let roots = default_roots();

@@ -66,6 +66,14 @@ enum RkyvView {
     Hex,
 }
 
+/// Why the app loop ended: the user quit, or asked for the file picker again.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum Outcome {
+    Quit,
+    /// `o` — back to the picker to open another file.
+    Reopen,
+}
+
 /// Top-level screen. Overlaid modals (`Mode`) and the help overlay sit on top.
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 enum Screen {
@@ -159,6 +167,8 @@ pub struct App {
     hex: Option<HexEdit>,
     /// Rect the hex editor last rendered into, for click hit-testing.
     hex_area: Rect,
+    /// Set by `o`: leave the app loop and show the file picker again.
+    reopen: bool,
     /// Active row-grid ordering, or `None` for the table's natural `rowid`
     /// order. Reset when another table is selected.
     sort: Option<Sort>,
@@ -213,6 +223,7 @@ impl App {
             sort: None,
             hex: None,
             hex_area: Rect::ZERO,
+            reopen: false,
             ov: Overlays::new(theme),
         };
         app.init();
@@ -244,7 +255,7 @@ impl App {
                 if !s.tables.is_empty() {
                     self.load_table();
                 }
-                self.status = "j/k ←/→ move · Tab focus · / search (n/N) · ^f/^b page · e edit · a add · d delete · : SQL · s sort · c scheme · h help · q quit".into();
+                self.status = "j/k ←/→ move · Tab focus · / search (n/N) · ^f/^b page · e edit · a add · d delete · : SQL · s sort · c scheme · o files · h help · q quit".into();
             }
             Store::Rkyv(r) => {
                 self.strings = r.strings(MIN_STRING);
@@ -252,18 +263,18 @@ impl App {
                 if let Some(d) = &self.decoded {
                     self.rkyv_view = RkyvView::Records;
                     self.status = format!(
-                        "{} · {} records · Enter detail · a add e hex-edit r rename d delete · / search · 0/1/2/3 views · c scheme · h help · q quit",
+                        "{} · {} records · Enter detail · a add e hex-edit r rename d delete · / search · 0/1/2/3 views · c scheme · o files · h help · q quit",
                         d.format,
                         d.records.len()
                     );
                 } else {
-                    self.status = "1 Info · 2 Strings · 3 Hex · j/k scroll · / search (n/N) · c scheme · h help · q quit  (rkyv: unrecognized)".into();
+                    self.status = "1 Info · 2 Strings · 3 Hex · j/k scroll · / search (n/N) · c scheme · o files · h help · q quit  (rkyv: unrecognized)".into();
                 }
             }
         }
     }
 
-    pub fn run(&mut self, terminal: &mut DefaultTerminal) -> Result<()> {
+    pub fn run(&mut self, terminal: &mut DefaultTerminal) -> Result<Outcome> {
         while !self.quit {
             terminal.draw(|f| self.render(f))?;
             if !event::poll(TICK)? {
@@ -277,7 +288,11 @@ impl App {
             }
             self.ov.expire_toast();
         }
-        Ok(())
+        Ok(if self.reopen {
+            Outcome::Reopen
+        } else {
+            Outcome::Quit
+        })
     }
 
     // ----- key handling -----------------------------------------------------
@@ -333,6 +348,14 @@ impl App {
         // every screen, exactly as on the recent-files picker — except inside the
         // hex editor, where those keys are motions and data.
         if self.screen != Screen::HexEdit && self.ov.on_key(code) {
+            return;
+        }
+
+        // `o` goes back to the file picker from any screen but the hex editor,
+        // where it inserts a byte.
+        if code == KeyCode::Char('o') && self.screen != Screen::HexEdit {
+            self.reopen = true;
+            self.quit = true;
             return;
         }
 
@@ -2095,19 +2118,38 @@ fn merge_hits(choices: &mut Vec<Choice>, hits: Vec<crate::scan::Hit>) {
     });
 }
 
-pub fn pick_mru(
-    terminal: &mut DefaultTerminal,
-    entries: &[Entry],
-    theme_override: Option<ThemeName>,
-    scan: Option<crate::scan::Scan>,
-) -> Result<Option<PathBuf>> {
+/// Everything the picker needs: the remembered files, the scheme override, and
+/// where its scan rows come from.
+pub struct Picker<'a> {
+    pub recent: &'a [Entry],
+    pub theme_override: Option<ThemeName>,
+    /// Rows restored from the saved scan (appdata), shown immediately.
+    pub cached: Vec<crate::scan::Hit>,
+    /// How old those rows are, for the title.
+    pub cache_age: Option<std::time::Duration>,
+    /// A walk already in progress, when the cache was missing or stale.
+    pub scan: Option<crate::scan::Scan>,
+    /// Roots to walk when the user asks for a rescan with `r`.
+    pub roots: Vec<crate::scan::Root>,
+    /// Whether a finished walk may be written to appdata (not for `--scan`,
+    /// whose roots are not the default set).
+    pub persist: bool,
+}
+
+pub fn pick_mru(terminal: &mut DefaultTerminal, mut p: Picker<'_>) -> Result<Option<PathBuf>> {
+    let entries = p.recent;
+    let theme_override = p.theme_override;
+    let mut scan = p.scan.take();
+    let mut cache_age = p.cache_age;
+    // Hits are kept as well as merged so a finished walk can be saved.
+    let mut scanned: Vec<crate::scan::Hit> = std::mem::take(&mut p.cached);
     let mut idx = 0usize;
     let mut pending_g = false;
     let mut search = String::new();
     let mut searching = false;
     // Recent files first, then whatever the scan turns up.
     let mut choices: Vec<Choice> = entries.iter().map(Choice::from_entry).collect();
-    let mut scan = scan;
+    merge_hits(&mut choices, scanned.clone());
     // The picker carries the same overlay layer as the main screens, so `h`,
     // `c` and `C` work here too — and a scheme picked here is the one the file
     // opens with.
@@ -2123,17 +2165,28 @@ pub fn pick_mru(
         } else {
             None
         };
-        // Pull in whatever the scan thread produced since the last frame.
+        // Pull in whatever the scan thread produced since the last frame, and
+        // save the finished list so the next start does not walk again.
         let scanning = match scan.as_mut() {
             Some(sc) => {
                 let hits = sc.drain();
+                scanned.extend(hits.iter().cloned());
                 merge_hits(&mut choices, hits);
-                sc.running.then_some(sc.found)
+                if sc.running {
+                    Some(sc.found)
+                } else {
+                    if p.persist {
+                        crate::scan::save_cache(&scanned);
+                        cache_age = Some(std::time::Duration::ZERO);
+                    }
+                    scan = None;
+                    None
+                }
             }
             None => None,
         };
         terminal.draw(|f| {
-            render_picker(f, &choices, idx, query, scanning, &ov.theme);
+            render_picker(f, &choices, idx, query, scanning, cache_age, &ov.theme);
             ov.render(f, HelpCtx::Picker);
         })?;
         if !event::poll(TICK)? {
@@ -2228,6 +2281,22 @@ pub fn pick_mru(
                         idx = i;
                     }
                 }
+                // `r` walks again (keeping the rows on screen until new ones
+                // arrive); `R` also drops the saved scan first.
+                KeyCode::Char('r') | KeyCode::Char('R') => {
+                    if key.code == KeyCode::Char('R') {
+                        crate::scan::clear_cache();
+                    }
+                    if let Some(sc) = &scan {
+                        sc.cancel();
+                    }
+                    scanned.clear();
+                    choices.retain(|c| c.opened.is_some());
+                    idx = 0;
+                    cache_age = None;
+                    scan = Some(crate::scan::spawn(p.roots.clone()));
+                    ov.toast("rescanning");
+                }
                 KeyCode::Char('G') => idx = choices.len().saturating_sub(1),
                 KeyCode::Up | KeyCode::Char('k') => idx = idx.saturating_sub(1),
                 KeyCode::Down | KeyCode::Char('j') => {
@@ -2266,12 +2335,14 @@ fn picker_find(choices: &[Choice], from: usize, forward: bool, q: &str) -> Optio
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_picker(
     f: &mut Frame,
     choices: &[Choice],
     idx: usize,
     query: Option<&str>,
     scanning: Option<usize>,
+    cache_age: Option<std::time::Duration>,
     t: &Theme,
 ) {
     let outer = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(f.area());
@@ -2333,14 +2404,22 @@ fn render_picker(
         let mut st = ListState::default();
         st.select(Some(idx.min(choices.len().saturating_sub(1))));
         let recent = choices.iter().filter(|c| c.opened.is_some()).count();
-        let title = match scanning {
-            Some(found) => format!(
+        let title = match (scanning, cache_age) {
+            (Some(found), _) => format!(
                 " zdbview — {} files ({} recent, scanning… {} found) ",
                 choices.len(),
                 recent,
                 found
             ),
-            None => format!(" zdbview — {} files ({} recent) ", choices.len(), recent),
+            // Saved scans are reused, so say how old the rows are and how to
+            // refresh them.
+            (None, Some(age)) => format!(
+                " zdbview — {} files ({} recent, scan {} · r rescans) ",
+                choices.len(),
+                recent,
+                age_label(age)
+            ),
+            (None, None) => format!(" zdbview — {} files ({} recent) ", choices.len(), recent),
         };
         let list = List::new(items)
             .block(
@@ -2570,6 +2649,17 @@ fn disasm_lines(_bytes: &[u8], _scroll: usize, _height: usize) -> Vec<Line<'stat
 }
 
 /// Truncate a display string to `max` chars, appending an ellipsis.
+/// A saved scan's age, phrased for the picker title.
+fn age_label(age: std::time::Duration) -> String {
+    let secs = age.as_secs();
+    match secs {
+        0..=90 => "just now".to_string(),
+        _ if secs < 3600 => format!("{}m old", secs / 60),
+        _ if secs < 86_400 => format!("{}h old", secs / 3600),
+        _ => format!("{}d old", secs / 86_400),
+    }
+}
+
 /// Byte count in the largest unit that keeps it under four digits.
 fn human_size(n: u64) -> String {
     const UNITS: [&str; 5] = ["B", "K", "M", "G", "T"];
@@ -2966,7 +3056,7 @@ mod tests {
         );
         let render = |choices: &[super::Choice], scanning: Option<usize>| -> Vec<String> {
             let mut term = Terminal::new(TestBackend::new(100, 8)).unwrap();
-            term.draw(|f| super::render_picker(f, choices, 0, None, scanning, &theme))
+            term.draw(|f| super::render_picker(f, choices, 0, None, scanning, None, &theme))
                 .unwrap();
             let buf = term.backend().buffer().clone();
             (0..buf.area().height)
@@ -3002,6 +3092,68 @@ mod tests {
         // While still scanning, it says so instead.
         let rows = render(&[], Some(0));
         assert!(contains(&rows, "Scanning for databases"));
+    }
+
+    /// `o` leaves the app loop asking for the picker again, rather than quitting.
+    #[test]
+    fn o_returns_to_the_file_picker() {
+        let mut app = rkyv_app();
+        assert!(!app.reopen);
+        press(&mut app, 'o');
+        assert!(app.reopen, "o must ask for the picker");
+        assert!(app.quit, "and end the app loop");
+
+        // Inside the hex editor `o` is an insert, not a way out.
+        let (mut app, path) = script_shard_app();
+        press(&mut app, 'e');
+        let before = app.hex.as_ref().unwrap().bytes.len();
+        press(&mut app, 'o');
+        assert!(!app.reopen, "the editor keeps o for inserting a byte");
+        assert_eq!(app.hex.as_ref().unwrap().bytes.len(), before + 1);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Rows restored from the saved scan are labelled with their age, so it is
+    /// clear the list was not just walked.
+    #[test]
+    fn picker_titles_a_reused_scan_with_its_age() {
+        let theme = crate::theme::Theme::from_name(ThemeName::NeonSprawl);
+        let mut choices: Vec<super::Choice> = Vec::new();
+        super::merge_hits(
+            &mut choices,
+            vec![scan_hit("/h/.zshrs/scripts.rkyv", Kind::Rkyv, None, 50, 1)],
+        );
+        let render = |age: Option<std::time::Duration>| -> Vec<String> {
+            let mut term = Terminal::new(TestBackend::new(100, 6)).unwrap();
+            term.draw(|f| super::render_picker(f, &choices, 0, None, None, age, &theme))
+                .unwrap();
+            let buf = term.backend().buffer().clone();
+            (0..buf.area().height)
+                .map(|y| {
+                    (0..buf.area().width)
+                        .map(|x| buf[(x, y)].symbol())
+                        .collect::<String>()
+                })
+                .collect()
+        };
+        let rows = render(Some(std::time::Duration::from_secs(3 * 3600)));
+        assert!(contains(&rows, "scan 3h old"), "age missing: {:?}", rows[0]);
+        assert!(contains(&rows, "r rescans"), "no way to refresh advertised");
+        // A walk that just finished says so instead of showing hours.
+        let rows = render(Some(std::time::Duration::ZERO));
+        assert!(contains(&rows, "just now"));
+        // Without a saved scan the title is plain.
+        let rows = render(None);
+        assert!(!contains(&rows, "rescans"));
+    }
+
+    #[test]
+    fn age_labels_read_naturally() {
+        use std::time::Duration;
+        assert_eq!(super::age_label(Duration::from_secs(5)), "just now");
+        assert_eq!(super::age_label(Duration::from_secs(600)), "10m old");
+        assert_eq!(super::age_label(Duration::from_secs(7200)), "2h old");
+        assert_eq!(super::age_label(Duration::from_secs(3 * 86_400)), "3d old");
     }
 
     /// Help lists the section for what is on screen.
