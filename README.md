@@ -176,7 +176,8 @@ back to a raw structural view.
 | awkrs script cache | `AWKR` | magic | script path |
 | vimlrs script cache | `VIML` | magic | script path |
 | elisprs heap-image cache | `ELSP` | magic | script path |
-| zshrs canonical shard | `ZSHS` | magic | `section/key`, `section[i]` |
+| zshrs canonical shard | `ZSHS` | magic (or validated, unstamped) | `section/key`, `section[i]` |
+| zshrs system shard | `ZSHS` | magic (second layout) | entry key |
 | pythonrs bytecode cache | *(none)* | validated try-decode | source path |
 | rubylang / arb script cache | *(none)* | validated try-decode | u64 content hash |
 

@@ -177,6 +177,17 @@ struct CanonicalShard {
     extras: HashMap<String, HashMap<String, String>>,
 }
 
+/// The daemon's OTHER ZSHS type: `zshrs/daemon/shard.rs`'s `Shard`, a flat
+/// blob map under the same header and the same magic. The `*-system.rkyv` image
+/// is written as this, not as a [`CanonicalShard`], so the ZSHS arm has to try
+/// both — exactly like the two STRY layouts above.
+#[derive(Archive, Serialize, Deserialize)]
+#[archive(check_bytes)]
+struct SystemShard {
+    header: CanonicalHeader,
+    entries: HashMap<String, Vec<u8>>,
+}
+
 // ---- Family C: header-less, hash-keyed shards (no magic) --------------------
 // pythonrs keeps a source path + a verify hash; rubylang and arb share an
 // identical minimal (key, blob) layout and cannot be told apart structurally.
@@ -233,6 +244,7 @@ pub struct KvRecord {
 pub enum FormatKind {
     Script,
     Canonical,
+    System,
     Stryke,
     Autoload,
     Elisp,
@@ -329,12 +341,31 @@ pub fn try_decode(bytes: &[u8]) -> Option<Decoded> {
         }
     }
 
-    // Family D — the zshrs canonical shard: many sections, not one entry map.
+    // Family D — the zshrs ZSHS images. Two layouts share the magic: the
+    // per-source canonical shard (many sections) and the flat blob `Shard` the
+    // system image uses. Try the richer one first, then the flat one.
     if contains_u32_le(bytes, CANONICAL_MAGIC) {
         if let Ok(s) = rkyv::check_archived_root::<CanonicalShard>(bytes) {
             if u32::from(s.header.magic) == CANONICAL_MAGIC {
                 return Some(decode_canonical(s));
             }
+        }
+        if let Ok(s) = rkyv::check_archived_root::<SystemShard>(bytes) {
+            if u32::from(s.header.magic) == CANONICAL_MAGIC {
+                return Some(decode_system(s));
+            }
+        }
+    }
+
+    // The recorder writes a canonical shard with the magic field left at ZERO
+    // (`*-recorder.rkyv`), so the pre-filter above never sees it. Validating the
+    // full type is itself a strong check — every field, every relative pointer —
+    // so an unstamped shard is accepted when it validates AND carries a slug,
+    // rather than being left on the structural view for a missing u32.
+    if let Ok(s) = rkyv::check_archived_root::<CanonicalShard>(bytes) {
+        let magic = u32::from(s.header.magic);
+        if (magic == 0 || magic == CANONICAL_MAGIC) && !s.header.slug.as_str().is_empty() {
+            return Some(decode_canonical(s));
         }
     }
 
@@ -620,6 +651,9 @@ where
 pub fn delete_record(bytes: &[u8], kind: FormatKind, del_key: &str) -> Result<Vec<u8>, String> {
     match kind {
         FormatKind::Canonical => canonical_edit(bytes, del_key, CanonicalOp::Delete),
+        FormatKind::System => edit_shard::<SystemShard, _>(bytes, |s| {
+            s.entries.remove(del_key);
+        }),
         FormatKind::Script => edit_shard::<ScriptShard, _>(bytes, |s| {
             s.entries.remove(del_key);
         }),
@@ -674,6 +708,12 @@ pub fn set_value(
         FormatKind::Canonical => {
             canonical_edit(bytes, del_key, CanonicalOp::Set(canonical_text(value)?))
         }
+        // System-shard values are opaque blobs, so they take the bytes verbatim.
+        FormatKind::System => edit_shard::<SystemShard, _>(bytes, move |s| {
+            if let Some(e) = s.entries.get_mut(del_key) {
+                *e = value;
+            }
+        }),
         FormatKind::Script => edit_shard::<ScriptShard, _>(bytes, |s| {
             if let Some(e) = s.entries.get_mut(del_key) {
                 e.chunk_blob = value;
@@ -723,6 +763,12 @@ pub fn add_record(
     value: Vec<u8>,
 ) -> Result<Vec<u8>, String> {
     match kind {
+        FormatKind::System => {
+            let key = key.to_string();
+            edit_shard::<SystemShard, _>(bytes, move |s| {
+                s.entries.insert(key, value);
+            })
+        }
         // A canonical address names its slot, so an add is "create this slot",
         // then set it when a value came with it.
         FormatKind::Canonical => {
@@ -815,6 +861,11 @@ pub fn rename_record(
     let new_key = new_key.to_string();
     match kind {
         FormatKind::Canonical => canonical_edit(bytes, del_key, CanonicalOp::Rename(new_key)),
+        FormatKind::System => edit_shard::<SystemShard, _>(bytes, move |s| {
+            if let Some(v) = s.entries.remove(del_key) {
+                s.entries.insert(new_key, v);
+            }
+        }),
         FormatKind::Script => edit_shard::<ScriptShard, _>(bytes, move |s| {
             if let Some(v) = s.entries.remove(del_key) {
                 s.entries.insert(new_key, v);
@@ -1478,5 +1529,141 @@ mod canonical_tests {
             !d.records.iter().any(|r| r.key.starts_with("nosuch")),
             "an address the shell has no section for must not create one"
         );
+    }
+}
+
+/// Project the flat ZSHS `Shard` (the `*-system.rkyv` image): one record per
+/// entry, the value being the raw blob the shell stored under that key.
+fn decode_system(s: &ArchivedSystemShard) -> Decoded {
+    let mut records: Vec<KvRecord> = s
+        .entries
+        .iter()
+        .map(|(k, v)| KvRecord {
+            key: k.as_str().to_string(),
+            del_key: k.as_str().to_string(),
+            value: v.as_slice().to_vec(),
+            fields: vec![("blob_len".into(), v.len().to_string())],
+        })
+        .collect();
+    records.sort_by(|a, b| a.key.cmp(&b.key));
+    Decoded {
+        format: "zshrs system shard (ZSHS)".into(),
+        kind: FormatKind::System,
+        header: vec![
+            ("magic".into(), format!("{:#010x}", u32::from(s.header.magic))),
+            (
+                "format_version".into(),
+                u32::from(s.header.format_version).to_string(),
+            ),
+            ("generation".into(), u64::from(s.header.generation).to_string()),
+            ("built_at_ns".into(), u64::from(s.header.built_at_ns).to_string()),
+            ("slug".into(), s.header.slug.as_str().to_string()),
+            ("source_root".into(), s.header.source_root.as_str().to_string()),
+            (
+                "entry_count".into(),
+                u32::from(s.header.entry_count).to_string(),
+            ),
+        ],
+        records,
+    }
+}
+
+#[cfg(test)]
+mod system_shard_tests {
+    use super::*;
+
+    /// The daemon's OTHER ZSHS layout: a flat blob map, which is what the
+    /// `*-system.rkyv` image is written as.
+    fn system_bytes() -> Vec<u8> {
+        let mut entries: HashMap<String, Vec<u8>> = HashMap::new();
+        entries.insert("cmd:ls".into(), b"/bin/ls".to_vec());
+        entries.insert("cmd:grep".into(), vec![0x00, 0xff, 0x10]);
+        let shard = SystemShard {
+            header: CanonicalHeader {
+                magic: CANONICAL_MAGIC,
+                format_version: 1,
+                generation: 3,
+                built_at_ns: 9,
+                slug: "system".into(),
+                source_root: "/".into(),
+                entry_count: 2,
+            },
+            entries,
+        };
+        rkyv::to_bytes::<_, 4096>(&shard).expect("serialize").into_vec()
+    }
+
+    /// Both ZSHS layouts share a magic, so the arm must try the canonical shard
+    /// first and fall through to the flat one instead of giving up — which is
+    /// what left the 43 MB system image on the structural view.
+    #[test]
+    fn the_flat_system_layout_is_reached_through_the_same_magic() {
+        let d = try_decode(&system_bytes()).expect("recognized");
+        assert_eq!(d.format, "zshrs system shard (ZSHS)");
+        assert!(matches!(d.kind, FormatKind::System));
+        assert_eq!(d.records.len(), 2);
+        let row = d.records.iter().find(|r| r.key == "cmd:ls").unwrap();
+        assert_eq!(row.value, b"/bin/ls");
+    }
+
+    #[test]
+    fn system_values_are_binary_and_round_trip() {
+        // A blob, not text: the edit path must take the bytes verbatim.
+        let edited = set_value(&system_bytes(), FormatKind::System, "cmd:grep", vec![1, 2, 3])
+            .expect("set");
+        let d = try_decode(&edited).expect("valid");
+        assert_eq!(d.records.iter().find(|r| r.key == "cmd:grep").unwrap().value, vec![1, 2, 3]);
+
+        let renamed = rename_record(&edited, FormatKind::System, "cmd:grep", "cmd:rg").expect("rename");
+        let d = try_decode(&renamed).expect("valid");
+        assert!(d.records.iter().any(|r| r.key == "cmd:rg"));
+
+        let deleted = delete_record(&renamed, FormatKind::System, "cmd:rg").expect("delete");
+        let d = try_decode(&deleted).expect("valid");
+        assert_eq!(d.records.len(), 1);
+    }
+
+    /// The recorder writes a canonical shard with the magic left at zero. It
+    /// still validates as the full type, so it decodes rather than falling back.
+    #[test]
+    fn an_unstamped_canonical_shard_is_still_decoded() {
+        let mut aliases = HashMap::new();
+        aliases.insert("g".to_string(), "git".to_string());
+        let shard = CanonicalShard {
+            header: CanonicalHeader {
+                magic: 0,
+                format_version: 1,
+                generation: 1,
+                built_at_ns: 1,
+                slug: "recorder".into(),
+                source_root: "/tmp".into(),
+                entry_count: 1,
+            },
+            aliases,
+            global_aliases: HashMap::new(),
+            suffix_aliases: HashMap::new(),
+            functions: HashMap::new(),
+            autoload_functions: HashMap::new(),
+            setopts: Vec::new(),
+            unsetopts: Vec::new(),
+            bindkeys: HashMap::new(),
+            named_dirs: HashMap::new(),
+            compdef: HashMap::new(),
+            zstyle: Vec::new(),
+            zmodload: Vec::new(),
+            env_exports: HashMap::new(),
+            params: HashMap::new(),
+            path: Vec::new(),
+            fpath: Vec::new(),
+            manpath: Vec::new(),
+            plugins: Vec::new(),
+            sourced_files: Vec::new(),
+            extras: HashMap::new(),
+        };
+        let bytes = rkyv::to_bytes::<_, 4096>(&shard).expect("serialize").into_vec();
+
+        let d = try_decode(&bytes).expect("an unstamped shard still decodes");
+        assert!(d.header.iter().any(|(k, v)| k == "magic" && v == "0x00000000"));
+        assert!(d.records.iter().any(|r| r.key == "aliases/g"));
     }
 }
