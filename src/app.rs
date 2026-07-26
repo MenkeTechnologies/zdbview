@@ -13,7 +13,8 @@ use ratatui::widgets::{
 };
 use ratatui::{DefaultTerminal, Frame};
 
-use std::path::PathBuf;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 
 use crate::formats::{self, Decoded, FormatKind};
 use crate::hexedit::{self, HexEdit};
@@ -4254,16 +4255,24 @@ pub struct Picked {
     pub theme: Theme,
 }
 
+/// The path a row is recognized by: symlinks resolved, so the same file reached
+/// two ways is one row, falling back to the path itself when it cannot be
+/// resolved (a file that has gone away is still worth listing once).
+fn canon(path: &Path) -> PathBuf {
+    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+}
+
 /// Merge scan hits into the list, dropping any path already present (a recent
 /// file the scan also found stays a recent file, keeping its age column).
-fn merge_hits(choices: &mut Vec<Choice>, hits: Vec<crate::scan::Hit>) {
+///
+/// `seen` holds the resolved path of every row already listed. It is the caller's
+/// so the resolution is paid once per row: an index of the whole disk is hundreds
+/// of rows, merged again on every return to the picker and once per frame while a
+/// walk streams, and resolving each listed row against each incoming hit made
+/// coming back from a file take most of a second.
+fn merge_hits(choices: &mut Vec<Choice>, seen: &mut HashSet<PathBuf>, hits: Vec<crate::scan::Hit>) {
     for hit in hits {
-        let dup = choices.iter().any(|c| {
-            c.path == hit.path
-                || (c.path.canonicalize().ok() == hit.path.canonicalize().ok()
-                    && c.path.canonicalize().is_ok())
-        });
-        if !dup {
+        if seen.insert(canon(&hit.path)) {
             choices.push(Choice::from_hit(hit));
         }
     }
@@ -4375,7 +4384,8 @@ pub fn pick_mru(terminal: &mut DefaultTerminal, mut p: Picker<'_>) -> Result<Opt
     let mut scanned: Vec<crate::scan::Hit> = std::mem::take(&mut p.cached);
     // Recent files first, then whatever the scan turns up.
     let mut choices: Vec<Choice> = entries.iter().map(Choice::from_entry).collect();
-    merge_hits(&mut choices, scanned.clone());
+    let mut listed: HashSet<PathBuf> = choices.iter().map(|c| canon(&c.path)).collect();
+    merge_hits(&mut choices, &mut listed, scanned.clone());
 
     // `/` filters the list: `view` holds the indices still listed and `sel` is a
     // position within it, so navigation and clicks address rows that are visible.
@@ -4402,7 +4412,7 @@ pub fn pick_mru(terminal: &mut DefaultTerminal, mut p: Picker<'_>) -> Result<Opt
             Some(sc) => {
                 let hits = sc.drain();
                 scanned.extend(hits.iter().cloned());
-                merge_hits(&mut choices, hits);
+                merge_hits(&mut choices, &mut listed, hits);
                 if sc.running {
                     Some(sc.found)
                 } else {
@@ -4640,6 +4650,7 @@ pub fn pick_mru(terminal: &mut DefaultTerminal, mut p: Picker<'_>) -> Result<Opt
                     }
                     scanned.clear();
                     choices.retain(|c| c.opened.is_some());
+                    listed = choices.iter().map(|c| canon(&c.path)).collect();
                     sel = 0;
                     cache_age = None;
                     // Everything again, from nothing: a walk of every root, whose
@@ -5230,6 +5241,13 @@ mod tests {
     use ratatui::backend::TestBackend;
     use ratatui::layout::Rect;
     use ratatui::Terminal;
+
+    /// Merge hits into a list the way the picker does: the set of paths already
+    /// listed comes from the rows themselves.
+    fn merge(choices: &mut Vec<super::Choice>, hits: Vec<crate::scan::Hit>) {
+        let mut listed = choices.iter().map(|c| super::canon(&c.path)).collect();
+        super::merge_hits(choices, &mut listed, hits);
+    }
 
     /// A unique scratch path per call — these tests run concurrently.
     fn scratch(ext: &str) -> std::path::PathBuf {
@@ -6334,12 +6352,43 @@ mod tests {
         }
     }
 
+    /// The list an index of the whole disk hands the picker is hundreds of rows,
+    /// and it is merged again every time the picker opens — pressing Esc out of a
+    /// file has to come straight back to the list. A per-pair filesystem lookup
+    /// made that quadratic in syscalls, which is what this holds down.
+    #[test]
+    fn merging_a_whole_disk_index_is_not_quadratic() {
+        let hits: Vec<crate::scan::Hit> = (0..600)
+            .map(|i| {
+                scan_hit(
+                    &format!("/h/dir{}/file{i}.db", i % 40),
+                    Kind::Sqlite,
+                    None,
+                    i as u64,
+                    2,
+                )
+            })
+            .collect();
+        let mut choices: Vec<super::Choice> = Vec::new();
+        let started = std::time::Instant::now();
+        merge(&mut choices, hits.clone());
+        // The second merge is the one a running walk repeats every frame: every
+        // row is already listed, so every one takes the duplicate path.
+        merge(&mut choices, hits);
+        let took = started.elapsed();
+        assert_eq!(choices.len(), 600);
+        assert!(
+            took < std::time::Duration::from_millis(50),
+            "merging 600 rows twice took {took:?}"
+        );
+    }
+
     /// Scan hits are ordered by what the tool is for: recognized shards, then
     /// other rkyv archives, then databases — newest first within each group.
     #[test]
     fn scan_hits_are_ranked_before_being_shown() {
         let mut choices: Vec<super::Choice> = Vec::new();
-        super::merge_hits(
+        merge(
             &mut choices,
             vec![
                 scan_hit("/h/.zshrs/compsys.db", Kind::Sqlite, None, 300, 2),
@@ -6374,7 +6423,7 @@ mod tests {
             opened: std::time::SystemTime::now(),
         };
         let mut choices: Vec<super::Choice> = vec![super::Choice::from_entry(&entry)];
-        super::merge_hits(
+        merge(
             &mut choices,
             vec![
                 crate::scan::Hit {
@@ -6401,7 +6450,7 @@ mod tests {
     fn picker_shows_scan_progress_and_row_details() {
         let theme = crate::theme::Theme::from_name(ThemeName::NeonSprawl);
         let mut choices: Vec<super::Choice> = Vec::new();
-        super::merge_hits(
+        merge(
             &mut choices,
             vec![scan_hit(
                 "/h/.zshrs/scripts.rkyv",
@@ -7150,7 +7199,7 @@ mod tests {
     fn picker_filter_removes_rows_from_the_list() {
         let theme = crate::theme::Theme::from_name(ThemeName::NeonSprawl);
         let mut choices: Vec<super::Choice> = Vec::new();
-        super::merge_hits(
+        merge(
             &mut choices,
             vec![
                 scan_hit("/h/.zshrs/scripts.rkyv", Kind::Rkyv, None, 30, 1),
@@ -7212,7 +7261,7 @@ mod tests {
     fn picker_titles_a_reused_scan_with_its_age() {
         let theme = crate::theme::Theme::from_name(ThemeName::NeonSprawl);
         let mut choices: Vec<super::Choice> = Vec::new();
-        super::merge_hits(
+        merge(
             &mut choices,
             vec![scan_hit("/h/.zshrs/scripts.rkyv", Kind::Rkyv, None, 50, 1)],
         );

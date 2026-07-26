@@ -1359,6 +1359,41 @@ mod tests {
         assert!(!alien.may_descend(Path::new("/usr"), "usr"));
     }
 
+    /// What pressing Esc out of an open file costs: the saved index is loaded and
+    /// checked again on every return to the picker, so the whole of it has to
+    /// stay well inside a keypress. Ignored by default because it measures this
+    /// machine's own index:
+    ///
+    /// ```text
+    /// cargo test --bin zdbview -- --ignored --nocapture reopening
+    /// ```
+    #[test]
+    #[ignore = "measures the machine's own saved index"]
+    fn reopening_the_picker_reads_the_index_in_a_keypress() {
+        if load_cache().is_none() {
+            eprintln!("no saved index on this machine — nothing to measure");
+            return;
+        }
+        let started = Instant::now();
+        let cached = load_cache().expect("it loaded a moment ago");
+        let loaded = started.elapsed();
+        let roots = default_roots();
+        let checking = Instant::now();
+        let todo = cached.refresh_roots(&roots);
+        let checked = checking.elapsed();
+        eprintln!(
+            "{} rows loaded in {loaded:.1?}, {} watched dirs checked in {checked:.1?}, {} to walk",
+            cached.hits.len(),
+            cached.dirs.len(),
+            todo.len()
+        );
+        assert!(
+            loaded + checked < Duration::from_millis(250),
+            "reading the index took {:.1?}",
+            loaded + checked
+        );
+    }
+
     /// The real thing, on the machine it is run on: a walk of every default root
     /// including `/`. Ignored by default because it reads the whole disk, which
     /// belongs in a deliberate run rather than in every `cargo test`:
