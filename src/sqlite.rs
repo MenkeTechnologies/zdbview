@@ -1868,6 +1868,143 @@ impl SqliteStore {
         }
     }
 
+    // ----- schema editing (DB Browser's Edit Table / Edit Index) -------------
+
+    /// The `sqlite_master` row for one object, as `(type, sql)`. An auto-index
+    /// has no `sql`, so it comes back with an empty statement rather than as a
+    /// missing object.
+    pub fn object_sql(&self, name: &str) -> Result<Option<(String, String)>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT type, COALESCE(sql, '') FROM sqlite_master WHERE name = ?1",
+                params![name],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+            )
+            .optional()?)
+    }
+
+    /// One table's definition, parsed from its own `CREATE` statement. The
+    /// pragmas cannot answer this — they do not report `COLLATE`, `CHECK`,
+    /// `UNIQUE` or a foreign key — and a rebuild driven by them would drop all
+    /// four, so the DDL is the source.
+    pub fn table_def(&self, table: &str) -> Result<crate::ddl::TableDef> {
+        let (ty, sql) = self
+            .object_sql(table)?
+            .ok_or_else(|| anyhow::anyhow!("{table} is not in this database"))?;
+        if ty != "table" {
+            return Err(anyhow::anyhow!("{table} is a {ty}, not a table"));
+        }
+        crate::ddl::parse_table(&sql)
+            .ok_or_else(|| anyhow::anyhow!("{table} is not an ordinary table"))
+    }
+
+    /// One index's definition, parsed the same way.
+    pub fn index_def(&self, name: &str) -> Result<crate::ddl::IndexDef> {
+        let (ty, sql) = self
+            .object_sql(name)?
+            .ok_or_else(|| anyhow::anyhow!("{name} is not in this database"))?;
+        if ty != "index" {
+            return Err(anyhow::anyhow!("{name} is a {ty}, not an index"));
+        }
+        if sql.is_empty() {
+            return Err(anyhow::anyhow!(
+                "{name} is an index SQLite created for a constraint, so it has no definition to edit"
+            ));
+        }
+        crate::ddl::parse_index(&sql).ok_or_else(|| anyhow::anyhow!("cannot parse {name}"))
+    }
+
+    /// Every object a rebuild of `table` has to put back: its indexes and
+    /// triggers, which go with the table when it is dropped, and any view that
+    /// names it, which a rename would leave dangling.
+    ///
+    /// A view is matched on the text of its statement because SQLite records no
+    /// dependency for one; the identifier has to appear in the statement for the
+    /// view to reference the table, so a text match cannot miss one, and a view
+    /// it matches spuriously is only re-created as it already was.
+    pub fn dependents(&self, table: &str) -> Result<Vec<crate::ddl::Dependent>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT type, name, COALESCE(sql, '') FROM sqlite_master \
+             WHERE sql IS NOT NULL AND name NOT LIKE 'sqlite_%' \
+             ORDER BY CASE type WHEN 'index' THEN 0 WHEN 'trigger' THEN 1 ELSE 2 END, name",
+        )?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows
+            .into_iter()
+            .filter(|(ty, _, sql)| {
+                matches!(ty.as_str(), "index" | "trigger" | "view")
+                    && crate::ddl::mentions_ident(sql, table)
+            })
+            .map(|(kind, name, sql)| crate::ddl::Dependent { kind, name, sql })
+            .collect())
+    }
+
+    /// Run a schema edit. Everything happens in one transaction, so a statement
+    /// that fails half way leaves the database exactly as it was.
+    ///
+    /// A rebuild additionally runs with foreign keys off and checks them at the
+    /// end, which is SQLite's own documented procedure: dropping the old table
+    /// would otherwise fire every child row's `ON DELETE` action, and the
+    /// enforcement setting cannot be changed inside a transaction, so it is
+    /// switched around the outside and put back afterwards.
+    pub fn apply_ddl(&self, plan: &crate::ddl::AlterPlan) -> Result<()> {
+        let fk_on: i64 = self
+            .conn
+            .query_row("PRAGMA foreign_keys", [], |r| r.get(0))
+            .unwrap_or(0);
+        if plan.rebuild && fk_on != 0 {
+            self.conn.execute_batch("PRAGMA foreign_keys = OFF")?;
+        }
+        let run = || -> Result<()> {
+            self.conn.execute_batch("BEGIN")?;
+            for sql in plan.statements.iter().filter(|s| !s.trim().is_empty()) {
+                self.conn
+                    .execute_batch(sql)
+                    .with_context(|| sql.replace('\n', " "))?;
+            }
+            if plan.rebuild {
+                let broken: Vec<String> = self
+                    .conn
+                    .prepare("PRAGMA foreign_key_check")?
+                    .query_map([], |r| {
+                        Ok(format!(
+                            "{} row {} → {}",
+                            r.get::<_, String>(0).unwrap_or_default(),
+                            r.get::<_, i64>(1).unwrap_or_default(),
+                            r.get::<_, String>(2).unwrap_or_default()
+                        ))
+                    })?
+                    .collect::<Result<Vec<_>, _>>()?;
+                if !broken.is_empty() {
+                    return Err(anyhow::anyhow!(
+                        "the edit would break {} foreign key(s): {}",
+                        broken.len(),
+                        broken.join("; ")
+                    ));
+                }
+            }
+            self.conn.execute_batch("COMMIT")?;
+            Ok(())
+        };
+        let result = run();
+        if result.is_err() {
+            let _ = self.conn.execute_batch("ROLLBACK");
+        }
+        if plan.rebuild && fk_on != 0 {
+            let _ = self.conn.execute_batch("PRAGMA foreign_keys = ON");
+        }
+        result
+    }
+
     /// Table and view names with their columns, for the SQL editor's completion.
     pub fn schema_names(&self) -> Vec<(String, Vec<String>)> {
         self.tables

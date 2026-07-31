@@ -12,6 +12,8 @@
 
 mod app;
 mod clipboard;
+mod ddl;
+mod designer;
 #[cfg(feature = "disasm")]
 mod disasm;
 mod export;
@@ -19,6 +21,7 @@ mod formats;
 mod frames;
 mod hexedit;
 mod import;
+mod input;
 mod monitor;
 mod mru;
 mod overlay;

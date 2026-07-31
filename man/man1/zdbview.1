@@ -565,7 +565,18 @@ leaves the editor, twice when there are unsaved edits. The editor is modal, so
 are its own motions and digits there rather than the help and scheme keys.
 .TP
 .B S
-Show the SQLite schema (CREATE statements for tables, views, and indexes).
+Show the SQLite schema: every object with its CREATE statement, plus the table
+and index designers.
+.B Enter
+edits the selected object,
+.B a
+creates a table,
+.B i
+an index,
+.B d
+drops the object after asking, and
+.B y
+copies its CREATE statement.
 .TP
 .B D
 Open the database report: the pragmas the shell's

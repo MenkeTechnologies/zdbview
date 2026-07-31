@@ -182,6 +182,9 @@ enum Mode {
     RenameRecord(String),
     /// Confirm a destructive action (delete row).
     ConfirmDelete,
+    /// Confirm dropping a schema object, as `(type, name)`. Dropping a table
+    /// takes its rows with it, so it is the one schema edit that asks first.
+    ConfirmDrop(String, String),
 }
 
 /// The views for a rkyv/binary file. `Records` is only available when the
@@ -238,6 +241,10 @@ enum Screen {
     Frames,
     /// SQLite schema (CREATE statements) view.
     Schema,
+    /// The table designer — DB Browser's "Edit Table Definition".
+    TableDesign,
+    /// The index designer — DB Browser's "Edit Index".
+    IndexDesign,
 }
 
 /// How the value pane renders raw bytes.
@@ -306,6 +313,12 @@ pub struct App {
     schema_scroll: usize,
     /// SQLite schema objects `(type, name, sql)`, loaded lazily.
     schema: Vec<(String, String, String)>,
+    /// Which schema object the cursor is on, indexing `schema`.
+    schema_idx: usize,
+    /// The table designer, while `screen` is `Screen::TableDesign`.
+    design: Option<crate::designer::TableDesigner>,
+    /// The index designer, while `screen` is `Screen::IndexDesign`.
+    index_design: Option<crate::designer::IndexDesigner>,
 
     // Mouse hit-testing: the on-screen rect and scroll offset of each clickable
     // list/grid, captured during render so a click maps to the right index.
@@ -437,6 +450,9 @@ impl App {
             detail_scroll: 0,
             schema_scroll: 0,
             schema: Vec::new(),
+            schema_idx: 0,
+            design: None,
+            index_design: None,
             click_left: Rect::ZERO,
             click_right: Rect::ZERO,
             click_records: Rect::ZERO,
@@ -511,7 +527,12 @@ impl App {
     /// bindings must stay out of the way: the hex editor (letters are hex digits
     /// and motions) and the SQL editor (letters are the statement).
     fn screen_owns_keys(&self) -> bool {
-        matches!(self.screen, Screen::HexEdit | Screen::Sql)
+        matches!(
+            self.screen,
+            // The designers take every printable key: `c`, `h` and `w` are text
+            // in a column name as readily as anywhere else.
+            Screen::HexEdit | Screen::Sql | Screen::TableDesign | Screen::IndexDesign
+        )
     }
 
     /// Which key sections the help overlay lists for what is on screen.
@@ -533,6 +554,12 @@ impl App {
         }
         if self.screen == Screen::Frames {
             return HelpCtx::Frames;
+        }
+        if matches!(
+            self.screen,
+            Screen::Schema | Screen::TableDesign | Screen::IndexDesign
+        ) {
+            return HelpCtx::Schema;
         }
         match &self.store {
             Store::Sqlite(_) => HelpCtx::Sqlite,
@@ -634,6 +661,7 @@ impl App {
             Add(String),
             Rename(String),
             Confirm,
+            Drop(String, String),
             None,
         }
         let modal = match &self.mode {
@@ -642,6 +670,7 @@ impl App {
             Mode::AddRecord(buf) => Modal::Add(buf.clone()),
             Mode::RenameRecord(buf) => Modal::Rename(buf.clone()),
             Mode::ConfirmDelete => Modal::Confirm,
+            Mode::ConfirmDrop(ty, name) => Modal::Drop(ty.clone(), name.clone()),
             Mode::Normal => Modal::None,
         };
         match modal {
@@ -682,6 +711,7 @@ impl App {
                 return self.key_input(key, buf, Mode::RenameRecord, App::commit_rename_record)
             }
             Modal::Confirm => return self.key_confirm_delete(code),
+            Modal::Drop(ty, name) => return self.key_confirm_drop(code, &ty, &name),
             Modal::None => {}
         }
 
@@ -718,6 +748,8 @@ impl App {
             Screen::Frames => return self.key_frames(code),
             Screen::Detail => return self.key_detail(code),
             Screen::Schema => return self.key_schema(code),
+            Screen::TableDesign => return self.key_table_design(key),
+            Screen::IndexDesign => return self.key_index_design(key),
             Screen::Main => {}
         }
 
@@ -873,24 +905,244 @@ impl App {
         }
     }
 
+    /// The schema screen is DB Browser's Database Structure tab: the objects,
+    /// their statements, and the edits that act on the object under the cursor.
     fn key_schema(&mut self, code: KeyCode) {
+        let last = self.schema.len().saturating_sub(1);
         match code {
             KeyCode::Char('q') => self.quit = true,
             KeyCode::Esc | KeyCode::Char('S') => {
                 self.screen = Screen::Main;
                 self.schema_scroll = 0;
             }
-            KeyCode::Down | KeyCode::Char('j') => self.schema_scroll += 1,
-            KeyCode::Up | KeyCode::Char('k') => {
-                self.schema_scroll = self.schema_scroll.saturating_sub(1)
+            KeyCode::Down | KeyCode::Char('j') => self.schema_idx = (self.schema_idx + 1).min(last),
+            KeyCode::Up | KeyCode::Char('k') => self.schema_idx = self.schema_idx.saturating_sub(1),
+            KeyCode::Char('g') | KeyCode::Home => self.schema_idx = 0,
+            KeyCode::Char('G') | KeyCode::End => self.schema_idx = last,
+            KeyCode::PageDown => self.schema_idx = (self.schema_idx + self.page_step()).min(last),
+            KeyCode::PageUp => self.schema_idx = self.schema_idx.saturating_sub(self.page_step()),
+            KeyCode::Enter | KeyCode::Char('e') => self.open_designer(),
+            KeyCode::Char('a') => self.open_new_table(),
+            KeyCode::Char('i') => self.open_new_index(),
+            KeyCode::Char('d') => {
+                if let Some((ty, name, _)) = self.schema.get(self.schema_idx) {
+                    self.mode = Mode::ConfirmDrop(ty.clone(), name.clone());
+                }
             }
-            KeyCode::Char('g') => self.schema_scroll = 0,
-            KeyCode::PageDown => self.schema_scroll += self.page_step(),
-            KeyCode::PageUp => {
-                self.schema_scroll = self.schema_scroll.saturating_sub(self.page_step())
-            }
+            KeyCode::Char('y') => self.copy_create_statement(),
             _ => {}
         }
+    }
+
+    /// `Enter`/`e` on the schema screen: open whichever designer fits the object.
+    fn open_designer(&mut self) {
+        let (ty, name) = match self.schema.get(self.schema_idx) {
+            Some((ty, name, _)) => (ty.clone(), name.clone()),
+            None => return,
+        };
+        match ty.as_str() {
+            "table" => match self.sqlite().map(|s| s.table_def(&name)) {
+                Some(Ok(def)) => {
+                    self.design = Some(crate::designer::TableDesigner::edit(def));
+                    self.screen = Screen::TableDesign;
+                }
+                Some(Err(e)) => self.notify(e.to_string()),
+                None => {}
+            },
+            "index" => {
+                let store = match self.sqlite() {
+                    Some(s) => s,
+                    None => return,
+                };
+                match store.index_def(&name) {
+                    Ok(def) => {
+                        let cols = store.columns(&def.table).unwrap_or_default();
+                        self.index_design = Some(crate::designer::IndexDesigner::edit(def, cols));
+                        self.screen = Screen::IndexDesign;
+                    }
+                    Err(e) => self.notify(e.to_string()),
+                }
+            }
+            other => self.notify(format!(
+                "{other}s have no designer — edit one as SQL with `:` (DROP then CREATE)"
+            )),
+        }
+    }
+
+    fn open_new_table(&mut self) {
+        if self.sqlite().is_none() {
+            return;
+        }
+        self.design = Some(crate::designer::TableDesigner::create());
+        self.screen = Screen::TableDesign;
+    }
+
+    /// `i` on the schema screen: a new index on the table under the cursor, or on
+    /// the table the object under the cursor belongs to.
+    fn open_new_index(&mut self) {
+        let table = match self.schema.get(self.schema_idx) {
+            Some((ty, name, _)) if ty == "table" => name.clone(),
+            Some((ty, name, _)) if ty == "index" => self
+                .sqlite()
+                .and_then(|s| s.index_def(name).ok())
+                .map(|d| d.table)
+                .unwrap_or_default(),
+            _ => self.current_table().unwrap_or_default(),
+        };
+        if table.is_empty() {
+            self.notify("select a table to index");
+            return;
+        }
+        let cols = self
+            .sqlite()
+            .and_then(|s| s.columns(&table).ok())
+            .unwrap_or_default();
+        self.index_design = Some(crate::designer::IndexDesigner::create(&table, cols));
+        self.screen = Screen::IndexDesign;
+    }
+
+    /// `y` on the schema screen — DB Browser's "Copy Create Statement".
+    fn copy_create_statement(&mut self) {
+        let sql = match self.schema.get(self.schema_idx) {
+            Some((_, _, sql)) if !sql.is_empty() => sql.clone(),
+            Some((ty, name, _)) => {
+                self.notify(format!("{ty} {name} has no statement — SQLite created it"));
+                return;
+            }
+            None => return,
+        };
+        let ok = crate::clipboard::copy(&sql);
+        self.notify(if ok {
+            format!("copied {} bytes to clipboard", sql.len())
+        } else {
+            "clipboard unavailable (no tty)".into()
+        });
+    }
+
+    fn key_confirm_drop(&mut self, code: KeyCode, ty: &str, name: &str) {
+        self.mode = Mode::Normal;
+        if !matches!(code, KeyCode::Char('y') | KeyCode::Char('Y')) {
+            return;
+        }
+        let sql = match crate::ddl::drop_sql(ty, name) {
+            Some(s) => s,
+            None => return,
+        };
+        let plan = crate::ddl::AlterPlan {
+            statements: vec![sql],
+            rebuild: false,
+        };
+        match self.sqlite().map(|s| s.apply_ddl(&plan)) {
+            Some(Ok(())) => {
+                self.after_schema_edit(format!("dropped {ty} {name}"));
+            }
+            Some(Err(e)) => self.notify(format!("drop failed: {e}")),
+            None => {}
+        }
+    }
+
+    fn key_table_design(&mut self, key: KeyEvent) {
+        let action = match self.design.as_mut() {
+            Some(d) => d.on_key(key),
+            None => {
+                self.screen = Screen::Schema;
+                return;
+            }
+        };
+        match action {
+            crate::designer::Action::None => {}
+            crate::designer::Action::Note(msg) => self.notify(msg),
+            crate::designer::Action::Cancel => {
+                self.design = None;
+                self.screen = Screen::Schema;
+            }
+            crate::designer::Action::Apply => self.apply_table_design(),
+        }
+    }
+
+    fn apply_table_design(&mut self) {
+        let designer = match self.design.as_ref() {
+            Some(d) => d,
+            None => return,
+        };
+        // A rebuild has to put the table's indexes, triggers and views back, so
+        // they are read before anything is dropped.
+        let aux = match (&designer.original, self.sqlite()) {
+            (Some(old), Some(store)) => store.dependents(&old.name).unwrap_or_default(),
+            _ => Vec::new(),
+        };
+        let plan = match designer.plan(&aux) {
+            Ok(p) => p,
+            Err(e) => return self.notify(e),
+        };
+        let name = designer.def.name.clone();
+        let created = designer.original.is_none();
+        match self.sqlite().map(|s| s.apply_ddl(&plan)) {
+            Some(Ok(())) => {
+                self.design = None;
+                self.screen = Screen::Schema;
+                let what = if created { "created" } else { "wrote" };
+                let how = if plan.rebuild { " (rebuilt)" } else { "" };
+                self.after_schema_edit(format!("{what} table {name}{how}"));
+            }
+            Some(Err(e)) => self.notify(format!("write failed: {e}")),
+            None => {}
+        }
+    }
+
+    fn key_index_design(&mut self, key: KeyEvent) {
+        let action = match self.index_design.as_mut() {
+            Some(d) => d.on_key(key),
+            None => {
+                self.screen = Screen::Schema;
+                return;
+            }
+        };
+        match action {
+            crate::designer::Action::None => {}
+            crate::designer::Action::Note(msg) => self.notify(msg),
+            crate::designer::Action::Cancel => {
+                self.index_design = None;
+                self.screen = Screen::Schema;
+            }
+            crate::designer::Action::Apply => self.apply_index_design(),
+        }
+    }
+
+    fn apply_index_design(&mut self) {
+        let designer = match self.index_design.as_ref() {
+            Some(d) => d,
+            None => return,
+        };
+        let plan = match designer.plan() {
+            Ok(p) => p,
+            Err(e) => return self.notify(e),
+        };
+        let name = designer.def.name.clone();
+        match self.sqlite().map(|s| s.apply_ddl(&plan)) {
+            Some(Ok(())) => {
+                self.index_design = None;
+                self.screen = Screen::Schema;
+                self.after_schema_edit(format!("wrote index {name}"));
+            }
+            Some(Err(e)) => self.notify(format!("write failed: {e}")),
+            None => {}
+        }
+    }
+
+    /// After any schema edit: every cached fact about the database is stale, the
+    /// object list has changed, and the grid may be looking at a table that no
+    /// longer has the columns it is displaying.
+    fn after_schema_edit(&mut self, note: String) {
+        self.schema_changed();
+        if let Some(s) = self.sqlite() {
+            self.schema = s.schema().unwrap_or_default();
+        }
+        self.schema_idx = self.schema_idx.min(self.schema.len().saturating_sub(1));
+        // The grid may be on a table that has just been renamed, dropped or
+        // reshaped, so it is re-selected rather than left showing stale columns.
+        self.select_table(self.table_idx);
+        self.notify(note);
     }
 
     /// Enter the detail screen for the current SQLite row or rkyv record.
@@ -1313,15 +1565,15 @@ impl App {
                 commit(self, &buf);
                 return;
             }
-            KeyCode::Left => cur = input_left(&buf, cur),
-            KeyCode::Right => cur = input_right(&buf, cur),
+            KeyCode::Left => cur = crate::input::left(&buf, cur),
+            KeyCode::Right => cur = crate::input::right(&buf, cur),
             KeyCode::Home => cur = 0,
             KeyCode::End => cur = buf.len(),
             KeyCode::Char('a') if ctrl => cur = 0,
             KeyCode::Char('e') if ctrl => cur = buf.len(),
-            KeyCode::Char('b') if ctrl => cur = input_left(&buf, cur),
-            KeyCode::Char('f') if ctrl => cur = input_right(&buf, cur),
-            KeyCode::Char('w') if ctrl => cur = input_delete_word(&mut buf, cur),
+            KeyCode::Char('b') if ctrl => cur = crate::input::left(&buf, cur),
+            KeyCode::Char('f') if ctrl => cur = crate::input::right(&buf, cur),
+            KeyCode::Char('w') if ctrl => cur = crate::input::delete_word(&mut buf, cur),
             KeyCode::Char('u') if ctrl => {
                 buf.drain(..cur);
                 cur = 0;
@@ -1329,14 +1581,14 @@ impl App {
             KeyCode::Char('k') if ctrl => buf.truncate(cur),
             KeyCode::Backspace => {
                 if cur > 0 {
-                    let p = input_left(&buf, cur);
+                    let p = crate::input::left(&buf, cur);
                     buf.drain(p..cur);
                     cur = p;
                 }
             }
             KeyCode::Delete => {
                 if cur < buf.len() {
-                    let n = input_right(&buf, cur);
+                    let n = crate::input::right(&buf, cur);
                     buf.drain(cur..n);
                 }
             }
@@ -2603,6 +2855,18 @@ impl App {
                 }
             }
             Screen::Schema => self.render_schema(f, outer[0]),
+            Screen::TableDesign => {
+                let t = self.ov.theme;
+                if let Some(d) = self.design.as_mut() {
+                    d.render(f, outer[0], &t);
+                }
+            }
+            Screen::IndexDesign => {
+                let t = self.ov.theme;
+                if let Some(d) = self.index_design.as_mut() {
+                    d.render(f, outer[0], &t);
+                }
+            }
             Screen::Main => match &self.store {
                 Store::Sqlite(_) => self.render_sqlite(f, outer[0]),
                 Store::Rkyv(_) => self.render_rkyv(f, outer[0]),
@@ -2622,6 +2886,16 @@ impl App {
                     Store::Rkyv(_) => "record (rewrites the cache file)",
                 };
                 self.render_input(f, &format!("delete this {}? (y = yes, any = no)", what), "")
+            }
+            Mode::ConfirmDrop(ty, name) => {
+                let extra = if ty == "table" { ", with its rows" } else { "" };
+                let title = format!(
+                    "DROP {} {}{}? (y = yes, any = no)",
+                    ty.to_uppercase(),
+                    name,
+                    extra
+                );
+                self.render_input(f, &title, "")
             }
             Mode::Normal => {}
         }
@@ -3718,12 +3992,24 @@ impl App {
         }
     }
 
-    fn render_schema(&self, f: &mut Frame, area: Rect) {
+    fn render_schema(&mut self, f: &mut Frame, area: Rect) {
         let mut lines: Vec<Line> = Vec::new();
-        for (ty, name, sql) in &self.schema {
+        // Where each object's header line lands, so the scroll can follow the
+        // selection rather than counting statements by hand.
+        let mut anchor: Vec<usize> = Vec::new();
+        for (i, (ty, name, sql)) in self.schema.iter().enumerate() {
+            anchor.push(lines.len());
+            let selected = i == self.schema_idx;
+            let mut head = Style::default().add_modifier(Modifier::BOLD);
+            if selected {
+                head = head.add_modifier(Modifier::REVERSED);
+            }
             lines.push(Line::from(vec![
-                Span::styled(format!("{:<6}", ty), Style::default().fg(self.ov.theme.alt)),
-                Span::styled(name.clone(), Style::default().add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    format!("{} {:<6} ", if selected { "▸" } else { " " }, ty),
+                    Style::default().fg(self.ov.theme.alt),
+                ),
+                Span::styled(name.clone(), head),
             ]));
             for l in sql.lines() {
                 lines.push(Line::from(Span::styled(
@@ -3733,7 +4019,23 @@ impl App {
             }
             lines.push(Line::from(""));
         }
-        let height = area.height.saturating_sub(2) as usize;
+        let height = (area.height.saturating_sub(2) as usize).max(1);
+        // Keep the selected object's header on screen, and as much of its
+        // statement under it as fits.
+        if let Some(&at) = anchor.get(self.schema_idx) {
+            if at < self.schema_scroll {
+                self.schema_scroll = at;
+            } else {
+                let end = anchor
+                    .get(self.schema_idx + 1)
+                    .copied()
+                    .unwrap_or(lines.len());
+                let want = end.min(at + height);
+                if want > self.schema_scroll + height {
+                    self.schema_scroll = want - height;
+                }
+            }
+        }
         let visible: Vec<Line> = lines
             .into_iter()
             .skip(self.schema_scroll)
@@ -3741,7 +4043,8 @@ impl App {
             .collect();
         f.render_widget(
             Paragraph::new(visible).block(Block::default().borders(Borders::ALL).title(format!(
-                " schema — {} objects (j/k scroll · Esc back) ",
+                " schema — {} objects (j/k select · Enter edit · a table · i index · \
+                 d drop · y copy · Esc back) ",
                 self.schema.len()
             ))),
             area,
@@ -5022,50 +5325,6 @@ fn hit(r: Rect, col: u16, row: u16) -> bool {
         && row < r.y.saturating_add(r.height)
 }
 
-/// Move the cursor one char left (UTF-8-safe). Ported from iftoprs `FilterState::left`.
-fn input_left(buf: &str, cur: usize) -> usize {
-    if cur > 0 {
-        buf[..cur]
-            .char_indices()
-            .next_back()
-            .map(|(i, _)| i)
-            .unwrap_or(0)
-    } else {
-        0
-    }
-}
-
-/// Move the cursor one char right (UTF-8-safe). Ported from iftoprs `FilterState::right`.
-fn input_right(buf: &str, cur: usize) -> usize {
-    if cur < buf.len() {
-        buf[cur..]
-            .char_indices()
-            .nth(1)
-            .map(|(i, _)| cur + i)
-            .unwrap_or(buf.len())
-    } else {
-        buf.len()
-    }
-}
-
-/// Delete the word before the cursor (Ctrl+W). Ported from iftoprs
-/// `FilterState::delete_word` — skips trailing whitespace, then the word,
-/// stepping by real UTF-8 widths. Returns the new cursor position.
-fn input_delete_word(buf: &mut String, cur: usize) -> usize {
-    let s = &buf[..cur];
-    let trimmed = s.trim_end();
-    let word_start = match trimmed
-        .char_indices()
-        .rev()
-        .find(|(_, c)| c.is_whitespace())
-    {
-        Some((i, c)) => i + c.len_utf8(),
-        None => 0,
-    };
-    buf.drain(word_start..cur);
-    word_start
-}
-
 /// Parse a value-input string: a `0x…` prefix is decoded as hex bytes (spaces
 /// Lowercase hex of a byte slice.
 /// Whether a byte slice is mostly printable/UTF-8 text (heuristic for Auto
@@ -5228,9 +5487,7 @@ fn centered(area: Rect, w: u16, h: u16) -> Rect {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        find_bytes, find_next, hit, input_delete_word, input_left, input_right, App, Store,
-    };
+    use super::{find_bytes, find_next, hit, App, Store};
     use crate::mru::Entry;
     use crate::overlay::HelpCtx;
     use crate::rkyv_inspect::RkyvStore;
@@ -6778,9 +7035,11 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    /// The detail screen's value pane and the schema view page too.
+    /// The detail screen's value pane pages too. The schema screen pages its
+    /// selection rather than its scroll, which
+    /// [`the_schema_screen_follows_its_selection`] covers.
     #[test]
-    fn paging_scrolls_the_detail_and_schema_screens() {
+    fn paging_scrolls_the_detail_screen() {
         let (mut app, path) = sqlite_app_rows(5);
         app.on_key(KeyEvent::from(KeyCode::Tab));
         app.on_key(KeyEvent::from(KeyCode::Enter)); // detail
@@ -6795,14 +7054,6 @@ mod tests {
         assert_eq!(app.detail_scroll, 0);
         app.on_key(KeyEvent::from(KeyCode::Esc));
 
-        app.on_key(KeyEvent::from(KeyCode::Char('S'))); // schema
-        assert_eq!(app.screen, super::Screen::Schema);
-        frame_rows(&mut app, 80, 30);
-        let step = app.page_rows;
-        app.on_key(KeyEvent::from(KeyCode::PageDown));
-        assert_eq!(app.schema_scroll, step);
-        app.on_key(KeyEvent::from(KeyCode::PageUp));
-        assert_eq!(app.schema_scroll, 0);
         let _ = std::fs::remove_file(&path);
     }
 
@@ -7432,19 +7683,19 @@ mod tests {
     fn cursor_left_right_utf8() {
         // "aé" — 'é' is 2 bytes, so byte offsets are 0,1,3.
         let s = "aé";
-        assert_eq!(input_right(s, 0), 1); // past 'a'
-        assert_eq!(input_right(s, 1), 3); // past 'é'
-        assert_eq!(input_right(s, 3), 3); // at end, stays
-        assert_eq!(input_left(s, 3), 1); // before 'é'
-        assert_eq!(input_left(s, 1), 0);
-        assert_eq!(input_left(s, 0), 0);
+        assert_eq!(crate::input::right(s, 0), 1); // past 'a'
+        assert_eq!(crate::input::right(s, 1), 3); // past 'é'
+        assert_eq!(crate::input::right(s, 3), 3); // at end, stays
+        assert_eq!(crate::input::left(s, 3), 1); // before 'é'
+        assert_eq!(crate::input::left(s, 1), 0);
+        assert_eq!(crate::input::left(s, 0), 0);
     }
 
     #[test]
     fn delete_word_skips_trailing_space() {
         let mut s = String::from("foo bar  ");
         let len = s.len();
-        let cur = input_delete_word(&mut s, len);
+        let cur = crate::input::delete_word(&mut s, len);
         assert_eq!(s, "foo ");
         assert_eq!(cur, 4);
     }
@@ -7494,5 +7745,143 @@ mod tests {
         assert_eq!(find_bytes(hay, b"ab", 4, false), Some(0));
         assert_eq!(find_bytes(hay, b"zz", 0, true), None); // case-sensitive
         assert_eq!(find_bytes(hay, b"", 0, true), None);
+    }
+
+    // ----- schema screen and designers --------------------------------------
+
+    /// The whole path DB Browser's Edit Table Definition covers, driven by keys:
+    /// schema screen → designer → a changed column type → written back. The type
+    /// change is the case `ALTER TABLE` cannot express, so this also proves the
+    /// rebuild runs and keeps the row.
+    #[test]
+    fn the_designer_writes_a_changed_column_type_through_a_rebuild() {
+        let (mut app, path) = sqlite_app();
+        press(&mut app, 'S');
+        assert_eq!(app.screen, super::Screen::Schema);
+        assert_eq!(app.schema[app.schema_idx].1, "t");
+
+        app.on_key(KeyEvent::from(KeyCode::Enter));
+        assert_eq!(app.screen, super::Screen::TableDesign);
+
+        // Column 1, field 1 is its type. Clear it and type a new one.
+        app.on_key(KeyEvent::from(KeyCode::Right));
+        app.on_key(KeyEvent::from(KeyCode::Enter));
+        app.on_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        for c in "INTEGER".chars() {
+            press(&mut app, c);
+        }
+        app.on_key(KeyEvent::from(KeyCode::Enter));
+        press(&mut app, 'W');
+
+        assert_eq!(app.screen, super::Screen::Schema, "the designer closed");
+        let def = app.sqlite().unwrap().table_def("t").unwrap();
+        assert_eq!(def.columns[0].ty, "INTEGER");
+        // The row survived the rebuild.
+        let n: i64 = app.sqlite().unwrap().count_exact("t", "").unwrap();
+        assert_eq!(n, 1);
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// Esc anywhere in the designer leaves the database alone.
+    #[test]
+    fn cancelling_the_designer_writes_nothing() {
+        let (mut app, path) = sqlite_app();
+        press(&mut app, 'S');
+        app.on_key(KeyEvent::from(KeyCode::Enter));
+        press(&mut app, 'd'); // drop the column from the definition
+        app.on_key(KeyEvent::from(KeyCode::Esc));
+        assert_eq!(app.screen, super::Screen::Schema);
+        let def = app.sqlite().unwrap().table_def("t").unwrap();
+        assert_eq!(def.columns.len(), 3, "the table still has every column");
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// `d` on the schema screen asks before it drops, and only `y` goes through.
+    #[test]
+    fn dropping_an_object_asks_first() {
+        let (mut app, path) = sqlite_app();
+        press(&mut app, 'S');
+        press(&mut app, 'd');
+        assert!(matches!(app.mode, super::Mode::ConfirmDrop(_, _)));
+        let rows = frame_rows(&mut app, 90, 20);
+        assert!(contains(&rows, "DROP TABLE t"), "{rows:?}");
+
+        press(&mut app, 'n');
+        assert!(app.sqlite().unwrap().object_sql("t").unwrap().is_some());
+
+        press(&mut app, 'd');
+        press(&mut app, 'y');
+        assert!(
+            app.sqlite().unwrap().object_sql("t").unwrap().is_none(),
+            "confirmed drop went through"
+        );
+        assert!(app.schema.is_empty(), "the object list was reloaded");
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// `i` on the schema screen builds an index on the selected table, and the
+    /// designer's own keys shape it.
+    #[test]
+    fn the_index_designer_creates_an_index_on_the_selected_table() {
+        let (mut app, path) = sqlite_app();
+        press(&mut app, 'S');
+        press(&mut app, 'i');
+        assert_eq!(app.screen, super::Screen::IndexDesign);
+        // Row 2 is UNIQUE; turn it on, then write.
+        app.on_key(KeyEvent::from(KeyCode::Down));
+        app.on_key(KeyEvent::from(KeyCode::Down));
+        press(&mut app, ' ');
+        press(&mut app, 'W');
+        assert_eq!(app.screen, super::Screen::Schema);
+        let idx = app.sqlite().unwrap().index_def("idx_t").unwrap();
+        assert!(idx.unique);
+        assert_eq!(idx.table, "t");
+        assert_eq!(idx.columns[0].expr, "a");
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// A definition SQLite would reject is reported in the status line, and the
+    /// designer stays open on it instead of closing over a failed write.
+    #[test]
+    fn an_invalid_definition_keeps_the_designer_open() {
+        let (mut app, path) = sqlite_app();
+        press(&mut app, 'S');
+        app.on_key(KeyEvent::from(KeyCode::Enter));
+        // Empty the first column's name, then try to write.
+        app.on_key(KeyEvent::from(KeyCode::Enter));
+        app.on_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        app.on_key(KeyEvent::from(KeyCode::Enter));
+        press(&mut app, 'W');
+        assert_eq!(app.screen, super::Screen::TableDesign, "still open");
+        let rows = frame_rows(&mut app, 90, 24);
+        assert!(contains(&rows, "column 1 needs a name"), "{rows:?}");
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// The schema screen scrolls to whichever object is selected, however long
+    /// the statements above it are.
+    #[test]
+    fn the_schema_screen_follows_its_selection() {
+        let path = scratch("db");
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        // Statements long enough that the last object is far off the first page.
+        for i in 0..8 {
+            conn.execute_batch(&format!(
+                "CREATE TABLE t{i} (\n a TEXT,\n b TEXT,\n c TEXT,\n d TEXT,\n e TEXT\n)"
+            ))
+            .unwrap();
+        }
+        drop(conn);
+        let store = Store::Sqlite(SqliteStore::open(&path).unwrap());
+        let mut app = App::with_theme(store, Theme::from_name(ThemeName::NeonSprawl));
+        press(&mut app, 'S');
+        press(&mut app, 'G');
+        assert_eq!(app.schema_idx, 7);
+        let rows = frame_rows(&mut app, 80, 20);
+        assert!(contains(&rows, "▸ table  t7"), "{rows:?}");
+        press(&mut app, 'g');
+        let rows = frame_rows(&mut app, 80, 20);
+        assert!(contains(&rows, "▸ table  t0"), "{rows:?}");
+        let _ = std::fs::remove_file(path);
     }
 }

@@ -13,6 +13,10 @@ use std::io::Write;
 // code in the test file itself is still reported.
 // `rkyv_inspect` formats its hex rows through `hexedit` (one shared layout for
 // every hex view), which in turn styles from `theme`, so both come along.
+// `sqlite` reads and rewrites schema definitions through `ddl`.
+#[allow(dead_code)]
+#[path = "../src/ddl.rs"]
+mod ddl;
 #[allow(dead_code)]
 #[path = "../src/hexedit.rs"]
 mod hexedit;
@@ -1566,4 +1570,193 @@ fn recover_reads_a_table_without_rowid() {
     for p in [path, replay] {
         let _ = std::fs::remove_file(p);
     }
+}
+
+// ----- schema editing (DB Browser's Edit Table / Edit Index) -----------------
+
+/// The rebuild path, end to end against a real file: a column dropped and the
+/// remaining ones retyped, with an index, a trigger and a view over the table.
+/// This is the edit `ALTER TABLE` cannot express, and the one where a careless
+/// implementation loses the rows or the dependent objects.
+#[test]
+fn rebuilding_a_table_keeps_its_rows_indexes_triggers_and_views() {
+    let path = tmp("ddl_rebuild.db");
+    let _ = std::fs::remove_file(&path);
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE t (a TEXT, b TEXT, note TEXT);
+         CREATE INDEX t_a ON t (a);
+         CREATE TABLE log (msg TEXT);
+         CREATE TRIGGER t_ins AFTER INSERT ON t BEGIN INSERT INTO log VALUES ('t'); END;
+         CREATE VIEW t_view AS SELECT a FROM t;
+         INSERT INTO t VALUES ('1', 'keep', 'gone');
+         INSERT INTO t VALUES ('2', 'keep', 'gone');",
+    )
+    .unwrap();
+    drop(conn);
+
+    let store = SqliteStore::open(&path).unwrap();
+    let old = store.table_def("t").unwrap();
+    let mut new = old.clone();
+    new.columns.retain(|c| c.name != "note"); // drop a column
+    new.columns[0].ty = "INTEGER".into(); // and retype another
+    let aux = store.dependents("t").unwrap();
+    assert_eq!(aux.len(), 3, "index, trigger and view are all dependents");
+
+    let plan = ddl::plan(&old, &new, &aux);
+    assert!(plan.rebuild);
+    store.apply_ddl(&plan).expect("the rebuild must apply");
+
+    let after = SqliteStore::open(&path).unwrap();
+    let def = after.table_def("t").unwrap();
+    assert_eq!(def.columns.len(), 2);
+    assert_eq!(def.columns[0].ty, "INTEGER");
+    assert_eq!(after.count_exact("t", "").unwrap(), 2, "rows survived");
+    assert_eq!(
+        after.indexes("t").unwrap().len(),
+        1,
+        "the index was recreated"
+    );
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    // The trigger and the view came back and still work. The two setup inserts
+    // already fired the trigger, so the delta is what this asserts.
+    let before: i64 = conn
+        .query_row("SELECT count(*) FROM log", [], |r| r.get(0))
+        .unwrap();
+    conn.execute("INSERT INTO t (a, b) VALUES (3, 'keep')", [])
+        .unwrap();
+    let logged: i64 = conn
+        .query_row("SELECT count(*) FROM log", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(logged, before + 1, "the trigger fired after the rebuild");
+    let viewed: i64 = conn
+        .query_row("SELECT count(*) FROM t_view", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(viewed, 3, "the view still reads the table");
+    drop(conn);
+    let _ = std::fs::remove_file(&path);
+}
+
+/// A rebuild that would orphan a child row is refused, and refusing it leaves
+/// the database exactly as it was — no half-built table, no dropped original.
+#[test]
+fn a_rebuild_that_breaks_a_foreign_key_is_rolled_back() {
+    let path = tmp("ddl_fk.db");
+    let _ = std::fs::remove_file(&path);
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute_batch(
+        "PRAGMA foreign_keys = ON;
+         CREATE TABLE parent (id INTEGER PRIMARY KEY);
+         CREATE TABLE child (pid INTEGER REFERENCES parent(id));
+         INSERT INTO parent VALUES (1);
+         INSERT INTO child VALUES (1);",
+    )
+    .unwrap();
+    drop(conn);
+
+    let store = SqliteStore::open(&path).unwrap();
+    store.exec("PRAGMA foreign_keys = ON").unwrap();
+    let old = store.table_def("parent").unwrap();
+    let mut new = old.clone();
+    // Rebuild the parent with nothing in it: every child row is then an orphan.
+    new.columns[0].ty = "INT".into();
+    let mut plan = ddl::plan(&old, &new, &store.dependents("parent").unwrap());
+    plan.statements.retain(|s| !s.starts_with("INSERT INTO"));
+    let err = store.apply_ddl(&plan).unwrap_err().to_string();
+    assert!(err.contains("foreign key"), "{err}");
+
+    let after = SqliteStore::open(&path).unwrap();
+    assert_eq!(
+        after.count_exact("parent", "").unwrap(),
+        1,
+        "the original table and its row are untouched"
+    );
+    assert!(
+        after.object_sql("zdbview_rebuild_tmp").unwrap().is_none(),
+        "the half-built table was rolled back"
+    );
+    let _ = std::fs::remove_file(&path);
+}
+
+/// An index SQLite created for a UNIQUE constraint has no statement of its own,
+/// so it is reported as uneditable rather than parsed into an empty definition.
+#[test]
+fn an_auto_index_has_no_definition_to_edit() {
+    let path = tmp("ddl_autoindex.db");
+    let _ = std::fs::remove_file(&path);
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute_batch("CREATE TABLE t (a TEXT UNIQUE)")
+        .unwrap();
+    drop(conn);
+    let store = SqliteStore::open(&path).unwrap();
+    let auto = store
+        .indexes("t")
+        .unwrap()
+        .into_iter()
+        .map(|(n, _)| n)
+        .find(|n| n.starts_with("sqlite_autoindex"))
+        .expect("the constraint made one");
+    let err = store.index_def(&auto).unwrap_err().to_string();
+    assert!(err.contains("no definition to edit"), "{err}");
+    let _ = std::fs::remove_file(&path);
+}
+
+/// Creating a table through the planner produces something SQLite accepts, with
+/// every constraint the designer can set on it.
+#[test]
+fn a_created_table_carries_every_constraint_the_designer_sets() {
+    let path = tmp("ddl_create.db");
+    let _ = std::fs::remove_file(&path);
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE parent (id INTEGER PRIMARY KEY);
+         INSERT INTO parent VALUES (1);",
+    )
+    .unwrap();
+    drop(conn);
+
+    let store = SqliteStore::open(&path).unwrap();
+    let mut def = ddl::TableDef {
+        name: "made".into(),
+        columns: vec![
+            ddl::ColumnDef::new("id", "INTEGER"),
+            ddl::ColumnDef::new("sku", "TEXT"),
+            ddl::ColumnDef::new("pid", "INTEGER"),
+        ],
+        ..Default::default()
+    };
+    def.columns[0].pk = true;
+    def.columns[0].autoincrement = true;
+    def.columns[1].not_null = true;
+    def.columns[1].unique = true;
+    def.columns[1].collate = "NOCASE".into();
+    def.columns[1].check = "length(sku) > 0".into();
+    def.columns[2].fk = "REFERENCES parent(id)".into();
+    store.apply_ddl(&ddl::plan_create(&def)).unwrap();
+
+    // Read it back through the parser: what was set is what is stored.
+    let after = SqliteStore::open(&path).unwrap();
+    let read = after.table_def("made").unwrap();
+    assert!(read.columns[0].pk && read.columns[0].autoincrement);
+    assert!(read.columns[1].not_null && read.columns[1].unique);
+    assert_eq!(read.columns[1].collate, "NOCASE");
+    assert_eq!(read.columns[1].check, "length(sku) > 0");
+    assert!(read.columns[2].fk.starts_with("REFERENCES parent(id)"));
+
+    // And the constraints are live, not decorative.
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    assert!(
+        conn.execute("INSERT INTO made (sku, pid) VALUES ('', NULL)", [])
+            .is_err(),
+        "the CHECK must reject an empty sku"
+    );
+    conn.execute("INSERT INTO made (sku, pid) VALUES ('a', 1)", [])
+        .unwrap();
+    assert!(
+        conn.execute("INSERT INTO made (sku, pid) VALUES ('A', 1)", [])
+            .is_err(),
+        "NOCASE UNIQUE must reject a case-folded duplicate"
+    );
+    drop(conn);
+    let _ = std::fs::remove_file(&path);
 }

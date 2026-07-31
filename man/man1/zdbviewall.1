@@ -335,8 +335,28 @@ From the table list, move focus to the rows; from the row grid, open the detail
 screen for the selected row.
 .TP
 .B S
-Open the schema screen for the database: the CREATE statements for tables, views
-and indexes.
+Open the schema screen: every object with its CREATE statement, and the
+designers that edit them. On that screen
+.BR Enter " opens the table or index designer, " a " starts a new table, "
+.BR i " a new index on the selected table, " d " drops the object after asking,"
+and
+.B y
+copies its CREATE statement. In a designer the arrows move by row and field,
+.B Enter
+edits a field,
+.B Space
+toggles a flag,
+.BR a " / " d
+add and drop a column,
+.BR J " / " K
+reorder,
+.B W
+writes and
+.B Esc
+cancels. Only renaming a table, renaming a column, appending one and dropping
+one are native ALTER TABLE; every other edit runs SQLite's documented rebuild in
+one transaction, with foreign keys off and PRAGMA foreign_key_check before the
+commit.
 .TP
 .BR k ", " Up
 Previous table (left pane) or previous row (right pane).

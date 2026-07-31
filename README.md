@@ -332,7 +332,7 @@ is published on crates.io); disable with `--no-default-features`.
 | `s` | sort by the cursor column (ascending → descending → off) |
 | `<` / `>` | move the sort to the previous / next column |
 | `a` `e` `r` `d` | create / hex-edit value / rename / delete record (rkyv) |
-| `S` | schema view (SQLite) |
+| `S` | schema: the objects, and the designers that edit them (SQLite) |
 | `D` | database report: pragmas, integrity check, foreign-key lint, maintenance (SQLite) |
 | `A` | column statistics for the table, with a per-column frequency table (SQLite) |
 | `F` | follow the foreign key under the cursor to the row it references (SQLite) |
@@ -534,6 +534,85 @@ index.
 History persists to `$XDG_CACHE_HOME/zdbview/sql_history` (200 statements, newlines
 escaped so one statement stays one line), written temp-plus-rename like the other
 appdata.
+
+## Schema editing (`S`)
+
+`S` lists every object with its `CREATE` statement — the objects DB Browser puts
+in its Database Structure tab — and the cursor selects one:
+
+| Key | Does |
+|-----|------|
+| `j` / `k`, `g` / `G`, `PgUp` / `PgDn` | select an object |
+| `Enter` / `e` | open the designer for a table or an index |
+| `a` | new table |
+| `i` | new index on the selected table |
+| `d` | drop the object (asks first) |
+| `y` | copy its `CREATE` statement — DB Browser's "Copy Create Statement" |
+
+Both designers are grids of fields with the SQL they will run shown underneath,
+so the statement is visible before it is applied:
+
+| Key | Does |
+|-----|------|
+| arrows, `Tab` | move by row and by field |
+| `Enter` / `e` | edit the field under the cursor |
+| `Space` | toggle the flag under the cursor |
+| `a` / `d` | add / drop a column |
+| `J` / `K` | move the column down / up |
+| `W` | write the change |
+| `Esc` | cancel, touching nothing |
+
+The table designer sets everything SQLite lets a column carry: type, `PRIMARY
+KEY`, `AUTOINCREMENT`, `NOT NULL`, `UNIQUE`, `DEFAULT`, `COLLATE`, `CHECK` and
+`REFERENCES`, plus `WITHOUT ROWID` and `STRICT` on the table. Turning
+`AUTOINCREMENT` on makes the column the table's single `INTEGER` key, because
+that is the only form SQLite accepts.
+
+### What the definition is read from
+
+The object's own `CREATE` statement, not the pragmas. `PRAGMA table_info` reports
+a column's name, type, `NOT NULL`, default and key and nothing else — it cannot
+see `COLLATE`, `CHECK`, `UNIQUE`, `REFERENCES` or a generated expression — so a
+rebuild driven by the pragmas would quietly drop all five. The statement is
+parsed instead, and anything the model does not cover is carried through
+verbatim rather than lost.
+
+### What each edit costs
+
+Only four schema edits are native `ALTER TABLE` in SQLite: renaming the table,
+renaming a column, appending a column and dropping one. When the edit is one of
+those, that is what runs:
+
+```
+ALTER TABLE "t" RENAME COLUMN "a" TO "a2"
+ALTER TABLE "t" ADD COLUMN "b" INTEGER
+```
+
+Anything else — a changed type, a changed constraint, a reordered column, an
+appended `NOT NULL` column with no default (which `ADD COLUMN` rejects) — is the
+rebuild SQLite documents and DB Browser performs:
+
+```
+CREATE TABLE "zdbview_rebuild_tmp" (…)      the new shape
+INSERT INTO "zdbview_rebuild_tmp" (…) SELECT … FROM "t"
+DROP VIEW "v"                                see below
+DROP TABLE "t"
+ALTER TABLE "zdbview_rebuild_tmp" RENAME TO "t"
+CREATE INDEX … / CREATE TRIGGER … / CREATE VIEW …
+```
+
+The whole rebuild is one transaction, run with foreign keys off and
+`PRAGMA foreign_key_check` before the commit, so an edit that would orphan a
+child row is refused and leaves the database exactly as it was.
+
+The views and triggers come down before the swap because they have to: SQLite
+validates every object in the schema during `ALTER TABLE … RENAME TO`, and one
+still pointing at the table the rebuild has just dropped fails the rename with
+`error in view v: no such table`. They are recreated afterwards, following the
+table's new name and any renamed columns — an index through the parser, so its
+table and columns are re-derived; a trigger or view by identifier rewriting,
+which leaves string literals alone. An index whose column no longer exists is
+not recreated.
 
 ## Database report (`D`)
 

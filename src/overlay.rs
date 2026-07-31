@@ -66,6 +66,8 @@ pub enum HelpCtx {
     Stats,
     /// The write-ahead log walker.
     Frames,
+    /// The schema screen, where the designers are reached from.
+    Schema,
 }
 
 /// The overlay layer: active scheme plus help / chooser / editor / toast state.
@@ -735,6 +737,7 @@ impl HelpCtx {
             HelpCtx::DbInfo => "database",
             HelpCtx::Stats => "column statistics",
             HelpCtx::Frames => "write-ahead log",
+            HelpCtx::Schema => "schema",
         }
     }
 }
@@ -850,6 +853,39 @@ fn help_sections(ctx: HelpCtx) -> Vec<HelpSection> {
             },
         ];
     }
+    if ctx == HelpCtx::Schema {
+        return vec![
+            HelpSection {
+                title: "SCHEMA",
+                keys: &[
+                    ("j/k ↑↓", "Select object"),
+                    ("Enter / e", "Edit table / index"),
+                    ("a", "New table"),
+                    ("i", "New index"),
+                    ("d", "Drop object"),
+                    ("y", "Copy CREATE statement"),
+                    ("S / Esc", "Back to the data"),
+                ],
+            },
+            HelpSection {
+                title: "DESIGNER",
+                keys: &[
+                    ("arrows", "Move by row / field"),
+                    ("Enter", "Edit the field"),
+                    ("Space", "Toggle the flag"),
+                    ("a / d", "Add / drop column"),
+                    ("J / K", "Move column down / up"),
+                    ("W", "Write the change"),
+                    ("Esc", "Cancel"),
+                ],
+            },
+            HelpSection {
+                title: "DISPLAY",
+                keys: DISPLAY_KEYS,
+            },
+        ];
+    }
+
     if ctx == HelpCtx::DbInfo {
         return vec![
             HelpSection {
