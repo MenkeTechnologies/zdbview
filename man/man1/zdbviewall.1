@@ -429,6 +429,20 @@ Esc stops a running statement: the statement runs on the drawing thread, so the
 key is read from SQLite's progress handler, which is the only place that gets
 control back while it runs.
 .TP
+.B Ctrl\-n
+Put NULL in the cell — not the empty string, which is what clearing it would
+write.
+.TP
+.B Ctrl\-h
+Copy the cell as a hex and ASCII dump.
+.TP
+.B Ctrl\-e
+Write the cell's bytes to a temporary file and open it with the desktop's own
+opener (open, or xdg-open).
+.TP
+.BR Ctrl\-r ", " F5
+Re-read the database, dropping every cached fact including the reader threads'.
+.TP
 .B Ctrl\-p
 Print the table, under its filter and sort, by piping it to lpr — which is the
 print dialog a terminal program has.

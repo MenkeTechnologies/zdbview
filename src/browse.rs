@@ -47,6 +47,13 @@ pub enum Format {
     WebkitEpochLocal,
     /// Days since 1899-12-30, the OLE automation date Windows uses.
     WindowsDate,
+    /// Read the stored bytes as ISO-8859-1 rather than UTF-8 — DB4S's "Set
+    /// encoding", which is about how existing bytes are *read*, not how new ones
+    /// are written.
+    Latin1,
+    /// The same for Windows-1252, which is Latin-1 plus printable characters in
+    /// the 0x80–0x9F range that Latin-1 leaves as controls.
+    Cp1252,
     /// Any SQL expression, with `%1` standing for the column — the placeholder
     /// DB4S's own dialog names.
     Custom(String),
@@ -74,6 +81,8 @@ impl Format {
         Format::WebkitEpoch,
         Format::WebkitEpochLocal,
         Format::WindowsDate,
+        Format::Latin1,
+        Format::Cp1252,
     ];
 
     pub fn label(&self) -> String {
@@ -96,6 +105,8 @@ impl Format {
             Format::WebkitEpoch => "webkit / chromium epoch to date".into(),
             Format::WebkitEpochLocal => "webkit / chromium epoch to local time".into(),
             Format::WindowsDate => "windows DATE to date".into(),
+            Format::Latin1 => "text as latin-1".into(),
+            Format::Cp1252 => "text as windows-1252".into(),
             Format::Custom(expr) => format!("custom: {expr}"),
         }
     }
@@ -135,7 +146,38 @@ impl Format {
             // The OLE automation date counts days from 1899-12-30; 25569 of them
             // separate it from the Unix epoch.
             Format::WindowsDate => format!("datetime(({col} - 25569) * 86400, 'unixepoch')"),
+            // An encoding is not something SQL can do — SQLite has no codecs —
+            // so the bytes come back as hex and are decoded on this side. See
+            // [`Format::decode`].
+            Format::Latin1 | Format::Cp1252 => format!("hex({col})"),
             Format::Custom(expr) => expr.replace("%1", col),
+        }
+    }
+
+    /// Whether this format hands back hex that has to be decoded here rather
+    /// than a value SQL already made readable.
+    pub fn decodes_bytes(&self) -> bool {
+        matches!(self, Format::Latin1 | Format::Cp1252)
+    }
+
+    /// Turn the hex a byte-decoding format produced into text.
+    ///
+    /// Latin-1 is the identity map onto the first 256 code points, so a byte is
+    /// its own character. Windows-1252 differs only in 0x80–0x9F, where Latin-1
+    /// has controls and Windows has the curly quotes, dashes and symbols that
+    /// turn up in text pasted out of Word — the whole reason DB4S offers it.
+    pub fn decode(&self, hex: &str) -> String {
+        let bytes: Vec<u8> = hex
+            .as_bytes()
+            .chunks(2)
+            .filter_map(|pair| {
+                let s = std::str::from_utf8(pair).ok()?;
+                u8::from_str_radix(s, 16).ok()
+            })
+            .collect();
+        match self {
+            Format::Cp1252 => bytes.iter().map(|&b| cp1252_char(b)).collect(),
+            _ => bytes.iter().map(|&b| b as char).collect(),
         }
     }
 
@@ -354,6 +396,23 @@ fn like_matches(value: &str, pattern: &str) -> bool {
         pi += 1;
     }
     pi == p.len()
+}
+
+/// One byte as Windows-1252 sees it. Only 0x80–0x9F differ from Latin-1, and
+/// five of those are unassigned, which Unicode's replacement character stands in
+/// for.
+fn cp1252_char(b: u8) -> char {
+    const HIGH: [char; 32] = [
+        '\u{20AC}', '\u{FFFD}', '\u{201A}', '\u{0192}', '\u{201E}', '\u{2026}', '\u{2020}',
+        '\u{2021}', '\u{02C6}', '\u{2030}', '\u{0160}', '\u{2039}', '\u{0152}', '\u{FFFD}',
+        '\u{017D}', '\u{FFFD}', '\u{FFFD}', '\u{2018}', '\u{2019}', '\u{201C}', '\u{201D}',
+        '\u{2022}', '\u{2013}', '\u{2014}', '\u{02DC}', '\u{2122}', '\u{0161}', '\u{203A}',
+        '\u{0153}', '\u{FFFD}', '\u{017E}', '\u{0178}',
+    ];
+    match b {
+        0x80..=0x9F => HIGH[(b - 0x80) as usize],
+        other => other as char,
+    }
 }
 
 /// What one table's grid is set to show. Kept per table, so going back to a

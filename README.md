@@ -349,6 +349,10 @@ is published on crates.io); disable with `--no-default-features`.
 | `L` | unlock a view for editing (SQLite) |
 | `Ctrl-y` | copy the column's name (SQLite) |
 | `Ctrl-p` | print the table through `lpr` (SQLite) |
+| `Ctrl-n` | set the cell to `NULL` (SQLite) |
+| `Ctrl-h` | copy the cell as a hex + ASCII dump (SQLite) |
+| `Ctrl-e` | open the cell's bytes in an external application (SQLite) |
+| `Ctrl-r` / `F5` | re-read the database (SQLite) |
 | `A` | column statistics for the table, with a per-column frequency table (SQLite) |
 | `F` | follow the foreign key under the cursor to the row it references (SQLite) |
 | `Y` | copy the row as an `INSERT` (SQLite) |
@@ -652,6 +656,7 @@ The eighteen formats DB Browser applies, and the SQL each one runs:
 | java epoch (ms) to date | `datetime(c / 1000, 'unixepoch')` |
 | webkit / chromium epoch to date / to local time | `datetime(c / 1000000 - 11644473600, 'unixepoch')` (`, 'localtime'`) |
 | windows DATE to date | `datetime((c - 25569) * 86400, 'unixepoch')` |
+| text as latin-1 / windows-1252 | `hex(c)`, decoded here — see below |
 
 **A format is SQL, not a rendering rule** — which is how DB Browser does it, and
 what makes `hex blob` possible at all: the grid receives cells that are already
@@ -661,6 +666,13 @@ does not. The column keeps its own name in the result, so sorting, filtering,
 paging and editing all still address the raw value — sorting a hex-formatted
 integer column gives `1, 2, a`, not the `1, 10, 2` that sorting the displayed
 strings would.
+
+The last two are DB Browser's *Set encoding*: they read the bytes already stored
+as ISO-8859-1 or Windows-1252 rather than UTF-8. SQLite has no codecs, so the
+value comes back as `hex()` and is decoded on this side — which is also the only
+way to read bytes that are not valid UTF-8 at all. Windows-1252 differs from
+Latin-1 only in `0x80`–`0x9F`, where it has the curly quotes and dashes that turn
+up in text pasted out of Word, and Latin-1 has control characters.
 
 DB Browser's *SpatiaLite Geometry to SVG* is the one format not implemented: it
 needs the SpatiaLite extension loaded to mean anything.
@@ -757,6 +769,11 @@ The rest of DB Browser's Browse Data tab:
 | `z` / `Z` | clear the sorting / the filter | Clear sorting / Clear all filters |
 | `L` | unlock a view for editing | Unlock view editing |
 | `Ctrl-y` | copy the column's name | Copy column name |
+| `Ctrl-n` | set the cell to `NULL` | Set to NULL |
+| `Ctrl-h` | copy the cell as a hex + ASCII dump | Copy with hex/ASCII |
+| `Ctrl-e` | open the cell's bytes in an external application | Open in external application |
+| `Ctrl-r` / `F5` | re-read the database | Refresh |
+| `R` (schema screen) | row counts per table and view | Row counts |
 
 **Find and replace** asks in two steps, because a terminal has one prompt line:
 what to find, then what to put there. Between them it counts, so a term that

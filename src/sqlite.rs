@@ -876,7 +876,7 @@ impl SqliteStore {
             filter,
             hint,
             known_total,
-            formats: _,
+            formats,
         } = *q;
         let meta = self.meta(table)?;
         let columns = &meta.columns;
@@ -947,7 +947,7 @@ impl SqliteStore {
         // `*` unless a column has a display format, in which case every column is
         // named so the formatted ones can be expressions. The names are kept as
         // the columns' own, so nothing downstream has to know a format was used.
-        let select = if q.formats.is_empty() {
+        let select = if formats.is_empty() {
             if with_rowid {
                 "rowid, *".to_string()
             } else {
@@ -958,7 +958,7 @@ impl SqliteStore {
                 .iter()
                 .map(|c| {
                     let quoted = format!("\"{}\"", esc(c));
-                    match q.formats.get(c) {
+                    match formats.get(c) {
                         Some(f) => format!("{} AS {}", f.expression(&quoted), quoted),
                         None => quoted,
                     }
@@ -994,8 +994,14 @@ impl SqliteStore {
             };
             rowids.push(rid);
             let mut cells = Vec::with_capacity(ncols);
-            for i in 0..ncols {
-                cells.push(value_to_string(row, base + i));
+            for (i, name) in columns.iter().enumerate().take(ncols) {
+                let cell = value_to_string(row, base + i);
+                // A format that reads the bytes in another encoding asked for
+                // hex; this is where it becomes text.
+                cells.push(match formats.get(name) {
+                    Some(f) if f.decodes_bytes() => f.decode(&cell),
+                    _ => cell,
+                });
             }
             rows_out.push(cells);
         }
@@ -1270,6 +1276,21 @@ impl SqliteStore {
         params.push(&bytes);
         self.begin_edit()?;
         Ok(self.conn.execute(&sql, params.as_slice())?)
+    }
+
+    /// Put `NULL` in one cell — DB Browser's "Set to NULL". The other update
+    /// paths bind the new value as text, which has no way to say NULL, so this
+    /// writes the keyword into the statement instead.
+    pub fn update_cell_null(&self, table: &str, key: &RowKey, col: &str) -> Result<usize> {
+        let (clause, binds) = Self::where_key(key);
+        let sql = format!(
+            "UPDATE \"{}\" SET \"{}\" = NULL WHERE {}",
+            esc(table),
+            esc(col),
+            clause
+        );
+        self.begin_edit()?;
+        Ok(self.conn.execute(&sql, rusqlite::params_from_iter(binds))?)
     }
 
     pub fn delete_row_keyed(&self, table: &str, key: &RowKey) -> Result<usize> {

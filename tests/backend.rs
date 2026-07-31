@@ -2336,3 +2336,86 @@ fn optimize_reports_what_it_did() {
     assert!(err.contains("unwritten changes"), "{err}");
     let _ = std::fs::remove_file(&path);
 }
+
+/// The two text encodings DB Browser offers for reading stored bytes. SQLite has
+/// no codecs, so the value comes back as hex and is decoded here — which is also
+/// the only way to reach bytes that are not valid UTF-8 at all.
+#[test]
+fn stored_bytes_can_be_read_as_latin1_or_windows_1252() {
+    let path = tmp("browse_encoding.db");
+    let _ = std::fs::remove_file(&path);
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute_batch("CREATE TABLE t (v BLOB)").unwrap();
+    // 0xE9 is é in Latin-1; 0x93/0x94 are curly quotes in Windows-1252 and
+    // control characters in Latin-1. None of it is valid UTF-8.
+    conn.execute("INSERT INTO t VALUES (?1)", [&[0x93u8, 0xE9, 0x94][..]])
+        .unwrap();
+    drop(conn);
+
+    let store = SqliteStore::open(&path).unwrap();
+    let plain = store.rows(&pq("t", 10, 0, None, "")).unwrap();
+    assert!(
+        plain.rows[0][0].starts_with("<blob"),
+        "undecoded it is just bytes"
+    );
+
+    let mut formats = std::collections::HashMap::new();
+    formats.insert("v".to_string(), browse::Format::Latin1);
+    let view = store
+        .rows(&sqlite::PageQuery {
+            formats: &formats,
+            ..pq("t", 10, 0, None, "")
+        })
+        .unwrap();
+    assert_eq!(
+        view.rows[0][0], "\u{93}é\u{94}",
+        "latin-1 maps byte to code point"
+    );
+
+    formats.insert("v".to_string(), browse::Format::Cp1252);
+    let view = store
+        .rows(&sqlite::PageQuery {
+            formats: &formats,
+            ..pq("t", 10, 0, None, "")
+        })
+        .unwrap();
+    assert_eq!(
+        view.rows[0][0], "\u{201C}é\u{201D}",
+        "windows-1252 has the curly quotes latin-1 leaves as controls"
+    );
+    let _ = std::fs::remove_file(&path);
+}
+
+/// NULL is not the empty string, and setting a cell to it needs a statement of
+/// its own because the other updates bind text.
+#[test]
+fn a_cell_can_be_set_back_to_null() {
+    let path = tmp("browse_null.db");
+    let _ = std::fs::remove_file(&path);
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute_batch("CREATE TABLE t (a TEXT); INSERT INTO t VALUES ('x')")
+        .unwrap();
+    drop(conn);
+
+    let store = SqliteStore::open(&path).unwrap();
+    let key = sqlite::RowKey::Rowid(1);
+    // The text path can only ever write a string, empty or not.
+    store.update_cell_keyed("t", &key, "a", "").unwrap();
+    store.write_changes().unwrap();
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    let ty: String = conn
+        .query_row("SELECT typeof(a) FROM t", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(ty, "text");
+    drop(conn);
+
+    assert_eq!(store.update_cell_null("t", &key, "a").unwrap(), 1);
+    store.write_changes().unwrap();
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    let ty: String = conn
+        .query_row("SELECT typeof(a) FROM t", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(ty, "null");
+    drop(conn);
+    let _ = std::fs::remove_file(&path);
+}

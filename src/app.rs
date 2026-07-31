@@ -347,6 +347,10 @@ pub struct App {
     schema: Vec<(String, String, String)>,
     /// Which schema object the cursor is on, indexing `schema`.
     schema_idx: usize,
+    /// Row counts for the schema screen, once they have been asked for — DB
+    /// Browser's "Row counts", which is an action rather than a column because
+    /// counting every table means scanning every table.
+    schema_counts: std::collections::HashMap<String, i64>,
     /// The table designer, while `screen` is `Screen::TableDesign`.
     design: Option<crate::designer::TableDesigner>,
     /// The index designer, while `screen` is `Screen::IndexDesign`.
@@ -506,6 +510,7 @@ impl App {
             schema_scroll: 0,
             schema: Vec::new(),
             schema_idx: 0,
+            schema_counts: Default::default(),
             design: None,
             index_design: None,
             pragmas: None,
@@ -1040,8 +1045,39 @@ impl App {
                 }
             }
             KeyCode::Char('y') => self.copy_create_statement(),
+            KeyCode::Char('R') => self.count_schema_rows(),
             _ => {}
         }
+    }
+
+    /// `R` on the schema screen: how many rows each table and view holds — DB
+    /// Browser's "Row counts". Pressing it again drops them, since a count is a
+    /// scan and the numbers age the moment anything writes.
+    fn count_schema_rows(&mut self) {
+        if !self.schema_counts.is_empty() {
+            self.schema_counts.clear();
+            self.notify("row counts cleared");
+            return;
+        }
+        let names: Vec<String> = self
+            .schema
+            .iter()
+            .filter(|(ty, _, _)| ty == "table" || ty == "view")
+            .map(|(_, name, _)| name.clone())
+            .collect();
+        let counts: Vec<(String, i64)> = match self.sqlite() {
+            Some(s) => names
+                .into_iter()
+                .filter_map(|n| s.count_exact(&n, "").ok().map(|c| (n, c)))
+                .collect(),
+            None => return,
+        };
+        let n = counts.len();
+        self.schema_counts = counts.into_iter().collect();
+        self.notify(format!(
+            "counted {n} object{}",
+            if n == 1 { "" } else { "s" }
+        ));
     }
 
     /// `Enter`/`e` on the schema screen: open whichever designer fits the object.
@@ -1421,6 +1457,11 @@ impl App {
                 KeyCode::Char('s') => self.write_changes(),
                 KeyCode::Char('y') => self.copy_column_name(),
                 KeyCode::Char('p') => self.print_table(),
+                // The rest of DB Browser's cell menu.
+                KeyCode::Char('n') => self.set_cell_null(),
+                KeyCode::Char('r') => self.refresh(),
+                KeyCode::Char('h') => self.copy_cell_hex(),
+                KeyCode::Char('e') => self.open_cell_externally(),
                 _ => {}
             }
             return;
@@ -1551,6 +1592,8 @@ impl App {
             KeyCode::Char('Z') => self.clear_filter(),
             KeyCode::Char('L') => self.unlock_view_editing(),
             KeyCode::Char('!') => self.open_cond_format(),
+            // F5 is the refresh every GUI has, including DB Browser's.
+            KeyCode::F(5) => self.refresh(),
             _ => {}
         }
     }
@@ -2352,6 +2395,113 @@ impl App {
             view.rules.remove(&column);
         } else {
             view.rules.insert(column, rules);
+        }
+    }
+
+    /// `Ctrl-n`: put NULL in the cell — DB Browser's "Set to NULL", which is not
+    /// the same as clearing it to an empty string.
+    fn set_cell_null(&mut self) {
+        let (table, key, column) = match self.cell_target() {
+            Some(t) => t,
+            None => return,
+        };
+        if !self.writable_here() {
+            return;
+        }
+        // The keyed update binds text, which cannot express NULL, so the store
+        // has a statement of its own for it.
+        let done = self
+            .sqlite()
+            .map(|s| s.update_cell_null(&table, &key, &column));
+        match done {
+            Some(Ok(_)) => {
+                self.load_table();
+                self.notify(format!("{column} = NULL — W writes it, R reverts"));
+            }
+            Some(Err(e)) => self.notify(format!("cannot set {column} to NULL: {e}")),
+            None => {}
+        }
+    }
+
+    /// The table, row key and column the cursor is on.
+    fn cell_target(&self) -> Option<(String, crate::sqlite::RowKey, String)> {
+        let table = self.current_table()?;
+        let key = self.current_key()?;
+        let column = self.cursor_column()?;
+        Some((table, key, column))
+    }
+
+    /// `Ctrl-r` / `F5`: read the database again — DB Browser's Refresh. Every
+    /// cached fact is dropped, including the reader threads', since another
+    /// process may have written to the file since the page was fetched.
+    fn refresh(&mut self) {
+        self.schema_changed();
+        if self.screen == Screen::Schema {
+            if let Some(s) = self.sqlite() {
+                self.schema = s.schema().unwrap_or_default();
+            }
+        }
+        self.load_table();
+        self.notify("refreshed");
+    }
+
+    /// `Ctrl-h`: the cell as a hex + ASCII dump on the clipboard — DB Browser's
+    /// "Copy with hex/ASCII".
+    fn copy_cell_hex(&mut self) {
+        let (table, key, column) = match self.cell_target() {
+            Some(t) => t,
+            None => return,
+        };
+        let bytes = match self
+            .sqlite()
+            .map(|s| s.cell_bytes_keyed(&table, &key, &column))
+        {
+            Some(Ok(b)) => b,
+            Some(Err(e)) => return self.notify(e.to_string()),
+            None => return,
+        };
+        let dump: String = bytes
+            .chunks(16)
+            .enumerate()
+            .map(|(i, chunk)| crate::hexedit::hex_dump_line(i * 16, chunk))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let ok = crate::clipboard::copy(&dump);
+        self.notify(if ok {
+            format!("copied {} bytes of {column} as hex", bytes.len())
+        } else {
+            "clipboard unavailable (no tty)".into()
+        });
+    }
+
+    /// `Ctrl-e`: hand the cell's bytes to whatever opens that kind of file —
+    /// DB Browser's "Open in external application". The bytes go to a temporary
+    /// file, since an external viewer takes a path, not a stream.
+    fn open_cell_externally(&mut self) {
+        let (table, key, column) = match self.cell_target() {
+            Some(t) => t,
+            None => return,
+        };
+        let bytes = match self
+            .sqlite()
+            .map(|s| s.cell_bytes_keyed(&table, &key, &column))
+        {
+            Some(Ok(b)) => b,
+            Some(Err(e)) => return self.notify(e.to_string()),
+            None => return,
+        };
+        let path = std::env::temp_dir().join(format!(
+            "zdbview-{}-{}-{}",
+            std::process::id(),
+            table.replace(|c: char| !c.is_alphanumeric(), "_"),
+            column.replace(|c: char| !c.is_alphanumeric(), "_")
+        ));
+        if let Err(e) = std::fs::write(&path, &bytes) {
+            return self.notify(format!("cannot write {}: {e}", path.display()));
+        }
+        match open_externally(&path) {
+            Ok(()) => self.notify(format!("opened {} ({} bytes)", path.display(), bytes.len())),
+            Err(e) => self.notify(format!("cannot open it: {e}")),
         }
     }
 
@@ -5213,13 +5363,20 @@ impl App {
             if selected {
                 head = head.add_modifier(Modifier::REVERSED);
             }
-            lines.push(Line::from(vec![
+            let mut spans = vec![
                 Span::styled(
                     format!("{} {:<6} ", if selected { "▸" } else { " " }, ty),
                     Style::default().fg(self.ov.theme.alt),
                 ),
                 Span::styled(name.clone(), head),
-            ]));
+            ];
+            if let Some(n) = self.schema_counts.get(name) {
+                spans.push(Span::styled(
+                    format!("  {n} row{}", if *n == 1 { "" } else { "s" }),
+                    Style::default().fg(self.ov.theme.dim),
+                ));
+            }
+            lines.push(Line::from(spans));
             for l in sql.lines() {
                 lines.push(Line::from(Span::styled(
                     format!("    {}", l),
@@ -5253,7 +5410,7 @@ impl App {
         f.render_widget(
             Paragraph::new(visible).block(Block::default().borders(Borders::ALL).title(format!(
                 " schema — {} objects (j/k select · Enter edit · a table · i index · \
-                 d drop · y copy · Esc back) ",
+                 d drop · y copy · R counts · Esc back) ",
                 self.schema.len()
             ))),
             area,
@@ -6756,6 +6913,23 @@ const PRINT_ROWS: i64 = 10_000;
 /// Width of one grid cell, including the space between columns. The grid draws
 /// as many as fit and scrolls the rest, so this decides how many that is.
 const CELL_W: usize = 21;
+
+/// Hand `path` to the desktop's opener — `open` on macOS, `xdg-open` elsewhere,
+/// which is what every other terminal program uses for this.
+fn open_externally(path: &std::path::Path) -> std::io::Result<()> {
+    use std::process::{Command, Stdio};
+    let opener = if cfg!(target_os = "macos") {
+        "open"
+    } else {
+        "xdg-open"
+    };
+    Command::new(opener)
+        .arg(path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    Ok(())
+}
 
 /// Pipe `text` to `lpr`, which is the print dialog a terminal program has.
 fn print_via_lpr(text: &str) -> std::io::Result<()> {
@@ -9247,6 +9421,41 @@ mod tests {
         let h = header(&mut app);
         assert!(!h.contains("rowid"), "{h}");
         assert!(!app.browse.view("t").show_rowid);
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// `Ctrl-n` puts NULL in the cell, `Ctrl-r` re-reads the database, and `R`
+    /// on the schema screen counts the rows.
+    #[test]
+    fn the_cell_and_refresh_actions_do_what_they_say() {
+        let (mut app, path) = sqlite_app();
+        await_queries(&mut app);
+        app.on_key(KeyEvent::from(KeyCode::Tab));
+
+        app.on_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL));
+        await_queries(&mut app);
+        let rows = frame_rows(&mut app, 90, 12);
+        assert!(contains(&rows, "NULL"), "the cell shows NULL: {rows:?}");
+        app.write_changes();
+
+        // Another connection writes; a refresh is what brings it into view.
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute("INSERT INTO t VALUES ('fresh', 'row', 'here')", [])
+            .unwrap();
+        drop(conn);
+        app.on_key(KeyEvent::from(KeyCode::F(5)));
+        await_queries(&mut app);
+        let rows = frame_rows(&mut app, 90, 12);
+        assert!(contains(&rows, "fresh"), "{rows:?}");
+
+        // Row counts on the schema screen, and off again.
+        press(&mut app, 'S');
+        press(&mut app, 'R');
+        let rows = frame_rows(&mut app, 90, 16);
+        assert!(contains(&rows, "2 rows"), "{rows:?}");
+        press(&mut app, 'R');
+        let rows = frame_rows(&mut app, 90, 16);
+        assert!(!contains(&rows, "2 rows"), "counts cleared: {rows:?}");
         let _ = std::fs::remove_file(path);
     }
 
