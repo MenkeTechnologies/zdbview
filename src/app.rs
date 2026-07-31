@@ -178,6 +178,9 @@ enum Mode {
     Search(String),
     /// Adding a new rkyv record; buffer holds the key being typed.
     AddRecord(String),
+    /// Typing a custom display format for the cursor column, where `%1` stands
+    /// for the column — DB Browser's "Custom" display format.
+    CustomFormat(String),
     /// Renaming a rkyv record's key; buffer holds the new key.
     RenameRecord(String),
     /// Confirm a destructive action (delete row).
@@ -334,6 +337,12 @@ pub struct App {
     index_design: Option<crate::designer::IndexDesigner>,
     /// The pragma form, while `screen` is `Screen::Pragmas`.
     pragmas: Option<crate::pragmas::PragmaEditor>,
+    /// Per-table grid settings: hidden columns, frozen columns, the rowid
+    /// column, display formats — DB Browser's Browse Data settings.
+    browse: crate::browse::Browse,
+    /// First scrolling column on screen, so a wide table can be walked sideways
+    /// without the window jumping back and forth.
+    col_scroll: usize,
 
     // Mouse hit-testing: the on-screen rect and scroll offset of each clickable
     // list/grid, captured during render so a click maps to the right index.
@@ -469,6 +478,8 @@ impl App {
             design: None,
             index_design: None,
             pragmas: None,
+            browse: Default::default(),
+            col_scroll: 0,
             click_left: Rect::ZERO,
             click_right: Rect::ZERO,
             click_records: Rect::ZERO,
@@ -683,6 +694,7 @@ impl App {
             Edit(String),
             Search(String),
             Add(String),
+            Format(String),
             Rename(String),
             Confirm,
             Drop(String, String),
@@ -693,6 +705,7 @@ impl App {
             Mode::EditCell(buf) => Modal::Edit(buf.clone()),
             Mode::Search(buf) => Modal::Search(buf.clone()),
             Mode::AddRecord(buf) => Modal::Add(buf.clone()),
+            Mode::CustomFormat(buf) => Modal::Format(buf.clone()),
             Mode::RenameRecord(buf) => Modal::Rename(buf.clone()),
             Mode::ConfirmDelete => Modal::Confirm,
             Mode::ConfirmDrop(ty, name) => Modal::Drop(ty.clone(), name.clone()),
@@ -732,6 +745,9 @@ impl App {
             }
             Modal::Add(buf) => {
                 return self.key_input(key, buf, Mode::AddRecord, App::commit_add_record)
+            }
+            Modal::Format(buf) => {
+                return self.key_input(key, buf, Mode::CustomFormat, App::commit_custom_format)
             }
             Modal::Rename(buf) => {
                 return self.key_input(key, buf, Mode::RenameRecord, App::commit_rename_record)
@@ -1284,6 +1300,7 @@ impl App {
             filter: &self.filter,
             hint: None,
             known_total: None,
+            formats: &crate::sqlite::NO_FORMATS,
         }) {
             Ok(v) => v,
             Err(e) => {
@@ -1410,16 +1427,12 @@ impl App {
             // iftoprs) and `l` is left free so the pair stays consistent.
             KeyCode::Left => {
                 if self.focus == Focus::Right {
-                    self.col_idx = self.col_idx.saturating_sub(1);
+                    self.step_column(false);
                 }
             }
             KeyCode::Right => {
                 if self.focus == Focus::Right {
-                    if let Some(r) = &self.rows {
-                        if self.col_idx + 1 < r.columns.len() {
-                            self.col_idx += 1;
-                        }
-                    }
+                    self.step_column(true);
                 }
             }
             KeyCode::Enter => match self.focus {
@@ -1461,6 +1474,14 @@ impl App {
             // DB Browser's Write Changes / Revert Changes.
             KeyCode::Char('W') => self.write_changes(),
             KeyCode::Char('R') => self.revert_changes(),
+            // DB Browser's Browse Data column settings.
+            KeyCode::Char('H') => self.toggle_hidden_column(),
+            KeyCode::Char('U') => self.show_all_columns(),
+            KeyCode::Char('f') => self.freeze_to_cursor(),
+            KeyCode::Char('#') => self.toggle_rowid_column(),
+            KeyCode::Char('m') => self.cycle_column_format(true),
+            KeyCode::Char('M') => self.cycle_column_format(false),
+            KeyCode::Char('%') => self.begin_custom_format(),
             _ => {}
         }
     }
@@ -1816,6 +1837,225 @@ impl App {
     fn commit_search(&mut self, pattern: &str) {
         self.search = pattern.to_string();
         self.search_next(true);
+    }
+
+    // ----- what the grid shows (DB Browser's Browse Data settings) ----------
+
+    /// The column under the cursor, by name.
+    fn cursor_column(&self) -> Option<String> {
+        self.rows
+            .as_ref()
+            .and_then(|r| r.columns.get(self.col_idx))
+            .cloned()
+    }
+
+    /// `H`: hide the cursor column, or show it again if it is already hidden.
+    fn toggle_hidden_column(&mut self) {
+        let (table, column) = match (self.current_table(), self.cursor_column()) {
+            (Some(t), Some(c)) => (t, c),
+            _ => return,
+        };
+        let total = self.rows.as_ref().map(|r| r.columns.len()).unwrap_or(0);
+        let done = self.browse.view_mut(&table).toggle_hidden(&column, total);
+        match done {
+            Ok(hidden) => {
+                if hidden {
+                    // The cursor cannot sit on a column that is not drawn.
+                    self.move_to_visible_column(1);
+                }
+                self.notify(format!(
+                    "{column} {}",
+                    if hidden { "hidden" } else { "shown" }
+                ));
+            }
+            Err(e) => self.notify(e),
+        }
+    }
+
+    /// `U`: DB Browser's "Show all columns".
+    fn show_all_columns(&mut self) {
+        let table = match self.current_table() {
+            Some(t) => t,
+            None => return,
+        };
+        let n = self.browse.view(&table).hidden.len();
+        self.browse.view_mut(&table).hidden.clear();
+        self.notify(if n == 0 {
+            "no columns were hidden".to_string()
+        } else {
+            format!("showing {n} hidden column{}", if n == 1 { "" } else { "s" })
+        });
+    }
+
+    /// `f`: freeze the columns up to and including the cursor, so they stay at
+    /// the left edge while the rest scroll. Pressing it on a column already
+    /// inside the frozen span unfreezes everything.
+    fn freeze_to_cursor(&mut self) {
+        let table = match self.current_table() {
+            Some(t) => t,
+            None => return,
+        };
+        let columns = self
+            .rows
+            .as_ref()
+            .map(|r| r.columns.clone())
+            .unwrap_or_default();
+        let view = self.browse.view_mut(&table);
+        let visible = view.visible(&columns);
+        let at = visible.iter().position(|&i| i == self.col_idx);
+        let want = match at {
+            Some(at) if at < view.frozen => 0,
+            Some(at) => at + 1,
+            None => return,
+        };
+        view.frozen = want;
+        self.col_scroll = 0;
+        self.notify(if want == 0 {
+            "columns unfrozen".to_string()
+        } else {
+            format!("{want} column{} frozen", if want == 1 { "" } else { "s" })
+        });
+    }
+
+    /// `#`: DB Browser's "Show rowid column".
+    fn toggle_rowid_column(&mut self) {
+        let table = match self.current_table() {
+            Some(t) => t,
+            None => return,
+        };
+        let has_rowid = self
+            .rows
+            .as_ref()
+            .is_some_and(|r| r.rowids.iter().any(Option::is_some));
+        if !has_rowid {
+            self.notify("a WITHOUT ROWID table has no rowid to show");
+            return;
+        }
+        let view = self.browse.view_mut(&table);
+        view.show_rowid = !view.show_rowid;
+        let on = view.show_rowid;
+        self.notify(if on {
+            "rowid column shown"
+        } else {
+            "rowid column hidden"
+        });
+    }
+
+    /// `m` / `M`: step the cursor column's display format forwards or back —
+    /// DB Browser's Column Display Format, applied in the `SELECT`.
+    fn cycle_column_format(&mut self, forward: bool) {
+        let (table, column) = match (self.current_table(), self.cursor_column()) {
+            (Some(t), Some(c)) => (t, c),
+            _ => return,
+        };
+        let next = self.browse.view(&table).format(&column).next(!forward);
+        self.browse
+            .view_mut(&table)
+            .set_format(&column, next.clone());
+        // The format is part of the query, so the page has to be fetched again.
+        self.load_table();
+        self.notify(format!("{column}: {}", next.label()));
+    }
+
+    /// One column left or right, over the columns that are drawn — a hidden
+    /// column is stepped over rather than selected invisibly.
+    fn step_column(&mut self, forward: bool) {
+        let (table, columns) = match (
+            self.current_table(),
+            self.rows.as_ref().map(|r| r.columns.clone()),
+        ) {
+            (Some(t), Some(c)) => (t, c),
+            _ => return,
+        };
+        let visible = self.browse.view(&table).visible(&columns);
+        let at = visible.iter().position(|&i| i == self.col_idx);
+        let next = match (at, forward) {
+            (Some(i), true) => visible.get(i + 1).copied(),
+            (Some(i), false) => i.checked_sub(1).and_then(|p| visible.get(p).copied()),
+            // The cursor is on a hidden column, so the step lands on a shown one.
+            (None, _) => visible.first().copied(),
+        };
+        if let Some(c) = next {
+            self.col_idx = c;
+        }
+    }
+
+    /// `%`: type a display format of your own — DB Browser's "Custom" entry,
+    /// where `%1` stands for the column.
+    fn begin_custom_format(&mut self) {
+        let (table, column) = match (self.current_table(), self.cursor_column()) {
+            (Some(t), Some(c)) => (t, c),
+            _ => return,
+        };
+        // Seeded with whatever the column is already formatted by, written out as
+        // an expression — a cycled format is then editable rather than a dead end.
+        let seed = match self.browse.view(&table).format(&column) {
+            crate::browse::Format::Custom(expr) => expr,
+            crate::browse::Format::Default => String::new(),
+            other => other.expression("%1"),
+        };
+        self.input_cursor = seed.len();
+        self.mode = Mode::CustomFormat(seed);
+    }
+
+    fn commit_custom_format(&mut self, expr: &str) {
+        let (table, column) = match (self.current_table(), self.cursor_column()) {
+            (Some(t), Some(c)) => (t, c),
+            _ => return,
+        };
+        // An empty expression clears the format rather than being rejected: it is
+        // the obvious way to ask for the column back.
+        if expr.trim().is_empty() {
+            self.browse
+                .view_mut(&table)
+                .set_format(&column, crate::browse::Format::Default);
+            self.load_table();
+            self.notify(format!("{column}: default"));
+            return;
+        }
+        if let Err(e) = crate::browse::Format::validate_custom(expr) {
+            self.notify(e);
+            return;
+        }
+        let f = crate::browse::Format::Custom(expr.trim().to_string());
+        self.browse.view_mut(&table).set_format(&column, f.clone());
+        self.load_table();
+        // A bad expression is SQLite's to reject, and the failed page says so.
+        self.notify(format!("{column}: {}", f.label()));
+    }
+
+    /// Move the cursor to the nearest column that is actually drawn, stepping in
+    /// `dir`. Used after hiding the one it was on.
+    fn move_to_visible_column(&mut self, dir: isize) {
+        let (table, columns) = match (
+            self.current_table(),
+            self.rows.as_ref().map(|r| r.columns.clone()),
+        ) {
+            (Some(t), Some(c)) => (t, c),
+            _ => return,
+        };
+        let visible = self.browse.view(&table).visible(&columns);
+        if visible.is_empty() {
+            return;
+        }
+        if visible.contains(&self.col_idx) {
+            return;
+        }
+        // The nearest visible column in the direction of travel, else the other
+        // way — hiding the last column has to land somewhere.
+        let next = if dir >= 0 {
+            visible
+                .iter()
+                .find(|&&i| i > self.col_idx)
+                .or_else(|| visible.last())
+        } else {
+            visible
+                .iter()
+                .rev()
+                .find(|&&i| i < self.col_idx)
+                .or_else(|| visible.first())
+        };
+        self.col_idx = next.copied().unwrap_or(0);
     }
 
     // ----- editable pragmas (DB Browser's Edit Pragmas) ---------------------
@@ -2355,6 +2595,7 @@ impl App {
             filter: self.filter.clone(),
             hint,
             known_total: self.known_total(),
+            formats: self.browse.expressions(&table),
         };
         // The exact total is only worth a scan once per table+filter; while it
         // still describes the grid it is kept.
@@ -3112,6 +3353,9 @@ impl App {
             Mode::EditCell(buf) => self.render_input(f, "edit cell (Enter=save, Esc=cancel)", buf),
             Mode::Search(buf) => self.render_input(f, "search / (Enter, Esc)", buf),
             Mode::AddRecord(buf) => self.render_input(f, "new record key (Enter=add, Esc)", buf),
+            Mode::CustomFormat(buf) => {
+                self.render_input(f, "custom display format — %1 is the column", buf)
+            }
             Mode::RenameRecord(buf) => self.render_input(f, "rename key to (Enter, Esc)", buf),
             Mode::ConfirmDelete => {
                 let what = match self.store {
@@ -4404,36 +4648,79 @@ impl App {
         };
 
         if let Some(rv) = &self.rows {
-            let header = Row::new(
-                rv.columns
-                    .iter()
-                    .enumerate()
-                    .map(|(i, c)| {
-                        let st = if i == self.col_idx && self.focus == Focus::Right {
-                            Style::default()
-                                .fg(self.ov.theme.accent)
-                                .add_modifier(Modifier::BOLD)
-                        } else {
-                            Style::default().add_modifier(Modifier::BOLD)
-                        };
-                        // Mark the sorted column in its header.
-                        let label = match &self.sort {
-                            Some(s) if s.column == *c => format!("{} {}", c, arrow(s.desc)),
-                            _ => c.clone(),
-                        };
-                        Cell::from(label).style(st)
-                    })
-                    .collect::<Vec<_>>(),
+            // Which columns are drawn: the ones not hidden, windowed so the
+            // cursor is on screen, with the frozen ones always at the left.
+            let view = self
+                .current_table()
+                .map(|t| self.browse.view(&t))
+                .unwrap_or_default();
+            let visible = view.visible(&rv.columns);
+            // Every column is drawn CELL_W wide inside the pane's borders.
+            let fits = (rect_right.width.saturating_sub(2) as usize / CELL_W).max(1);
+            let rowid_col = view.show_rowid && rv.rowids.iter().any(Option::is_some);
+            let (drawn, scroll) = crate::browse::layout(
+                &visible,
+                view.frozen,
+                self.col_idx,
+                self.col_scroll,
+                fits.saturating_sub(usize::from(rowid_col)),
             );
-            let body = rv.rows.iter().map(|row| {
-                Row::new(
-                    row.iter()
-                        .map(|c| Cell::from(truncate(c, 40)))
-                        .collect::<Vec<_>>(),
-                )
+            self.col_scroll = scroll;
+
+            let mut head: Vec<Cell> = Vec::new();
+            if rowid_col {
+                head.push(
+                    Cell::from("rowid").style(Style::default().fg(self.ov.theme.dim).italic()),
+                );
+            }
+            head.extend(drawn.iter().map(|&i| {
+                let c = &rv.columns[i];
+                let st = if i == self.col_idx && self.focus == Focus::Right {
+                    Style::default()
+                        .fg(self.ov.theme.accent)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().add_modifier(Modifier::BOLD)
+                };
+                // Mark the sorted column, a frozen one, and a formatted one in
+                // the header — the settings are otherwise invisible.
+                let mut label = match &self.sort {
+                    Some(s) if s.column == *c => format!("{} {}", c, arrow(s.desc)),
+                    _ => c.clone(),
+                };
+                if visible
+                    .iter()
+                    .position(|&v| v == i)
+                    .is_some_and(|p| p < view.frozen)
+                {
+                    label.push('▏');
+                }
+                if view.format(c) != crate::browse::Format::Default {
+                    label.push('ƒ');
+                }
+                Cell::from(label).style(st)
+            }));
+            let header = Row::new(head);
+            let body = rv.rows.iter().enumerate().map(|(r, row)| {
+                let mut cells: Vec<Cell> = Vec::new();
+                if rowid_col {
+                    let id = rv
+                        .rowids
+                        .get(r)
+                        .copied()
+                        .flatten()
+                        .map(|v| v.to_string())
+                        .unwrap_or_default();
+                    cells.push(Cell::from(id).style(Style::default().fg(self.ov.theme.dim)));
+                }
+                cells.extend(drawn.iter().map(|&i| {
+                    Cell::from(truncate(row.get(i).map(String::as_str).unwrap_or(""), 40))
+                }));
+                Row::new(cells)
             });
-            let widths: Vec<Constraint> =
-                rv.columns.iter().map(|_| Constraint::Length(20)).collect();
+            let widths: Vec<Constraint> = (0..drawn.len() + usize::from(rowid_col))
+                .map(|_| Constraint::Length(CELL_W as u16 - 1))
+                .collect();
             let mut tstate = TableState::default();
             tstate.select(Some(self.row_idx));
             let table = Table::new(body, widths)
@@ -5743,6 +6030,10 @@ pub fn truncate(s: &str, max: usize) -> String {
         out
     }
 }
+
+/// Width of one grid cell, including the space between columns. The grid draws
+/// as many as fit and scrolls the rest, so this decides how many that is.
+const CELL_W: usize = 21;
 
 /// A centered rect `w` cols wide and `h` rows tall inside `area`.
 fn centered(area: Rect, w: u16, h: u16) -> Rect {
@@ -8022,6 +8313,198 @@ mod tests {
         assert_eq!(find_bytes(hay, b"ab", 4, false), Some(0));
         assert_eq!(find_bytes(hay, b"zz", 0, true), None); // case-sensitive
         assert_eq!(find_bytes(hay, b"", 0, true), None);
+    }
+
+    // ----- what the grid shows ----------------------------------------------
+
+    /// `H` hides the cursor column and `U` brings them all back, and the cursor
+    /// never sits on a column that is not drawn.
+    #[test]
+    fn columns_hide_and_come_back() {
+        let (mut app, path) = sqlite_app();
+        await_queries(&mut app);
+        app.on_key(KeyEvent::from(KeyCode::Tab));
+        assert!(contains(&frame_rows(&mut app, 90, 12), "b"));
+
+        app.on_key(KeyEvent::from(KeyCode::Right)); // column b
+        assert_eq!(app.col_idx, 1);
+        press(&mut app, 'H');
+        assert_ne!(app.col_idx, 1, "the cursor left the hidden column");
+        let rows = frame_rows(&mut app, 90, 12);
+        assert!(
+            rows.iter().any(|r| r.contains("a") && !r.contains("b")),
+            "{rows:?}"
+        );
+
+        // Right steps over the hidden column instead of selecting it invisibly.
+        app.col_idx = 0;
+        app.on_key(KeyEvent::from(KeyCode::Right));
+        assert_eq!(app.col_idx, 2, "b was skipped");
+
+        press(&mut app, 'U');
+        let rows = frame_rows(&mut app, 90, 12);
+        assert!(rows.iter().any(|r| r.contains("b")), "{rows:?}");
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// A display format is a SQL expression, so it changes what the query
+    /// returns — the proof is a value the raw column does not contain.
+    #[test]
+    fn a_display_format_changes_what_the_query_returns() {
+        let path = scratch("db");
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch("CREATE TABLE t (n INTEGER); INSERT INTO t VALUES (255)")
+            .unwrap();
+        drop(conn);
+        let store = Store::Sqlite(SqliteStore::open(&path).unwrap());
+        let mut app = App::with_theme(store, Theme::from_name(ThemeName::NeonSprawl));
+        await_queries(&mut app);
+        app.on_key(KeyEvent::from(KeyCode::Tab));
+        assert!(contains(&frame_rows(&mut app, 90, 12), "255"));
+
+        // default → decimal → exponent → hex blob → hex number.
+        for _ in 0..4 {
+            press(&mut app, 'm');
+        }
+        await_queries(&mut app);
+        assert_eq!(
+            app.browse.view("t").format("n"),
+            crate::browse::Format::HexNumber
+        );
+        let rows = frame_rows(&mut app, 90, 12);
+        assert!(contains(&rows, "ff"), "255 in hex: {rows:?}");
+        assert!(contains(&rows, "ƒ"), "the header marks the format");
+
+        // `M` steps back to where it was.
+        for _ in 0..4 {
+            press(&mut app, 'M');
+        }
+        await_queries(&mut app);
+        assert_eq!(
+            app.browse.view("t").format("n"),
+            crate::browse::Format::Default
+        );
+        assert!(contains(&frame_rows(&mut app, 90, 12), "255"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// `%` types a format of your own, `%1` standing for the column — and an
+    /// expression that never mentions the column is refused, since it would show
+    /// the same value in every row.
+    #[test]
+    fn a_custom_display_format_is_typed_and_checked() {
+        let path = scratch("db");
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch("CREATE TABLE t (n INTEGER); INSERT INTO t VALUES (7)")
+            .unwrap();
+        drop(conn);
+        let store = Store::Sqlite(SqliteStore::open(&path).unwrap());
+        let mut app = App::with_theme(store, Theme::from_name(ThemeName::NeonSprawl));
+        await_queries(&mut app);
+        app.on_key(KeyEvent::from(KeyCode::Tab));
+
+        press(&mut app, '%');
+        assert!(matches!(app.mode, super::Mode::CustomFormat(_)));
+        for c in "'n=' || 1".chars() {
+            press(&mut app, c);
+        }
+        app.on_key(KeyEvent::from(KeyCode::Enter));
+        let rows = frame_rows(&mut app, 90, 12);
+        assert!(
+            contains(&rows, "%1"),
+            "the refusal names the placeholder: {rows:?}"
+        );
+        assert_eq!(
+            app.browse.view("t").format("n"),
+            crate::browse::Format::Default
+        );
+
+        press(&mut app, '%');
+        for c in "'n=' || %1".chars() {
+            press(&mut app, c);
+        }
+        app.on_key(KeyEvent::from(KeyCode::Enter));
+        await_queries(&mut app);
+        let rows = frame_rows(&mut app, 90, 12);
+        assert!(contains(&rows, "n=7"), "{rows:?}");
+
+        // An empty expression is how the column comes back.
+        press(&mut app, '%');
+        app.on_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        app.on_key(KeyEvent::from(KeyCode::Enter));
+        await_queries(&mut app);
+        assert_eq!(
+            app.browse.view("t").format("n"),
+            crate::browse::Format::Default
+        );
+        assert!(contains(&frame_rows(&mut app, 90, 12), "7"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// A table wider than the pane scrolls sideways, and frozen columns stay put
+    /// while it does.
+    #[test]
+    fn a_wide_table_scrolls_and_freezes() {
+        let path = scratch("db");
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        let cols: Vec<String> = (0..12).map(|i| format!("col{i:02} TEXT")).collect();
+        conn.execute_batch(&format!("CREATE TABLE wide ({})", cols.join(", ")))
+            .unwrap();
+        let vals: Vec<String> = (0..12).map(|i| format!("'v{i:02}'")).collect();
+        conn.execute_batch(&format!("INSERT INTO wide VALUES ({})", vals.join(", ")))
+            .unwrap();
+        drop(conn);
+        let store = Store::Sqlite(SqliteStore::open(&path).unwrap());
+        let mut app = App::with_theme(store, Theme::from_name(ThemeName::NeonSprawl));
+        await_queries(&mut app);
+        app.on_key(KeyEvent::from(KeyCode::Tab));
+
+        // Only the first few columns fit in a 90-wide frame.
+        let rows = frame_rows(&mut app, 90, 12);
+        assert!(contains(&rows, "col00"), "{rows:?}");
+        assert!(!contains(&rows, "col11"), "the far column is off screen");
+
+        // Freeze the first column, then walk the cursor to the last one.
+        press(&mut app, 'f');
+        for _ in 0..11 {
+            app.on_key(KeyEvent::from(KeyCode::Right));
+        }
+        let rows = frame_rows(&mut app, 90, 12);
+        assert!(
+            contains(&rows, "col11"),
+            "the cursor column scrolled in: {rows:?}"
+        );
+        assert!(
+            contains(&rows, "col00"),
+            "the frozen column stayed at the edge: {rows:?}"
+        );
+        assert!(
+            !contains(&rows, "col05"),
+            "the middle scrolled away: {rows:?}"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// `#` puts the rowid on screen as its own column, and says so rather than
+    /// doing nothing on a table that has none.
+    #[test]
+    fn the_rowid_column_can_be_shown() {
+        let (mut app, path) = sqlite_app();
+        await_queries(&mut app);
+        app.on_key(KeyEvent::from(KeyCode::Tab));
+        // The toast that says what was toggled paints over the grid, so the
+        // assertions are about the header row alone.
+        let header = |app: &mut App| frame_rows(app, 90, 12)[1].clone();
+        assert!(!header(&mut app).contains("rowid"));
+        press(&mut app, '#');
+        let h = header(&mut app);
+        assert!(h.contains("rowid"), "{h}");
+        assert!(app.browse.view("t").show_rowid);
+        press(&mut app, '#');
+        let h = header(&mut app);
+        assert!(!h.contains("rowid"), "{h}");
+        assert!(!app.browse.view("t").show_rowid);
+        let _ = std::fs::remove_file(path);
     }
 
     // ----- editable pragmas --------------------------------------------------

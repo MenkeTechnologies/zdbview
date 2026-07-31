@@ -11,6 +11,7 @@
 //! descriptor (future work).
 
 mod app;
+mod browse;
 mod clipboard;
 mod ddl;
 mod designer;

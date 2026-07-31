@@ -564,6 +564,12 @@ leaves the editor, twice when there are unsaved edits. The editor is modal, so
 .BR h " and " c
 are its own motions and digits there rather than the help and scheme keys.
 .TP
+.BR H ", " U ", " f ", " # ", " m ", " M
+The Browse Data column settings, kept per table: hide the cursor column or show
+all of them, freeze the columns up to the cursor, show the rowid column, and
+step the column's display format. A display format is a SQL expression applied
+in the SELECT, so sorting and filtering still address the raw value.
+.TP
 .B P
 Edit the pragmas that decide how the database is written — the eighteen DB
 Browser exposes, from

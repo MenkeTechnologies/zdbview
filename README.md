@@ -336,6 +336,11 @@ is published on crates.io); disable with `--no-default-features`.
 | `S` | schema: the objects, and the designers that edit them (SQLite) |
 | `D` | database report: pragmas, integrity check, foreign-key lint, maintenance (SQLite) |
 | `P` | edit the pragmas that decide how the file is written (SQLite) |
+| `H` / `U` | hide the cursor column / show every hidden column (SQLite) |
+| `f` | freeze the columns up to the cursor at the left edge (SQLite) |
+| `#` | show the `rowid` as its own column (SQLite) |
+| `m` / `M` | next / previous display format for the cursor column (SQLite) |
+| `%` | custom display format for the cursor column (SQLite) |
 | `A` | column statistics for the table, with a per-column frequency table (SQLite) |
 | `F` | follow the foreign key under the cursor to the row it references (SQLite) |
 | `Y` | copy the row as an `INSERT` (SQLite) |
@@ -568,6 +573,55 @@ Two consequences worth knowing:
 
 The one-shot command-line paths (`--import`) write before exiting: there is no
 user there to ask.
+
+## What the grid shows
+
+The Browse Data settings DB Browser keeps per table, kept the same way — going
+back to a table finds it as it was left.
+
+| Key | Does | DB Browser |
+|-----|------|------------|
+| `H` | hide the cursor column (the last visible one cannot be hidden) | Hide columns |
+| `U` | show every hidden column again | Show all columns |
+| `f` | freeze the columns up to the cursor; again inside that span unfreezes | Freeze columns |
+| `#` | show the `rowid` as a leading read-only column | Show rowid column |
+| `m` / `M` | step the cursor column's display format | Column display format |
+| `%` | type a display format of your own, `%1` standing for the column | Custom |
+
+A wide table scrolls sideways under the cursor, and the frozen columns stay at
+the left edge while it does. A frozen column is marked `▏` in its header and a
+formatted one `ƒ`, since neither setting is otherwise visible.
+
+### Display formats
+
+The eighteen formats DB Browser applies, and the SQL each one runs:
+
+| Format | SQL |
+|--------|-----|
+| default | the column |
+| decimal number / exponent notation | `printf('%d', c)` / `printf('%e', c)` |
+| hex blob / hex number / octal number | `hex(c)` / `printf('%x', c)` / `printf('%o', c)` |
+| round number | `round(c)` |
+| lower case / upper case | `lower(c)` / `upper(c)` |
+| date as dd/mm/yyyy | `strftime('%d/%m/%Y', c)` |
+| julian day to date | `datetime(c)` |
+| unix epoch to date / to local time | `datetime(c, 'unixepoch')` (`, 'localtime'`) |
+| apple NSDate to date | `datetime(c + 978307200, 'unixepoch')` |
+| java epoch (ms) to date | `datetime(c / 1000, 'unixepoch')` |
+| webkit / chromium epoch to date / to local time | `datetime(c / 1000000 - 11644473600, 'unixepoch')` (`, 'localtime'`) |
+| windows DATE to date | `datetime((c - 25569) * 86400, 'unixepoch')` |
+
+**A format is SQL, not a rendering rule** — which is how DB Browser does it, and
+what makes `hex blob` possible at all: the grid receives cells that are already
+display strings, so a blob has become `<blob 12 bytes>` long before anything
+could format it. Asking SQLite for `hex(col)` gets the bytes; asking the string
+does not. The column keeps its own name in the result, so sorting, filtering,
+paging and editing all still address the raw value — sorting a hex-formatted
+integer column gives `1, 2, a`, not the `1, 10, 2` that sorting the displayed
+strings would.
+
+DB Browser's *SpatiaLite Geometry to SVG* is the one format not implemented: it
+needs the SpatiaLite extension loaded to mean anything.
 
 ## Editable pragmas (`P`)
 

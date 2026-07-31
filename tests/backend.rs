@@ -13,7 +13,11 @@ use std::io::Write;
 // code in the test file itself is still reported.
 // `rkyv_inspect` formats its hex rows through `hexedit` (one shared layout for
 // every hex view), which in turn styles from `theme`, so both come along.
-// `sqlite` reads and rewrites schema definitions through `ddl`.
+// `sqlite` reads and rewrites schema definitions through `ddl`, and applies the
+// grid's display formats — which are SQL expressions — through `browse`.
+#[allow(dead_code)]
+#[path = "../src/browse.rs"]
+mod browse;
 #[allow(dead_code)]
 #[path = "../src/ddl.rs"]
 mod ddl;
@@ -65,6 +69,7 @@ fn pq<'a>(
         filter,
         hint: None,
         known_total: None,
+        formats: &sqlite::NO_FORMATS,
     }
 }
 
@@ -1915,5 +1920,116 @@ fn vacuum_refuses_while_changes_are_unwritten() {
     assert!(err.contains("unwritten changes"), "{err}");
     store.write_changes().unwrap();
     assert!(store.maintain(sqlite::Maintenance::Vacuum).is_ok());
+    let _ = std::fs::remove_file(&path);
+}
+
+/// A display format runs in the `SELECT`, which is the only place it can see a
+/// blob's bytes — by the time the grid has a cell, a blob has already become
+/// `<blob N bytes>`. Editing still addresses the raw column.
+#[test]
+fn a_display_format_is_applied_by_the_query() {
+    let path = tmp("browse_format.db");
+    let _ = std::fs::remove_file(&path);
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE t (n INTEGER, raw BLOB, when_ INTEGER);
+         INSERT INTO t VALUES (255, x'00ff', 0);",
+    )
+    .unwrap();
+    drop(conn);
+
+    let store = SqliteStore::open(&path).unwrap();
+    let plain = store.rows(&pq("t", 10, 0, None, "")).unwrap();
+    assert_eq!(plain.rows[0][0], "255");
+    assert!(
+        plain.rows[0][1].starts_with("<blob"),
+        "a blob has no text form"
+    );
+
+    let mut formats = std::collections::HashMap::new();
+    formats.insert("n".to_string(), browse::Format::HexNumber);
+    formats.insert("raw".to_string(), browse::Format::HexBlob);
+    formats.insert("when_".to_string(), browse::Format::UnixEpoch);
+    let view = store
+        .rows(&sqlite::PageQuery {
+            formats: &formats,
+            ..pq("t", 10, 0, None, "")
+        })
+        .unwrap();
+    assert_eq!(view.rows[0][0], "ff");
+    assert_eq!(
+        view.rows[0][1], "00FF",
+        "the bytes, which the string could not give"
+    );
+    assert_eq!(view.rows[0][2], "1970-01-01 00:00:00");
+    assert_eq!(
+        view.columns, plain.columns,
+        "the columns keep their own names, formatted or not"
+    );
+    // The rowids still address the raw row, so an edit is unaffected.
+    assert_eq!(view.rowids, plain.rowids);
+
+    // A custom expression is substituted for %1 and runs like any other.
+    formats.clear();
+    formats.insert(
+        "n".to_string(),
+        browse::Format::Custom("printf('<%d>', %1)".into()),
+    );
+    let view = store
+        .rows(&sqlite::PageQuery {
+            formats: &formats,
+            ..pq("t", 10, 0, None, "")
+        })
+        .unwrap();
+    assert_eq!(view.rows[0][0], "<255>");
+    let _ = std::fs::remove_file(&path);
+}
+
+/// A format must not break paging, sorting or filtering: those are all about the
+/// underlying column, which is still what the query orders and filters on.
+#[test]
+fn a_formatted_column_still_sorts_and_filters_on_the_raw_value() {
+    let path = tmp("browse_format_sort.db");
+    let _ = std::fs::remove_file(&path);
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE t (n INTEGER);
+         INSERT INTO t VALUES (2), (10), (1);",
+    )
+    .unwrap();
+    drop(conn);
+
+    let store = SqliteStore::open(&path).unwrap();
+    let mut formats = std::collections::HashMap::new();
+    formats.insert("n".to_string(), browse::Format::HexNumber);
+    let sort = Sort {
+        column: "n".into(),
+        desc: false,
+    };
+    let view = store
+        .rows(&sqlite::PageQuery {
+            formats: &formats,
+            ..pq("t", 10, 0, Some(&sort), "")
+        })
+        .unwrap();
+    // Numerically 1, 2, 10 — not the "1", "10", "2" that sorting the hex strings
+    // would give.
+    assert_eq!(
+        view.rows.iter().map(|r| r[0].clone()).collect::<Vec<_>>(),
+        vec!["1", "2", "a"]
+    );
+
+    // And a filter matches what is stored, not what is displayed.
+    let view = store
+        .rows(&sqlite::PageQuery {
+            formats: &formats,
+            ..pq("t", 10, 0, None, "10")
+        })
+        .unwrap();
+    assert_eq!(view.rows.len(), 1);
+    assert_eq!(
+        view.rows[0][0], "a",
+        "the row matched on 10, and shows as a"
+    );
     let _ = std::fs::remove_file(&path);
 }

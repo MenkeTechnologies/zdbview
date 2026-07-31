@@ -208,7 +208,16 @@ pub struct PageQuery<'a> {
     /// A counted total for this table and filter, when one is known. Without it
     /// the view reports the bound this page proves.
     pub known_total: Option<i64>,
+    /// Per-column display formats, applied in the `SELECT` — the grid receives
+    /// cells already turned into display strings, so a format has to happen in
+    /// SQL to see a blob's bytes at all. Empty leaves the select as `*`.
+    pub formats: &'a std::collections::HashMap<String, crate::browse::Format>,
 }
+
+/// The empty format map, for every query that shows a table plainly.
+pub static NO_FORMATS: std::sync::LazyLock<
+    std::collections::HashMap<String, crate::browse::Format>,
+> = std::sync::LazyLock::new(Default::default);
 
 impl<'a> PageQuery<'a> {
     /// The whole of `table`, unordered and unfiltered — what an export wants.
@@ -221,6 +230,7 @@ impl<'a> PageQuery<'a> {
             filter: "",
             hint: None,
             known_total: None,
+            formats: &NO_FORMATS,
         }
     }
 }
@@ -866,6 +876,7 @@ impl SqliteStore {
             filter,
             hint,
             known_total,
+            formats: _,
         } = *q;
         let meta = self.meta(table)?;
         let columns = &meta.columns;
@@ -933,7 +944,33 @@ impl SqliteStore {
             (None, true) => String::new(),
         };
         let take = plan.take(probe, offset, known_total);
-        let select = if with_rowid { "rowid, *" } else { "*" };
+        // `*` unless a column has a display format, in which case every column is
+        // named so the formatted ones can be expressions. The names are kept as
+        // the columns' own, so nothing downstream has to know a format was used.
+        let select = if q.formats.is_empty() {
+            if with_rowid {
+                "rowid, *".to_string()
+            } else {
+                "*".to_string()
+            }
+        } else {
+            let list = columns
+                .iter()
+                .map(|c| {
+                    let quoted = format!("\"{}\"", esc(c));
+                    match q.formats.get(c) {
+                        Some(f) => format!("{} AS {}", f.expression(&quoted), quoted),
+                        None => quoted,
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            if with_rowid {
+                format!("rowid, {list}")
+            } else {
+                list
+            }
+        };
         let sql = format!(
             "SELECT {select} FROM \"{}\"{where_sql} ORDER BY {order} LIMIT {take} OFFSET {}",
             esc(table),
@@ -2397,6 +2434,7 @@ mod tests {
             filter,
             hint,
             known_total,
+            formats: &NO_FORMATS,
         }
     }
 

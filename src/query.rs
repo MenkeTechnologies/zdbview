@@ -48,6 +48,9 @@ pub struct PageReq {
     pub hint: Option<PageHint>,
     /// A counted total for this table and filter, when the UI already has one.
     pub known_total: Option<i64>,
+    /// Per-column display formats — see [`crate::browse::Format`]. Cloned into
+    /// the request because the worker runs on its own thread.
+    pub formats: std::collections::HashMap<String, crate::browse::Format>,
 }
 
 impl PageReq {
@@ -63,6 +66,7 @@ impl PageReq {
             filter: &self.filter,
             hint: self.hint.as_ref(),
             known_total: self.known_total,
+            formats: &self.formats,
         }
     }
 }

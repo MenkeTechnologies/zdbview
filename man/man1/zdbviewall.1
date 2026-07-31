@@ -334,6 +334,29 @@ Toggle focus between the table list and the row grid.
 From the table list, move focus to the rows; from the row grid, open the detail
 screen for the selected row.
 .TP
+.BR H ", " U
+Hide the column under the cursor, or show every hidden column again. The last
+visible column cannot be hidden. The cursor steps over hidden columns rather
+than selecting one invisibly.
+.TP
+.B f
+Freeze the columns up to and including the cursor at the left edge; pressing it
+inside the frozen span unfreezes them. A wide table scrolls sideways under the
+cursor while the frozen columns stay put.
+.TP
+.B #
+Show the rowid as a leading read-only column.
+.TP
+.BR m ", " M
+Step the cursor column's display format forwards or back through DB Browser's
+eighteen: decimal, exponent, hex blob, hex number, octal, round, lower and upper
+case, dd/mm/yyyy, julian day, unix epoch in UTC and local time, Apple NSDate,
+Java milliseconds, WebKit microseconds in UTC and local time, and the Windows
+OLE date. A format is a SQL expression applied in the SELECT, not a rendering
+rule — which is the only way to reach a blob's bytes, since the grid receives
+cells that are already display strings. The column keeps its own name, so
+sorting, filtering and editing still address the raw value.
+.TP
 .B P
 Open the editable pragmas: the eighteen settings DB Browser puts in its Edit
 Pragmas tab, which decide how the database is written rather than what is in it.
