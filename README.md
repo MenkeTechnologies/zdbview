@@ -508,6 +508,40 @@ Inside a clause the scoped columns lead, then what continues the clause (`AND`,
 `ORDER BY`, …), then table names, then the functions. A prefix matching exactly one
 candidate is taken without a menu.
 
+### Tabs, files and results
+
+The rest of DB Browser's Execute SQL tab, on the Alt chords so every printable
+key stays part of the statement:
+
+| Key | Does | DB Browser |
+|-----|------|------------|
+| `Alt-t` / `Alt-w` | new tab / close it | Open tab / Close tab |
+| `Alt-[` / `Alt-]` | previous / next tab | the tab bar |
+| `Alt-o` / `Alt-s` | open a `.sql` file into the tab / save the tab to one | Open SQL file / Save SQL file |
+| `Alt-l` | run only the line the cursor is on | Execute current line |
+| `Alt-;` | comment or uncomment the cursor's line | Toggle comment |
+| `Alt-f` / `Alt-r` | find / replace inside the statement | Find / Find and Replace |
+| `Alt-x` | export the last result set (CSV or JSON, by extension) | Export to CSV / JSON |
+| `Alt-v` | save the statement that produced the result as a view | Save results as view |
+| `Alt-W` | word wrap the transcript | Word Wrap |
+| `Esc` | stop a running statement, else back to the data | Stop the execution |
+
+Each tab keeps its own statement, transcript and file; the tab strip is the
+pane's title, and a tab loaded from a file is named after it. A tab that came
+from a file saves back to it without asking again.
+
+**Stopping a statement.** A statement runs on the thread that draws, so nothing
+else can watch the keyboard while it does. SQLite's progress handler is the one
+place that gets control back periodically, so that is where the key is read: it
+polls without blocking every few thousand VM instructions, and `Esc` (or
+`Ctrl-c`) aborts the statement. The transcript then says it was stopped rather
+than that it failed:
+
+```
+sql> SELECT count(*) FROM huge
+     stopped after 2.184s
+```
+
 ### Dot-commands
 
 A line starting with `.` is a dot-command, as in the shell — `Tab` completes them,

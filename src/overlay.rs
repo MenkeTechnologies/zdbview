@@ -796,6 +796,21 @@ fn help_sections(ctx: HelpCtx) -> Vec<HelpSection> {
                     ("^w", "Delete word"),
                     ("^u / ^k", "Kill to start/end"),
                     ("PgUp/PgDn", "Scroll transcript"),
+                    ("Alt-;", "Toggle comment"),
+                    ("Alt-f", "Find in statement"),
+                    ("Alt-r", "Replace in statement"),
+                ],
+            },
+            HelpSection {
+                title: "TABS & FILES",
+                keys: &[
+                    ("Alt-t / Alt-w", "New / close tab"),
+                    ("Alt-[ / Alt-]", "Previous / next tab"),
+                    ("Alt-o / Alt-s", "Open / save .sql"),
+                    ("Alt-l", "Run the current line"),
+                    ("Alt-x", "Export the result"),
+                    ("Alt-v", "Save result as view"),
+                    ("Alt-W", "Toggle word wrap"),
                 ],
             },
         ];

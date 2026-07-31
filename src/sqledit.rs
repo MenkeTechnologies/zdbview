@@ -303,6 +303,16 @@ pub enum Action {
     /// Show this statement's query plan instead of running it (Alt-e / F5, the
     /// shell's `.eqp`).
     Explain(String),
+    /// Read this file into the tab — DB Browser's "Open SQL file".
+    OpenFile(String),
+    /// Write the tab's statement to this file.
+    SaveFile(String),
+    /// Write the last result set to this file; the extension picks CSV or JSON.
+    ExportResult(String),
+    /// `CREATE VIEW` over the last statement, under this name.
+    SaveView(String),
+    /// Something for the status line.
+    Note(String),
 }
 
 /// One transcript entry.
@@ -349,6 +359,19 @@ pub struct SqlEdit {
     scroll: usize,
     /// Stick to the newest transcript output as it arrives.
     follow: bool,
+    /// The other tabs, each holding the statement and transcript it was left
+    /// with. Switching swaps the fields above with one of these, so every
+    /// existing path keeps working on "the tab in front of you".
+    tabs: Vec<TabState>,
+    /// Which tab the fields above belong to, indexing the whole set.
+    active: usize,
+    /// A one-line question the editor is asking — a file to open, a term to find
+    /// — with what has been typed so far.
+    prompt: Option<(Ask, crate::input::Line)>,
+    /// Wrap long transcript lines instead of cutting them at the pane's edge.
+    wrap: bool,
+    /// What a two-step replace is looking for, between its prompts.
+    replace_find: String,
     history: Vec<String>,
     /// `None` = editing fresh input; `Some(i)` = browsing history at `i`.
     hist_idx: Option<usize>,
@@ -361,6 +384,47 @@ pub struct SqlEdit {
     pub running: bool,
 }
 
+/// One tab's saved state, for the tabs that are not in front of you.
+#[derive(Default)]
+struct TabState {
+    input: Vec<char>,
+    cursor: usize,
+    transcript: Vec<Entry>,
+    scroll: usize,
+    follow: bool,
+    /// Where this tab was loaded from or last saved to, which is what a bare
+    /// save writes back to.
+    file: Option<String>,
+}
+
+/// What a prompt inside the editor is asking for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Ask {
+    OpenFile,
+    SaveFile,
+    Find,
+    /// Replace, step one: what to look for in the statement.
+    ReplaceFind,
+    /// Replace, step two: what to put there.
+    ReplaceWith,
+    ExportResult,
+    SaveView,
+}
+
+impl Ask {
+    fn label(self) -> &'static str {
+        match self {
+            Ask::OpenFile => "open SQL file",
+            Ask::SaveFile => "save SQL to",
+            Ask::Find => "find in statement",
+            Ask::ReplaceFind => "replace what",
+            Ask::ReplaceWith => "replace with",
+            Ask::ExportResult => "export result to (.csv / .json)",
+            Ask::SaveView => "save result as view",
+        }
+    }
+}
+
 impl SqlEdit {
     pub fn new(schema: Vec<(String, Vec<String>)>) -> Self {
         SqlEdit {
@@ -369,6 +433,11 @@ impl SqlEdit {
             transcript: Vec::new(),
             scroll: 0,
             follow: true,
+            tabs: vec![TabState::default()],
+            active: 0,
+            prompt: None,
+            wrap: false,
+            replace_find: String::new(),
             history: load_history(),
             hist_idx: None,
             stash: Vec::new(),
@@ -393,6 +462,14 @@ impl SqlEdit {
         })
     }
 
+    /// The newest result set in the transcript, for exporting it.
+    pub fn last_result(&self) -> Option<(Vec<String>, Vec<Vec<String>>)> {
+        self.transcript.iter().rev().find_map(|e| match e {
+            Entry::Rows { columns, rows, .. } => Some((columns.clone(), rows.clone())),
+            _ => None,
+        })
+    }
+
     pub fn push(&mut self, entry: Entry) {
         self.transcript.push(entry);
         while self.transcript.len() > MAX_TRANSCRIPT {
@@ -407,6 +484,252 @@ impl SqlEdit {
     #[cfg(test)]
     pub fn transcript(&self) -> &[Entry] {
         &self.transcript
+    }
+
+    // ----- tabs (DB Browser's "Open tab") -----------------------------------
+
+    /// How many tabs there are, and which one is in front.
+    pub fn tab_count(&self) -> usize {
+        self.tabs.len()
+    }
+
+    pub fn active_tab(&self) -> usize {
+        self.active
+    }
+
+    /// Put the fields in front into their tab's slot.
+    fn stash_tab(&mut self) {
+        let file = self.tabs[self.active].file.clone();
+        self.tabs[self.active] = TabState {
+            input: std::mem::take(&mut self.input),
+            cursor: self.cursor,
+            transcript: std::mem::take(&mut self.transcript),
+            scroll: self.scroll,
+            follow: self.follow,
+            file,
+        };
+    }
+
+    /// Bring tab `i` to the front.
+    fn switch_to(&mut self, i: usize) {
+        if i >= self.tabs.len() || i == self.active {
+            return;
+        }
+        self.stash_tab();
+        self.active = i;
+        let tab = std::mem::take(&mut self.tabs[i]);
+        self.input = tab.input;
+        self.cursor = tab.cursor;
+        self.transcript = tab.transcript;
+        self.scroll = tab.scroll;
+        self.follow = tab.follow;
+        self.tabs[i].file = tab.file;
+        self.completion = None;
+        self.hist_idx = None;
+    }
+
+    fn new_tab(&mut self) {
+        self.stash_tab();
+        self.tabs.push(TabState {
+            follow: true,
+            ..Default::default()
+        });
+        self.active = self.tabs.len() - 1;
+        self.input.clear();
+        self.cursor = 0;
+        self.transcript.clear();
+        self.scroll = 0;
+        self.follow = true;
+        self.completion = None;
+    }
+
+    /// Close the tab in front. The last one is emptied rather than removed —
+    /// an editor with no tabs has nothing to draw.
+    fn close_tab(&mut self) -> Action {
+        if self.tabs.len() == 1 {
+            self.input.clear();
+            self.cursor = 0;
+            self.transcript.clear();
+            self.tabs[0].file = None;
+            return Action::Note("the last tab was cleared".into());
+        }
+        self.tabs.remove(self.active);
+        self.active = self.active.min(self.tabs.len() - 1);
+        let tab = std::mem::take(&mut self.tabs[self.active]);
+        self.input = tab.input;
+        self.cursor = tab.cursor;
+        self.transcript = tab.transcript;
+        self.scroll = tab.scroll;
+        self.follow = tab.follow;
+        self.tabs[self.active].file = tab.file;
+        Action::None
+    }
+
+    /// The file this tab is bound to, if any.
+    pub fn file(&self) -> Option<&str> {
+        self.tabs[self.active].file.as_deref()
+    }
+
+    /// Replace the tab's statement with a file's contents, and bind the tab to
+    /// it so a later save writes back there.
+    pub fn load_text(&mut self, path: &str, text: &str) {
+        self.input = text.chars().collect();
+        self.cursor = self.input.len();
+        self.tabs[self.active].file = Some(path.to_string());
+        self.hist_idx = None;
+        self.completion = None;
+    }
+
+    /// Note where the tab was saved, so the next save needs no path.
+    pub fn bind_file(&mut self, path: &str) {
+        self.tabs[self.active].file = Some(path.to_string());
+    }
+
+    // ----- editing the statement --------------------------------------------
+
+    /// The line the cursor is on, as `(start, end)` character offsets.
+    fn line_bounds(&self) -> (usize, usize) {
+        let start = self.input[..self.cursor]
+            .iter()
+            .rposition(|&c| c == '\n')
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        let end = self.input[self.cursor..]
+            .iter()
+            .position(|&c| c == '\n')
+            .map(|i| self.cursor + i)
+            .unwrap_or(self.input.len());
+        (start, end)
+    }
+
+    /// Run only the line the cursor is on — DB Browser's "Execute current line".
+    fn execute_line(&mut self) -> Action {
+        let (start, end) = self.line_bounds();
+        let sql: String = self.input[start..end].iter().collect();
+        let sql = sql.trim().to_string();
+        if sql.is_empty() {
+            return Action::Note("the line is empty".into());
+        }
+        self.transcript.push(Entry::Sql(sql.clone()));
+        self.running = true;
+        self.follow = true;
+        Action::Execute(sql)
+    }
+
+    /// Comment or uncomment the cursor's line — DB Browser's "Toggle comment".
+    fn toggle_comment(&mut self) {
+        let (start, end) = self.line_bounds();
+        let line: String = self.input[start..end].iter().collect();
+        let trimmed = line.trim_start();
+        let indent = line.len() - trimmed.len();
+        let (new, delta): (String, isize) = if let Some(rest) = trimmed.strip_prefix("--") {
+            // Take the space back too, if this comment put one there.
+            let rest = rest.strip_prefix(' ').unwrap_or(rest);
+            (
+                format!("{}{}", &line[..indent], rest),
+                -((line.chars().count() - indent - rest.chars().count()) as isize),
+            )
+        } else {
+            (format!("{}-- {}", &line[..indent], trimmed), 3)
+        };
+        let mut chars: Vec<char> = new.chars().collect();
+        self.input.splice(start..end, chars.drain(..));
+        self.cursor = (self.cursor as isize + delta)
+            .clamp(start as isize, self.input.len() as isize) as usize;
+        self.hist_idx = None;
+        self.completion = None;
+    }
+
+    /// Move the cursor to the next occurrence of `needle`, wrapping once.
+    fn find(&mut self, needle: &str) -> Action {
+        if needle.is_empty() {
+            return Action::None;
+        }
+        let text: String = self.input.iter().collect();
+        let lower = text.to_lowercase();
+        let needle = needle.to_lowercase();
+        // Character offsets, since the cursor counts characters.
+        let from = self.cursor;
+        let hit = lower
+            .match_indices(&needle)
+            .map(|(i, _)| text[..i].chars().count())
+            .find(|&i| i > from)
+            .or_else(|| {
+                lower
+                    .match_indices(&needle)
+                    .map(|(i, _)| text[..i].chars().count())
+                    .next()
+            });
+        match hit {
+            Some(i) => {
+                self.cursor = i;
+                Action::None
+            }
+            None => Action::Note(format!("{needle:?} is not in the statement")),
+        }
+    }
+
+    /// Replace every occurrence in the statement.
+    fn replace_all(&mut self, find: &str, with: &str) -> Action {
+        if find.is_empty() {
+            return Action::None;
+        }
+        let text: String = self.input.iter().collect();
+        let n = text.matches(find).count();
+        if n == 0 {
+            return Action::Note(format!("{find:?} is not in the statement"));
+        }
+        self.input = text.replace(find, with).chars().collect();
+        self.cursor = self.cursor.min(self.input.len());
+        self.hist_idx = None;
+        Action::Note(format!(
+            "replaced {n} occurrence{}",
+            if n == 1 { "" } else { "s" }
+        ))
+    }
+
+    /// Open a prompt for `ask`, seeded with `seed`.
+    fn ask(&mut self, ask: Ask, seed: &str) {
+        self.prompt = Some((ask, crate::input::Line::at_end(seed)));
+    }
+
+    /// Handle one key of an open prompt.
+    fn prompt_key(&mut self, key: KeyEvent) -> Action {
+        let (ask, line) = match self.prompt.as_mut() {
+            Some(p) => p,
+            None => return Action::None,
+        };
+        let ask = *ask;
+        match line.on_key(key) {
+            crate::input::Edit::Commit => {
+                let text = line.buf.trim().to_string();
+                self.prompt = None;
+                if text.is_empty() {
+                    return Action::None;
+                }
+                match ask {
+                    Ask::OpenFile => Action::OpenFile(text),
+                    Ask::SaveFile => Action::SaveFile(text),
+                    Ask::Find => self.find(&text),
+                    Ask::ReplaceFind => {
+                        self.replace_find = text;
+                        self.ask(Ask::ReplaceWith, "");
+                        Action::None
+                    }
+                    Ask::ReplaceWith => {
+                        let find = self.replace_find.clone();
+                        self.replace_all(&find, &text)
+                    }
+                    Ask::ExportResult => Action::ExportResult(text),
+                    Ask::SaveView => Action::SaveView(text),
+                }
+            }
+            crate::input::Edit::Cancel => {
+                self.prompt = None;
+                Action::None
+            }
+            _ => Action::None,
+        }
     }
 
     fn insert_char(&mut self, c: char) {
@@ -778,6 +1101,74 @@ impl SqlEdit {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
 
+        // An open prompt owns every key until it commits or is cancelled.
+        if self.prompt.is_some() {
+            return self.prompt_key(key);
+        }
+
+        // The Alt chords are the menu DB Browser puts above the editor: tabs,
+        // files, execute-line, comment, find and replace, and what to do with a
+        // result set.
+        if alt {
+            match key.code {
+                KeyCode::Char('t') => {
+                    self.new_tab();
+                    return Action::None;
+                }
+                KeyCode::Char('w') => return self.close_tab(),
+                KeyCode::Char('[') => {
+                    let n = self.tabs.len();
+                    self.switch_to((self.active + n - 1) % n);
+                    return Action::None;
+                }
+                KeyCode::Char(']') => {
+                    let n = self.tabs.len();
+                    self.switch_to((self.active + 1) % n);
+                    return Action::None;
+                }
+                KeyCode::Char('o') => {
+                    let seed = self.file().unwrap_or("").to_string();
+                    self.ask(Ask::OpenFile, &seed);
+                    return Action::None;
+                }
+                KeyCode::Char('s') => {
+                    let seed = self.file().unwrap_or("").to_string();
+                    self.ask(Ask::SaveFile, &seed);
+                    return Action::None;
+                }
+                KeyCode::Char('l') => return self.execute_line(),
+                KeyCode::Char(';') => {
+                    self.toggle_comment();
+                    return Action::None;
+                }
+                KeyCode::Char('f') => {
+                    self.ask(Ask::Find, "");
+                    return Action::None;
+                }
+                KeyCode::Char('r') => {
+                    self.ask(Ask::ReplaceFind, "");
+                    return Action::None;
+                }
+                KeyCode::Char('x') => {
+                    self.ask(Ask::ExportResult, "result.csv");
+                    return Action::None;
+                }
+                KeyCode::Char('v') => {
+                    self.ask(Ask::SaveView, "");
+                    return Action::None;
+                }
+                KeyCode::Char('W') => {
+                    self.wrap = !self.wrap;
+                    return Action::Note(if self.wrap {
+                        "word wrap on".into()
+                    } else {
+                        "word wrap off".into()
+                    });
+                }
+                _ => {}
+            }
+        }
+
         // While candidates are on screen they take the keys that drive them.
         if self.completion.is_some() {
             match key.code {
@@ -1001,15 +1392,36 @@ impl SqlEdit {
             .skip(self.scroll)
             .take(view.max(1))
             .collect();
+        // The tab strip is the title: which tabs exist, which is in front, and
+        // what file it is bound to.
+        let strip = (0..self.tabs.len())
+            .map(|i| {
+                let name = match (i == self.active, self.tab_file(i)) {
+                    (_, Some(f)) => short_name(f),
+                    (_, None) => format!("{}", i + 1),
+                };
+                if i == self.active {
+                    format!("[{name}]")
+                } else {
+                    format!(" {name} ")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("");
+        let body = Paragraph::new(shown);
+        let body = if self.wrap {
+            body.wrap(ratatui::widgets::Wrap { trim: false })
+        } else {
+            body
+        };
         f.render_widget(
-            Paragraph::new(shown).block(
+            body.block(
                 Block::default()
                     .borders(Borders::ALL)
                     .border_style(Style::default().fg(t.accent))
                     .title(format!(
-                        " SQL — {} statement{} · Tab completes · ^j newline · Enter runs · Esc back ",
-                        self.history.len(),
-                        if self.history.len() == 1 { "" } else { "s" }
+                        " SQL {strip} — Tab completes · ^j newline · Enter runs · \
+                         M-t tab · M-l line · M-; comment · Esc back "
                     )),
             ),
             rows[0],
@@ -1044,15 +1456,36 @@ impl SqlEdit {
             body.push(Line::from(spans));
             idx += len + 1;
         }
+        // A prompt takes the input pane while it is open, so the question and
+        // what is being typed are in the same place the statement would be.
+        if let Some((ask, line)) = &self.prompt {
+            f.render_widget(
+                Paragraph::new(Line::from(vec![
+                    Span::raw(line.buf.clone()),
+                    Span::styled(" ", Style::default().add_modifier(Modifier::REVERSED)),
+                ]))
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_style(Style::default().fg(t.accent))
+                        .title(format!(" {} (Enter, Esc) ", ask.label())),
+                ),
+                rows[1],
+            );
+            return;
+        }
         f.render_widget(
             Paragraph::new(body).block(
                 Block::default()
                     .borders(Borders::ALL)
                     .border_style(Style::default().fg(if self.running { t.label } else { t.dim }))
                     .title(if self.running {
-                        " running… ".to_string()
+                        " running… (Esc stops) ".to_string()
                     } else {
-                        format!(" input · {} chars ", self.input.len())
+                        match self.file() {
+                            Some(f) => format!(" input · {} chars · {f} ", self.input.len()),
+                            None => format!(" input · {} chars ", self.input.len()),
+                        }
                     }),
             ),
             rows[1],
@@ -1097,10 +1530,23 @@ impl SqlEdit {
         }
     }
 
+    /// The file tab `i` is bound to.
+    fn tab_file(&self, i: usize) -> Option<&str> {
+        self.tabs.get(i).and_then(|t| t.file.as_deref())
+    }
+
     /// A screenful of transcript, for paging.
     pub fn page_rows(area: Rect) -> usize {
         (area.height as usize).saturating_sub(6).max(1)
     }
+}
+
+/// A file's name without its directory, for the tab strip.
+fn short_name(path: &str) -> String {
+    std::path::Path::new(path)
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.to_string())
 }
 
 /// `$XDG_CACHE_HOME/zdbview/sql_history`, beside the other appdata.
@@ -1177,6 +1623,167 @@ mod tests {
 
     fn code(c: KeyCode) -> KeyEvent {
         KeyEvent::from(c)
+    }
+
+    fn alt(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::ALT)
+    }
+
+    /// Type `text` into the editor, a character at a time.
+    fn type_in(e: &mut SqlEdit, text: &str) {
+        for c in text.chars() {
+            e.on_key(key(c), 10);
+        }
+    }
+
+    /// Answer whatever prompt is open.
+    fn answer(e: &mut SqlEdit, text: &str) -> Action {
+        for c in text.chars() {
+            e.on_key(key(c), 10);
+        }
+        e.on_key(code(KeyCode::Enter), 10)
+    }
+
+    // ----- the Execute SQL tab's own menu ------------------------------------
+
+    #[test]
+    fn tabs_keep_their_own_statement_and_transcript() {
+        let mut e = ed();
+        type_in(&mut e, "SELECT 1");
+        e.push(Entry::Note(vec!["first".into()]));
+        assert_eq!(e.tab_count(), 1);
+
+        e.on_key(alt('t'), 10);
+        assert_eq!(e.tab_count(), 2);
+        assert_eq!(e.active_tab(), 1);
+        assert_eq!(e.text(), "", "a new tab starts empty");
+        type_in(&mut e, "SELECT 2");
+
+        // Back to the first: its statement and transcript are as they were.
+        e.on_key(alt('['), 10);
+        assert_eq!(e.active_tab(), 0);
+        assert_eq!(e.text(), "SELECT 1");
+        assert_eq!(e.transcript().len(), 1);
+
+        e.on_key(alt(']'), 10);
+        assert_eq!(e.text(), "SELECT 2");
+        assert!(e.transcript().is_empty());
+
+        // Closing takes the tab with it; the last one is cleared instead.
+        e.on_key(alt('w'), 10);
+        assert_eq!(e.tab_count(), 1);
+        assert_eq!(e.text(), "SELECT 1");
+        assert!(matches!(e.on_key(alt('w'), 10), Action::Note(_)));
+        assert_eq!(e.tab_count(), 1);
+        assert_eq!(e.text(), "");
+    }
+
+    #[test]
+    fn alt_l_runs_only_the_line_the_cursor_is_on() {
+        let mut e = ed();
+        type_in(&mut e, "SELECT 1;");
+        e.on_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL), 10);
+        type_in(&mut e, "SELECT 2;");
+        // The cursor is on the second line.
+        assert_eq!(e.on_key(alt('l'), 10), Action::Execute("SELECT 2;".into()));
+        // The statement is left in the editor, unlike Enter which submits it.
+        assert_eq!(e.text(), "SELECT 1;\nSELECT 2;");
+    }
+
+    #[test]
+    fn alt_semicolon_comments_and_uncomments_the_line() {
+        let mut e = ed();
+        type_in(&mut e, "  SELECT 1");
+        e.on_key(alt(';'), 10);
+        assert_eq!(e.text(), "  -- SELECT 1");
+        e.on_key(alt(';'), 10);
+        assert_eq!(e.text(), "  SELECT 1", "and back again");
+
+        // Only the cursor's line is touched.
+        e.on_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL), 10);
+        type_in(&mut e, "SELECT 2");
+        e.on_key(alt(';'), 10);
+        assert_eq!(e.text(), "  SELECT 1\n-- SELECT 2");
+    }
+
+    #[test]
+    fn alt_f_finds_and_alt_r_replaces_in_the_statement() {
+        let mut e = ed();
+        type_in(&mut e, "SELECT a FROM t WHERE a > 1");
+        e.on_key(code(KeyCode::Home), 10);
+        e.on_key(alt('f'), 10);
+        answer(&mut e, "FROM");
+        assert_eq!(e.cursor, 9, "the cursor moved to the match");
+        // A term that is not there says so rather than moving.
+        e.on_key(alt('f'), 10);
+        assert!(matches!(answer(&mut e, "zzz"), Action::Note(_)));
+        assert_eq!(e.cursor, 9);
+
+        e.on_key(alt('r'), 10);
+        answer(&mut e, "a");
+        let done = answer(&mut e, "b");
+        assert!(matches!(done, Action::Note(_)));
+        assert_eq!(e.text(), "SELECT b FROM t WHERE b > 1");
+    }
+
+    #[test]
+    fn a_prompt_can_be_cancelled_without_doing_anything() {
+        let mut e = ed();
+        type_in(&mut e, "SELECT 1");
+        e.on_key(alt('r'), 10);
+        type_in(&mut e, "SELECT");
+        assert_eq!(
+            e.text(),
+            "SELECT 1",
+            "the prompt takes the keys, not the buffer"
+        );
+        e.on_key(code(KeyCode::Esc), 10);
+        assert_eq!(e.text(), "SELECT 1");
+        // And Esc now closes the editor again, rather than the prompt.
+        assert_eq!(e.on_key(code(KeyCode::Esc), 10), Action::Close);
+    }
+
+    #[test]
+    fn file_and_result_actions_hand_the_work_to_the_host() {
+        let mut e = ed();
+        e.on_key(alt('o'), 10);
+        assert_eq!(answer(&mut e, "q.sql"), Action::OpenFile("q.sql".into()));
+
+        e.load_text("q.sql", "SELECT 1");
+        assert_eq!(e.text(), "SELECT 1");
+        assert_eq!(e.file(), Some("q.sql"));
+
+        // A save is offered the file the tab came from.
+        e.on_key(alt('s'), 10);
+        assert_eq!(
+            e.on_key(code(KeyCode::Enter), 10),
+            Action::SaveFile("q.sql".into())
+        );
+
+        e.on_key(alt('x'), 10);
+        // The prompt is seeded, so Enter alone exports to the default name.
+        assert_eq!(
+            e.on_key(code(KeyCode::Enter), 10),
+            Action::ExportResult("result.csv".into())
+        );
+
+        e.on_key(alt('v'), 10);
+        assert_eq!(answer(&mut e, "v1"), Action::SaveView("v1".into()));
+    }
+
+    #[test]
+    fn the_last_result_set_is_what_an_export_takes() {
+        let mut e = ed();
+        assert!(e.last_result().is_none());
+        e.push(Entry::Rows {
+            columns: vec!["a".into()],
+            rows: vec![vec!["1".into()]],
+            truncated: false,
+        });
+        e.push(Entry::Note(vec!["something else".into()]));
+        let (columns, rows) = e.last_result().unwrap();
+        assert_eq!(columns, vec!["a".to_string()]);
+        assert_eq!(rows, vec![vec!["1".to_string()]]);
     }
 
     fn ctrl(c: char) -> KeyEvent {

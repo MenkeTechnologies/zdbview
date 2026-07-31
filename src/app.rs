@@ -15,6 +15,7 @@ use ratatui::{DefaultTerminal, Frame};
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use crate::formats::{self, Decoded, FormatKind};
 use crate::hexedit::{self, HexEdit};
@@ -353,6 +354,12 @@ pub struct App {
     /// Per-table grid settings: hidden columns, frozen columns, the rowid
     /// column, display formats — DB Browser's Browse Data settings.
     browse: crate::browse::Browse,
+    /// True while the editor's statement is running, which is when the stop key
+    /// is watched. See [`App::install_sql_stop`].
+    sql_running: Arc<std::sync::atomic::AtomicBool>,
+    /// Set by the stop key, so the outcome can say the statement was stopped
+    /// rather than that it failed.
+    sql_stopped: Arc<std::sync::atomic::AtomicBool>,
     /// First scrolling column on screen, so a wide table can be walked sideways
     /// without the window jumping back and forth.
     col_scroll: usize,
@@ -501,6 +508,8 @@ impl App {
             index_design: None,
             pragmas: None,
             browse: Default::default(),
+            sql_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            sql_stopped: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             col_scroll: 0,
             replace_find: String::new(),
             insert_form: None,
@@ -4349,10 +4358,56 @@ impl App {
         };
         if self.sql.is_none() {
             self.sql = Some(crate::sqledit::SqlEdit::new(schema));
+            self.install_sql_stop();
         }
         self.screen = Screen::Sql;
-        self.status =
-            "SQL editor · Tab completes · ^j newline · Enter runs · ↑/↓ history · Esc back".into();
+        let (tab, tabs) = self
+            .sql
+            .as_ref()
+            .map(|e| (e.active_tab() + 1, e.tab_count()))
+            .unwrap_or((1, 1));
+        self.status = format!(
+            "SQL editor · tab {tab}/{tabs} · Tab completes · ^j newline · Enter runs · \
+             M-t new tab · Esc back"
+        );
+    }
+
+    /// Let a running statement be stopped — DB Browser's "Stop the execution".
+    ///
+    /// A statement runs on this thread, so nothing else can watch the keyboard
+    /// while it does. SQLite's progress handler is the one place that gets
+    /// control back periodically, so that is where the key is read: it polls
+    /// without blocking, and Esc (or Ctrl-c) aborts the statement, which SQLite
+    /// reports as an interrupt.
+    fn install_sql_stop(&mut self) {
+        let running = Arc::clone(&self.sql_running);
+        let stopped = Arc::clone(&self.sql_stopped);
+        let cancel: crate::sqlite::Cancel = Arc::new(move || {
+            if !running.load(std::sync::atomic::Ordering::Relaxed) {
+                return false;
+            }
+            // Poll rather than read: a statement that finishes quickly must not
+            // wait for a keypress that is not coming.
+            while event::poll(std::time::Duration::ZERO).unwrap_or(false) {
+                match event::read() {
+                    Ok(Event::Key(k))
+                        if k.kind == KeyEventKind::Press
+                            && (k.code == KeyCode::Esc
+                                || (k.code == KeyCode::Char('c')
+                                    && k.modifiers.contains(KeyModifiers::CONTROL))) =>
+                    {
+                        stopped.store(true, std::sync::atomic::Ordering::Relaxed);
+                        return true;
+                    }
+                    Ok(_) => {}
+                    Err(_) => return false,
+                }
+            }
+            false
+        });
+        if let Store::Sqlite(s) = &mut self.store {
+            s.set_cancel(SQL_STOP_CHECK_OPS, cancel);
+        }
     }
 
     fn key_sql(&mut self, key: KeyEvent) {
@@ -4371,6 +4426,97 @@ impl App {
             crate::sqledit::Action::Close => self.screen = Screen::Main,
             crate::sqledit::Action::Execute(sql) => self.execute_sql(&sql),
             crate::sqledit::Action::Explain(sql) => self.explain_sql(&sql),
+            crate::sqledit::Action::Note(msg) => self.notify(msg),
+            crate::sqledit::Action::OpenFile(path) => self.open_sql_file(&path),
+            crate::sqledit::Action::SaveFile(path) => self.save_sql_file(&path),
+            crate::sqledit::Action::ExportResult(path) => self.export_sql_result(&path),
+            crate::sqledit::Action::SaveView(name) => self.save_result_as_view(&name),
+        }
+    }
+
+    /// `Alt-o` in the editor: read a `.sql` file into the tab, which then
+    /// remembers where it came from.
+    fn open_sql_file(&mut self, path: &str) {
+        match std::fs::read_to_string(path) {
+            Ok(text) => {
+                if let Some(e) = self.sql.as_mut() {
+                    e.load_text(path, text.trim_end());
+                }
+                self.notify(format!("loaded {path}"));
+            }
+            Err(e) => self.notify(format!("cannot read {path}: {e}")),
+        }
+    }
+
+    /// `Alt-s`: write the tab's statement out.
+    fn save_sql_file(&mut self, path: &str) {
+        let text = match self.sql.as_ref() {
+            Some(e) => e.text(),
+            None => return,
+        };
+        match std::fs::write(path, format!("{}\n", text.trim_end())) {
+            Ok(()) => {
+                if let Some(e) = self.sql.as_mut() {
+                    e.bind_file(path);
+                }
+                self.notify(format!("wrote {} bytes to {path}", text.len() + 1));
+            }
+            Err(e) => self.notify(format!("cannot write {path}: {e}")),
+        }
+    }
+
+    /// `Alt-x`: the last result set to a file, CSV or JSON by extension — DB
+    /// Browser's "Export to CSV" / "Export to JSON" for a query's results.
+    fn export_sql_result(&mut self, path: &str) {
+        let (columns, rows) = match self.sql.as_ref().and_then(|e| e.last_result()) {
+            Some(r) => r,
+            None => {
+                self.notify("no result set to export — run a SELECT first");
+                return;
+            }
+        };
+        let json = std::path::Path::new(path)
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("json"));
+        let text = if json {
+            crate::export::rows_to_json(&columns, &rows)
+        } else {
+            crate::export::rows_to_csv(&columns, &rows)
+        };
+        match std::fs::write(path, text.as_bytes()) {
+            Ok(()) => self.notify(format!(
+                "wrote {} row{} to {path} as {}",
+                rows.len(),
+                if rows.len() == 1 { "" } else { "s" },
+                if json { "JSON" } else { "CSV" }
+            )),
+            Err(e) => self.notify(format!("cannot write {path}: {e}")),
+        }
+    }
+
+    /// `Alt-v`: DB Browser's "Save results as view" — the statement that
+    /// produced them becomes a view, since a result set itself cannot be one.
+    fn save_result_as_view(&mut self, name: &str) {
+        let sql = match self.sql.as_ref().and_then(|e| e.last_statement()) {
+            Some(s) => s,
+            None => {
+                self.notify("no statement to save — run a SELECT first");
+                return;
+            }
+        };
+        let statement = format!(
+            "CREATE VIEW {} AS {}",
+            crate::ddl::quote(name),
+            sql.trim().trim_end_matches(';')
+        );
+        let plan = crate::ddl::AlterPlan {
+            statements: vec![statement],
+            rebuild: false,
+        };
+        match self.sqlite().map(|s| s.apply_ddl(&plan)) {
+            Some(Ok(())) => self.after_schema_edit(format!("created view {name}")),
+            Some(Err(e)) => self.notify(format!("cannot create the view: {e}")),
+            None => {}
         }
     }
 
@@ -4404,11 +4550,28 @@ impl App {
             self.explain_sql(sql);
         }
         let started = std::time::Instant::now();
+        // The stop key is only watched while this runs, or every scan the grid
+        // makes would eat the keyboard.
+        self.sql_stopped
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        self.sql_running
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         let outcome = match self.sqlite() {
             Some(s) => s.run(sql, RESULT_ROWS),
             None => return,
         };
+        self.sql_running
+            .store(false, std::sync::atomic::Ordering::Relaxed);
         let took = started.elapsed();
+        if self.sql_stopped.load(std::sync::atomic::Ordering::Relaxed) {
+            if let Some(e) = self.sql.as_mut() {
+                e.push(crate::sqledit::Entry::Error(format!(
+                    "stopped after {:.3}s",
+                    took.as_secs_f64()
+                )));
+            }
+            return;
+        }
         let entry = match outcome {
             Ok(Outcome::Rows {
                 columns,
@@ -6416,6 +6579,11 @@ fn arrow(desc: bool) -> &'static str {
     }
 }
 
+/// How often a statement from the editor checks whether the stop key was
+/// pressed, in SQLite VM instructions. Small enough to feel immediate, large
+/// enough that the check costs nothing on a statement that returns at once.
+const SQL_STOP_CHECK_OPS: i32 = 5_000;
+
 /// Width of one grid cell, including the space between columns. The grid draws
 /// as many as fit and scrolls the rest, so this decides how many that is.
 const CELL_W: usize = 21;
@@ -8148,7 +8316,7 @@ mod tests {
         // The editor draws over the app, and Esc returns to the data with the
         // transcript intact for the next visit.
         let rows = frame_rows(&mut app, 100, 20);
-        assert!(contains(&rows, "SQL —"), "editor not drawn: {:?}", rows[0]);
+        assert!(contains(&rows, "SQL ["), "editor not drawn: {:?}", rows[0]);
         assert!(contains(&rows, "no such table"), "error not on screen");
         app.on_key(KeyEvent::from(KeyCode::Esc));
         assert_eq!(app.screen, super::Screen::Main);
@@ -8889,6 +9057,96 @@ mod tests {
         let h = header(&mut app);
         assert!(!h.contains("rowid"), "{h}");
         assert!(!app.browse.view("t").show_rowid);
+        let _ = std::fs::remove_file(path);
+    }
+
+    // ----- the SQL editor's files and results --------------------------------
+
+    /// A statement written out with `Alt-s` comes back with `Alt-o`, and the
+    /// result of running it exports as CSV or JSON by extension.
+    #[test]
+    fn the_editor_saves_and_loads_files_and_exports_its_result() {
+        let path = scratch("db");
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch("CREATE TABLE t (a TEXT); INSERT INTO t VALUES ('x')")
+            .unwrap();
+        drop(conn);
+        let store = Store::Sqlite(SqliteStore::open(&path).unwrap());
+        let mut app = App::with_theme(store, Theme::from_name(ThemeName::NeonSprawl));
+        press(&mut app, ':');
+        assert_eq!(app.screen, super::Screen::Sql);
+
+        let sql_file = scratch("sql");
+        for c in "SELECT a FROM t".chars() {
+            press(&mut app, c);
+        }
+        // Alt-s, then the path.
+        app.on_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::ALT));
+        app.on_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        for c in sql_file.to_string_lossy().chars() {
+            press(&mut app, c);
+        }
+        app.on_key(KeyEvent::from(KeyCode::Enter));
+        assert_eq!(
+            std::fs::read_to_string(&sql_file).unwrap().trim(),
+            "SELECT a FROM t"
+        );
+
+        // A new tab, then load the file back into it.
+        app.on_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::ALT));
+        assert_eq!(app.sql.as_ref().unwrap().text(), "");
+        app.on_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::ALT));
+        for c in sql_file.to_string_lossy().chars() {
+            press(&mut app, c);
+        }
+        app.on_key(KeyEvent::from(KeyCode::Enter));
+        assert_eq!(app.sql.as_ref().unwrap().text(), "SELECT a FROM t");
+
+        // Run it, then export the result.
+        app.on_key(KeyEvent::from(KeyCode::Enter));
+        let out = scratch("json");
+        app.on_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::ALT));
+        app.on_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        for c in out.to_string_lossy().chars() {
+            press(&mut app, c);
+        }
+        app.on_key(KeyEvent::from(KeyCode::Enter));
+        let json = std::fs::read_to_string(&out).unwrap();
+        assert!(json.contains("\"a\""), "{json}");
+        assert!(json.contains("\"x\""), "{json}");
+
+        for p in [path, sql_file, out] {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+
+    /// `Alt-v` turns the statement that produced the result into a view, since a
+    /// result set cannot be one.
+    #[test]
+    fn the_editors_result_can_be_saved_as_a_view() {
+        let path = scratch("db");
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch("CREATE TABLE t (a INTEGER); INSERT INTO t VALUES (1), (2)")
+            .unwrap();
+        drop(conn);
+        let store = Store::Sqlite(SqliteStore::open(&path).unwrap());
+        let mut app = App::with_theme(store, Theme::from_name(ThemeName::NeonSprawl));
+        press(&mut app, ':');
+        for c in "SELECT a FROM t WHERE a > 1".chars() {
+            press(&mut app, c);
+        }
+        app.on_key(KeyEvent::from(KeyCode::Enter));
+
+        app.on_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::ALT));
+        for c in "big_a".chars() {
+            press(&mut app, c);
+        }
+        app.on_key(KeyEvent::from(KeyCode::Enter));
+
+        let sql = app.sqlite().unwrap().object_sql("big_a").unwrap();
+        let (ty, text) = sql.expect("the view exists");
+        assert_eq!(ty, "view");
+        assert!(text.contains("SELECT a FROM t WHERE a > 1"), "{text}");
         let _ = std::fs::remove_file(path);
     }
 
