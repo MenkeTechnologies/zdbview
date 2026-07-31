@@ -13,8 +13,9 @@ use ratatui::style::{Modifier, Style};
 use ratatui::widgets::{Block, Borders, Cell, Row, Table, TableState};
 use ratatui::Frame;
 
-use crate::app::{human_size, truncate};
+use crate::app::human_size;
 use crate::store::Kind;
+use crate::text::truncate;
 use crate::theme::Theme;
 use crate::watch::{spark, Column, Sort, Watcher, ACTIVE_WINDOW};
 
@@ -180,7 +181,7 @@ impl Monitor {
                     }
                     self.note = Some(format!(
                         "{} is an rkyv archive — no log to walk",
-                        crate::app::truncate(name_of(&path), 24)
+                        crate::text::truncate(name_of(&path), 24)
                     ));
                 }
             }

@@ -357,6 +357,34 @@ rule — which is the only way to reach a blob's bytes, since the grid receives
 cells that are already display strings. The column keeps its own name, so
 sorting, filtering and editing still address the raw value.
 .TP
+.B r
+Find and replace in the column under the cursor, asked in two steps: what to
+find, then what to put there. Between them it counts the rows that match, so a
+term that finds nothing never reaches the second question. The replacement is a
+substring replace over the rows the active filter leaves, and it lands in the
+edit buffer like any other write.
+.TP
+.B i
+Insert a row value by value. A column starts NULL and stays NULL unless
+something is typed, so NULL and the empty string stay apart;
+.B n
+puts a column back to NULL.
+.TP
+.B V
+Save the current filter as a view. The filter's patterns are written into the
+statement as literals, since a view cannot carry parameters.
+.TP
+.BR z ", " Z
+Clear the sorting, or the filter.
+.TP
+.B L
+Unlock a view for editing. A view can only be written to through INSTEAD OF
+triggers, so this reports whether the view has them; editing one without them is
+refused with that reason.
+.TP
+.B Ctrl\-y
+Copy the column's name to the clipboard.
+.TP
 .B P
 Open the editable pragmas: the eighteen settings DB Browser puts in its Edit
 Pragmas tab, which decide how the database is written rather than what is in it.

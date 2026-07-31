@@ -360,11 +360,11 @@ impl FrameView {
                         let name = columns.get(i).cloned().unwrap_or_else(|| format!("c{i}"));
                         lines.push(Line::from(vec![
                             Span::styled(
-                                format!("  {:>16}  ", crate::app::truncate(&name, 16)),
+                                format!("  {:>16}  ", crate::text::truncate(&name, 16)),
                                 Style::default().fg(t.dim),
                             ),
                             Span::styled(
-                                crate::app::truncate(&show(v), 60),
+                                crate::text::truncate(&show(v), 60),
                                 Style::default().fg(t.primary),
                             ),
                         ]));

@@ -35,6 +35,7 @@ mod scan;
 mod sqledit;
 mod sqlite;
 mod store;
+mod text;
 mod theme;
 mod wal;
 mod watch;

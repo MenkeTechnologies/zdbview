@@ -21,9 +21,14 @@ mod browse;
 #[allow(dead_code)]
 #[path = "../src/ddl.rs"]
 mod ddl;
+// `browse` holds the insert form, which edits its fields through `input` and
+// fits them with `text`.
 #[allow(dead_code)]
 #[path = "../src/hexedit.rs"]
 mod hexedit;
+#[allow(dead_code)]
+#[path = "../src/input.rs"]
+mod input;
 #[allow(dead_code)]
 #[path = "../src/mru.rs"]
 mod mru;
@@ -39,6 +44,9 @@ mod sqlite;
 #[allow(dead_code)]
 #[path = "../src/store.rs"]
 mod store;
+#[allow(dead_code)]
+#[path = "../src/text.rs"]
+mod text;
 #[allow(dead_code)]
 #[path = "../src/theme.rs"]
 mod theme;
@@ -2031,5 +2039,170 @@ fn a_formatted_column_still_sorts_and_filters_on_the_raw_value() {
         view.rows[0][0], "a",
         "the row matched on 10, and shows as a"
     );
+    let _ = std::fs::remove_file(&path);
+}
+
+/// Find and replace works on one column, over the rows the grid's filter leaves,
+/// and lands in the edit buffer like any other write — so a replace that went
+/// wrong is one revert away.
+#[test]
+fn replace_touches_only_the_matching_rows_under_the_filter() {
+    let path = tmp("browse_replace.db");
+    let _ = std::fs::remove_file(&path);
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE t (tag TEXT, note TEXT);
+         INSERT INTO t VALUES ('keep', 'a cat sat'), ('keep', 'no match here'),
+                             ('skip', 'a cat ran');",
+    )
+    .unwrap();
+    drop(conn);
+
+    let mut store = SqliteStore::open(&path).unwrap();
+    assert_eq!(store.count_matches("t", "note", "cat", "").unwrap(), 2);
+    assert_eq!(
+        store.count_matches("t", "note", "cat", "tag:keep").unwrap(),
+        1,
+        "the filter narrows what a replace would touch"
+    );
+
+    let n = store
+        .replace_in_column("t", "note", "cat", "dog", "tag:keep")
+        .unwrap();
+    assert_eq!(n, 1);
+    assert!(store.has_pending(), "it is buffered like any other write");
+
+    let notes = |s: &SqliteStore| -> Vec<String> {
+        s.rows(&pq("t", 10, 0, None, ""))
+            .unwrap()
+            .rows
+            .into_iter()
+            .map(|r| r[1].clone())
+            .collect()
+    };
+    assert_eq!(
+        notes(&store),
+        vec!["a dog sat", "no match here", "a cat ran"],
+        "only the filtered, matching row changed"
+    );
+    store.revert_changes().unwrap();
+    assert_eq!(
+        notes(&store),
+        vec!["a cat sat", "no match here", "a cat ran"]
+    );
+
+    assert!(store
+        .replace_in_column("t", "nosuch", "a", "b", "")
+        .unwrap_err()
+        .to_string()
+        .contains("no column"));
+    assert!(store.replace_in_column("t", "note", "", "b", "").is_err());
+    let _ = std::fs::remove_file(&path);
+}
+
+/// Saving the filter as a view writes the filter's patterns into the statement
+/// as literals, because a view cannot carry parameters — and the view then
+/// selects exactly the rows the grid was showing.
+#[test]
+fn a_filter_becomes_a_view_that_selects_the_same_rows() {
+    let path = tmp("browse_view.db");
+    let _ = std::fs::remove_file(&path);
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE t (tag TEXT, n INTEGER);
+         INSERT INTO t VALUES ('keep', 1), ('drop', 2), ('keep', 3);",
+    )
+    .unwrap();
+    drop(conn);
+
+    let store = SqliteStore::open(&path).unwrap();
+    let filtered = store.rows(&pq("t", 10, 0, None, "tag:keep")).unwrap();
+    assert_eq!(filtered.rows.len(), 2);
+
+    let sql = store
+        .create_view_from_filter("keepers", "t", "tag:keep")
+        .unwrap();
+    assert!(
+        sql.starts_with("CREATE VIEW \"keepers\" AS SELECT * FROM \"t\" WHERE"),
+        "{sql}"
+    );
+    assert!(
+        !sql.contains('?'),
+        "no parameters survive into a view: {sql}"
+    );
+    store.write_changes().unwrap();
+
+    let n: i64 = store
+        .run("SELECT count(*) FROM keepers", 10)
+        .map(|o| match o {
+            sqlite::Outcome::Rows { rows, .. } => rows[0][0].parse().unwrap(),
+            _ => -1,
+        })
+        .unwrap();
+    assert_eq!(n, 2, "the view selects what the filter did");
+
+    // A quote in the pattern is escaped rather than ending the literal.
+    let sql = store
+        .create_view_from_filter("quoted", "t", "tag:it's")
+        .unwrap();
+    assert!(sql.contains("it''s"), "{sql}");
+    let _ = std::fs::remove_file(&path);
+}
+
+/// Insert Values keeps NULL apart from the empty string, which is the whole
+/// reason it exists next to the blank-row insert.
+#[test]
+fn insert_values_writes_nulls_and_empty_strings_apart() {
+    let path = tmp("browse_insert.db");
+    let _ = std::fs::remove_file(&path);
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute_batch("CREATE TABLE t (a TEXT, b TEXT)")
+        .unwrap();
+    drop(conn);
+
+    let store = SqliteStore::open(&path).unwrap();
+    store
+        .insert_values(
+            "t",
+            &[
+                ("a".to_string(), Some(String::new())),
+                ("b".to_string(), None),
+            ],
+        )
+        .unwrap();
+    store.write_changes().unwrap();
+
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    let (ta, tb): (String, String) = conn
+        .query_row("SELECT typeof(a), typeof(b) FROM t", [], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .unwrap();
+    assert_eq!((ta.as_str(), tb.as_str()), ("text", "null"));
+    let _ = std::fs::remove_file(&path);
+}
+
+/// A view is writable only through `INSTEAD OF` triggers — what "unlock view
+/// editing" is actually asking about.
+#[test]
+fn a_view_is_writable_only_with_instead_of_triggers() {
+    let path = tmp("browse_viewedit.db");
+    let _ = std::fs::remove_file(&path);
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE t (a TEXT);
+         CREATE VIEW plain AS SELECT a FROM t;
+         CREATE VIEW writable AS SELECT a FROM t;
+         CREATE TRIGGER writable_upd INSTEAD OF UPDATE ON writable
+           BEGIN UPDATE t SET a = NEW.a; END;",
+    )
+    .unwrap();
+    drop(conn);
+
+    let store = SqliteStore::open(&path).unwrap();
+    assert!(store.is_view("plain"));
+    assert!(!store.is_view("t"));
+    assert!(!store.view_is_writable("plain").unwrap());
+    assert!(store.view_is_writable("writable").unwrap());
     let _ = std::fs::remove_file(&path);
 }

@@ -14,6 +14,7 @@
 
 use crate::ddl::{ColumnDef, IndexColumn, IndexDef, TableDef};
 use crate::input::{Edit, Line};
+use crate::text::truncate as clip;
 use crate::theme::Theme;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -811,16 +812,6 @@ fn yes_no(on: bool) -> &'static str {
     } else {
         "no"
     }
-}
-
-/// Cut a field's text to the column width, marking that it was cut.
-fn clip(s: &str, w: usize) -> String {
-    if s.chars().count() <= w {
-        return s.to_string();
-    }
-    let mut out: String = s.chars().take(w.saturating_sub(1)).collect();
-    out.push('…');
-    out
 }
 
 #[cfg(test)]

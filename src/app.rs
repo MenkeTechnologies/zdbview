@@ -23,6 +23,7 @@ use crate::overlay::{HelpCtx, Overlays};
 use crate::rkyv_inspect::RkyvStore;
 use crate::sqlite::{RowsView, Sort, SqliteStore};
 use crate::store::{Kind, Store};
+use crate::text::truncate;
 use crate::theme::{Theme, ThemeName};
 
 /// How many rows per SQLite page.
@@ -181,6 +182,13 @@ enum Mode {
     /// Typing a custom display format for the cursor column, where `%1` stands
     /// for the column — DB Browser's "Custom" display format.
     CustomFormat(String),
+    /// Find and replace, step one: what to look for in the cursor column.
+    FindText(String),
+    /// Find and replace, step two: what to put in its place. The text to find is
+    /// in `replace_find`.
+    ReplaceText(String),
+    /// Naming the view a filter is being saved as.
+    ViewName(String),
     /// Renaming a rkyv record's key; buffer holds the new key.
     RenameRecord(String),
     /// Confirm a destructive action (delete row).
@@ -261,6 +269,8 @@ enum Screen {
     IndexDesign,
     /// The editable pragmas — DB Browser's "Edit Pragmas" tab.
     Pragmas,
+    /// The insert form — DB Browser's "Insert Values".
+    InsertRow,
 }
 
 /// How the value pane renders raw bytes.
@@ -343,6 +353,13 @@ pub struct App {
     /// First scrolling column on screen, so a wide table can be walked sideways
     /// without the window jumping back and forth.
     col_scroll: usize,
+    /// What find-and-replace is looking for, between its two prompts.
+    replace_find: String,
+    /// The insert form, while `screen` is `Screen::InsertRow`.
+    insert_form: Option<crate::browse::RowForm>,
+    /// Views the user has unlocked for editing this session — DB Browser's
+    /// "Unlock view editing".
+    unlocked_views: Vec<String>,
 
     // Mouse hit-testing: the on-screen rect and scroll offset of each clickable
     // list/grid, captured during render so a click maps to the right index.
@@ -480,6 +497,9 @@ impl App {
             pragmas: None,
             browse: Default::default(),
             col_scroll: 0,
+            replace_find: String::new(),
+            insert_form: None,
+            unlocked_views: Vec::new(),
             click_left: Rect::ZERO,
             click_right: Rect::ZERO,
             click_records: Rect::ZERO,
@@ -695,6 +715,9 @@ impl App {
             Search(String),
             Add(String),
             Format(String),
+            Find(String),
+            Replace(String),
+            ViewName(String),
             Rename(String),
             Confirm,
             Drop(String, String),
@@ -706,6 +729,9 @@ impl App {
             Mode::Search(buf) => Modal::Search(buf.clone()),
             Mode::AddRecord(buf) => Modal::Add(buf.clone()),
             Mode::CustomFormat(buf) => Modal::Format(buf.clone()),
+            Mode::FindText(buf) => Modal::Find(buf.clone()),
+            Mode::ReplaceText(buf) => Modal::Replace(buf.clone()),
+            Mode::ViewName(buf) => Modal::ViewName(buf.clone()),
             Mode::RenameRecord(buf) => Modal::Rename(buf.clone()),
             Mode::ConfirmDelete => Modal::Confirm,
             Mode::ConfirmDrop(ty, name) => Modal::Drop(ty.clone(), name.clone()),
@@ -748,6 +774,13 @@ impl App {
             }
             Modal::Format(buf) => {
                 return self.key_input(key, buf, Mode::CustomFormat, App::commit_custom_format)
+            }
+            Modal::Find(buf) => return self.key_input(key, buf, Mode::FindText, App::commit_find),
+            Modal::Replace(buf) => {
+                return self.key_input(key, buf, Mode::ReplaceText, App::commit_replace)
+            }
+            Modal::ViewName(buf) => {
+                return self.key_input(key, buf, Mode::ViewName, App::commit_view_name)
             }
             Modal::Rename(buf) => {
                 return self.key_input(key, buf, Mode::RenameRecord, App::commit_rename_record)
@@ -794,6 +827,7 @@ impl App {
             Screen::TableDesign => return self.key_table_design(key),
             Screen::IndexDesign => return self.key_index_design(key),
             Screen::Pragmas => return self.key_pragmas(key),
+            Screen::InsertRow => return self.key_insert_row(key),
             Screen::Main => {}
         }
 
@@ -1361,6 +1395,7 @@ impl App {
                 KeyCode::Char('f') => self.page_sqlite(true),
                 KeyCode::Char('b') => self.page_sqlite(false),
                 KeyCode::Char('s') => self.write_changes(),
+                KeyCode::Char('y') => self.copy_column_name(),
                 _ => {}
             }
             return;
@@ -1482,6 +1517,14 @@ impl App {
             KeyCode::Char('m') => self.cycle_column_format(true),
             KeyCode::Char('M') => self.cycle_column_format(false),
             KeyCode::Char('%') => self.begin_custom_format(),
+            // DB Browser's find and replace, insert values, save filter as view,
+            // and the two clears.
+            KeyCode::Char('r') => self.begin_find_replace(),
+            KeyCode::Char('i') => self.open_insert_form(),
+            KeyCode::Char('V') => self.begin_save_view(),
+            KeyCode::Char('z') => self.clear_sorting(),
+            KeyCode::Char('Z') => self.clear_filter(),
+            KeyCode::Char('L') => self.unlock_view_editing(),
             _ => {}
         }
     }
@@ -2056,6 +2099,251 @@ impl App {
                 .or_else(|| visible.first())
         };
         self.col_idx = next.copied().unwrap_or(0);
+    }
+
+    // ----- Browse Data operations (DB Browser's data tab) -------------------
+
+    /// `r`: find and replace in the cursor column, asked in two steps because a
+    /// terminal has one prompt line.
+    fn begin_find_replace(&mut self) {
+        if self.focus != Focus::Right || self.cursor_column().is_none() {
+            return;
+        }
+        if !self.writable_here() {
+            return;
+        }
+        self.input_cursor = 0;
+        self.mode = Mode::FindText(String::new());
+    }
+
+    fn commit_find(&mut self, find: &str) {
+        if find.is_empty() {
+            self.notify("nothing to find");
+            return;
+        }
+        let (table, column) = match (self.current_table(), self.cursor_column()) {
+            (Some(t), Some(c)) => (t, c),
+            _ => return,
+        };
+        // How many rows it would touch, before asking what to put there. A find
+        // that matches nothing is worth knowing before typing a replacement.
+        let filter = self.filter.clone();
+        let n = self
+            .sqlite()
+            .and_then(|s| s.count_matches(&table, &column, find, &filter).ok())
+            .unwrap_or(0);
+        if n == 0 {
+            self.notify(format!("{find:?} is not in {column}"));
+            return;
+        }
+        self.notify(format!(
+            "{n} row{} of {column} contain {find:?}",
+            if n == 1 { "" } else { "s" }
+        ));
+        self.replace_find = find.to_string();
+        self.input_cursor = 0;
+        self.mode = Mode::ReplaceText(String::new());
+    }
+
+    fn commit_replace(&mut self, to: &str) {
+        let (table, column) = match (self.current_table(), self.cursor_column()) {
+            (Some(t), Some(c)) => (t, c),
+            _ => return,
+        };
+        let find = self.replace_find.clone();
+        let filter = self.filter.clone();
+        let done = match self.sqlite() {
+            Some(s) => s.replace_in_column(&table, &column, &find, to, &filter),
+            None => return,
+        };
+        match done {
+            Ok(0) => self.notify(format!("{find:?} is not in {column}")),
+            Ok(n) => {
+                self.rows_changed();
+                self.load_table();
+                self.notify(format!(
+                    "replaced {find:?} with {to:?} in {n} row{} of {column} — R reverts",
+                    if n == 1 { "" } else { "s" }
+                ));
+            }
+            Err(e) => self.notify(e.to_string()),
+        }
+    }
+
+    /// `i`: DB Browser's "Insert Values" — a row typed column by column, rather
+    /// than the blank row `a` inserts.
+    fn open_insert_form(&mut self) {
+        let table = match self.current_table() {
+            Some(t) => t,
+            None => return,
+        };
+        if !self.writable_here() {
+            return;
+        }
+        let columns = match self.sqlite().and_then(|s| s.columns(&table).ok()) {
+            Some(c) if !c.is_empty() => c,
+            _ => return,
+        };
+        self.insert_form = Some(crate::browse::RowForm::new(&table, columns));
+        self.screen = Screen::InsertRow;
+    }
+
+    fn key_insert_row(&mut self, key: KeyEvent) {
+        let action = match self.insert_form.as_mut() {
+            Some(f) => f.on_key(key),
+            None => {
+                self.screen = Screen::Main;
+                return;
+            }
+        };
+        match action {
+            crate::browse::FormAction::None => {}
+            crate::browse::FormAction::Note(msg) => self.notify(msg),
+            crate::browse::FormAction::Cancel => {
+                self.insert_form = None;
+                self.screen = Screen::Main;
+            }
+            crate::browse::FormAction::Insert => {
+                let (table, values) = match self.insert_form.as_ref() {
+                    Some(f) => (f.table.clone(), f.pairs()),
+                    None => return,
+                };
+                match self.sqlite().map(|s| s.insert_values(&table, &values)) {
+                    Some(Ok(n)) => {
+                        self.insert_form = None;
+                        self.screen = Screen::Main;
+                        self.rows_changed();
+                        self.load_table();
+                        self.notify(format!("inserted {n} row — W writes it, R reverts"));
+                    }
+                    Some(Err(e)) => self.notify(e.to_string()),
+                    None => {}
+                }
+            }
+        }
+    }
+
+    /// `V`: DB Browser's "Save filter as view".
+    fn begin_save_view(&mut self) {
+        if self.current_table().is_none() {
+            return;
+        }
+        let seed = match self.current_table() {
+            Some(t) => format!("{t}_view"),
+            None => String::new(),
+        };
+        self.input_cursor = seed.len();
+        self.mode = Mode::ViewName(seed);
+    }
+
+    fn commit_view_name(&mut self, name: &str) {
+        let table = match self.current_table() {
+            Some(t) => t,
+            None => return,
+        };
+        let filter = self.filter.clone();
+        let done = match self.sqlite() {
+            Some(s) => s.create_view_from_filter(name, &table, &filter),
+            None => return,
+        };
+        match done {
+            Ok(sql) => {
+                self.after_schema_edit(format!("created view {name}: {sql}"));
+            }
+            Err(e) => self.notify(e.to_string()),
+        }
+    }
+
+    /// `z` / `Z`: DB Browser's "Clear sorting" and "Clear all filters".
+    fn clear_sorting(&mut self) {
+        if self.sort.is_none() {
+            self.notify("nothing is sorted");
+            return;
+        }
+        self.sort = None;
+        self.page_offset = 0;
+        self.row_idx = 0;
+        self.load_table();
+        self.notify("sort cleared (rowid order)");
+    }
+
+    fn clear_filter(&mut self) {
+        if self.filter.is_empty() {
+            self.notify("nothing is filtered");
+            return;
+        }
+        self.set_filter(String::new());
+        self.notify("filter cleared");
+    }
+
+    /// `Ctrl-y`: the column's name on the clipboard — DB Browser's "Copy column
+    /// name".
+    fn copy_column_name(&mut self) {
+        let column = match self.cursor_column() {
+            Some(c) => c,
+            None => return,
+        };
+        let ok = crate::clipboard::copy(&column);
+        self.notify(if ok {
+            format!("copied {column} to clipboard")
+        } else {
+            "clipboard unavailable (no tty)".into()
+        });
+    }
+
+    /// `L`: DB Browser's "Unlock view editing". A view can only be written to
+    /// when it carries `INSTEAD OF` triggers, so this reports what SQLite would
+    /// do rather than pretending the lock is zdbview's to lift.
+    fn unlock_view_editing(&mut self) {
+        let table = match self.current_table() {
+            Some(t) => t,
+            None => return,
+        };
+        let store = match self.sqlite() {
+            Some(s) => s,
+            None => return,
+        };
+        if !store.is_view(&table) {
+            self.notify(format!("{table} is a table — it is already editable"));
+            return;
+        }
+        match store.view_is_writable(&table) {
+            Ok(true) => {
+                if let Some(i) = self.unlocked_views.iter().position(|v| *v == table) {
+                    self.unlocked_views.remove(i);
+                    self.notify(format!("{table} locked again"));
+                } else {
+                    self.unlocked_views.push(table.clone());
+                    self.notify(format!(
+                        "{table} unlocked — its INSTEAD OF triggers take the write"
+                    ));
+                }
+            }
+            Ok(false) => self.notify(format!(
+                "{table} has no INSTEAD OF triggers, so SQLite cannot write to it"
+            )),
+            Err(e) => self.notify(e.to_string()),
+        }
+    }
+
+    /// Whether the object the grid is showing can be written to, with the reason
+    /// reported when it cannot.
+    fn writable_here(&mut self) -> bool {
+        let table = match self.current_table() {
+            Some(t) => t,
+            None => return false,
+        };
+        let is_view = self.sqlite().is_some_and(|s| s.is_view(&table));
+        if !is_view {
+            return true;
+        }
+        if self.unlocked_views.contains(&table) {
+            return true;
+        }
+        self.notify(format!(
+            "{table} is a view — L unlocks it if it has INSTEAD OF triggers"
+        ));
+        false
     }
 
     // ----- editable pragmas (DB Browser's Edit Pragmas) ---------------------
@@ -3341,6 +3629,12 @@ impl App {
                     p.render(f, outer[0], &t);
                 }
             }
+            Screen::InsertRow => {
+                let t = self.ov.theme;
+                if let Some(form) = self.insert_form.as_mut() {
+                    form.render(f, outer[0], &t);
+                }
+            }
             Screen::Main => match &self.store {
                 Store::Sqlite(_) => self.render_sqlite(f, outer[0]),
                 Store::Rkyv(_) => self.render_rkyv(f, outer[0]),
@@ -3355,6 +3649,22 @@ impl App {
             Mode::AddRecord(buf) => self.render_input(f, "new record key (Enter=add, Esc)", buf),
             Mode::CustomFormat(buf) => {
                 self.render_input(f, "custom display format — %1 is the column", buf)
+            }
+            Mode::FindText(buf) => self.render_input(
+                f,
+                &format!(
+                    "find in {} (Enter, Esc)",
+                    self.cursor_column().unwrap_or_default()
+                ),
+                buf,
+            ),
+            Mode::ReplaceText(buf) => self.render_input(
+                f,
+                &format!("replace {:?} with (Enter, Esc)", self.replace_find),
+                buf,
+            ),
+            Mode::ViewName(buf) => {
+                self.render_input(f, "save this filter as view (Enter, Esc)", buf)
             }
             Mode::RenameRecord(buf) => self.render_input(f, "rename key to (Enter, Esc)", buf),
             Mode::ConfirmDelete => {
@@ -6021,16 +6331,6 @@ fn arrow(desc: bool) -> &'static str {
     }
 }
 
-pub fn truncate(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        s.to_string()
-    } else {
-        let mut out: String = s.chars().take(max.saturating_sub(1)).collect();
-        out.push('…');
-        out
-    }
-}
-
 /// Width of one grid cell, including the space between columns. The grid draws
 /// as many as fit and scrolls the rest, so this decides how many that is.
 const CELL_W: usize = 21;
@@ -8504,6 +8804,165 @@ mod tests {
         let h = header(&mut app);
         assert!(!h.contains("rowid"), "{h}");
         assert!(!app.browse.view("t").show_rowid);
+        let _ = std::fs::remove_file(path);
+    }
+
+    // ----- Browse Data operations --------------------------------------------
+
+    /// `r` asks what to find, then what to put there, and reports how many rows
+    /// it touched. The write is buffered, so `R` takes it back.
+    #[test]
+    fn find_and_replace_runs_over_the_cursor_column() {
+        let path = scratch("db");
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch("CREATE TABLE t (note TEXT); INSERT INTO t VALUES ('a cat'), ('a dog')")
+            .unwrap();
+        drop(conn);
+        let store = Store::Sqlite(SqliteStore::open(&path).unwrap());
+        let mut app = App::with_theme(store, Theme::from_name(ThemeName::NeonSprawl));
+        await_queries(&mut app);
+        app.on_key(KeyEvent::from(KeyCode::Tab));
+
+        press(&mut app, 'r');
+        assert!(matches!(app.mode, super::Mode::FindText(_)));
+        for c in "cat".chars() {
+            press(&mut app, c);
+        }
+        app.on_key(KeyEvent::from(KeyCode::Enter));
+        assert!(matches!(app.mode, super::Mode::ReplaceText(_)));
+        for c in "bird".chars() {
+            press(&mut app, c);
+        }
+        app.on_key(KeyEvent::from(KeyCode::Enter));
+        await_queries(&mut app);
+        let rows = frame_rows(&mut app, 90, 12);
+        assert!(contains(&rows, "a bird"), "{rows:?}");
+        assert!(app.has_pending(), "the replace is buffered");
+
+        press(&mut app, 'R');
+        await_queries(&mut app);
+        assert!(contains(&frame_rows(&mut app, 90, 12), "a cat"));
+
+        // A term that matches nothing never reaches the second prompt.
+        press(&mut app, 'r');
+        for c in "zzz".chars() {
+            press(&mut app, c);
+        }
+        app.on_key(KeyEvent::from(KeyCode::Enter));
+        assert!(matches!(app.mode, super::Mode::Normal));
+        assert!(contains(&frame_rows(&mut app, 90, 12), "not in note"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// `i` types a row column by column, and `n` leaves one NULL.
+    #[test]
+    fn the_insert_form_writes_a_typed_row() {
+        let (mut app, path) = sqlite_app();
+        await_queries(&mut app);
+        press(&mut app, 'i');
+        assert_eq!(app.screen, super::Screen::InsertRow);
+        let rows = frame_rows(&mut app, 90, 12);
+        assert!(contains(&rows, "insert into t"), "{rows:?}");
+
+        app.on_key(KeyEvent::from(KeyCode::Enter));
+        for c in "typed".chars() {
+            press(&mut app, c);
+        }
+        app.on_key(KeyEvent::from(KeyCode::Enter));
+        press(&mut app, 'W');
+        assert_eq!(app.screen, super::Screen::Main);
+        app.write_changes();
+        await_queries(&mut app);
+
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        let n: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM t WHERE a = 'typed' AND b IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 1, "the typed value landed and the rest stayed NULL");
+        drop(conn);
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// `V` saves what the grid is showing as a view, and `z` / `Z` clear the sort
+    /// and the filter.
+    #[test]
+    fn the_filter_can_be_saved_as_a_view_and_cleared() {
+        let (mut app, path) = sqlite_app();
+        await_queries(&mut app);
+        app.on_key(KeyEvent::from(KeyCode::Tab));
+
+        press(&mut app, 's'); // sort by the cursor column
+        assert!(app.sort.is_some());
+        press(&mut app, 'z');
+        assert!(app.sort.is_none(), "z clears the sort");
+
+        press(&mut app, '/');
+        for c in "x".chars() {
+            press(&mut app, c);
+        }
+        app.on_key(KeyEvent::from(KeyCode::Enter));
+        assert_eq!(app.filter, "x");
+        await_queries(&mut app);
+
+        press(&mut app, 'V');
+        assert!(matches!(app.mode, super::Mode::ViewName(_)));
+        app.on_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        for c in "just_x".chars() {
+            press(&mut app, c);
+        }
+        app.on_key(KeyEvent::from(KeyCode::Enter));
+        assert!(
+            app.sqlite()
+                .unwrap()
+                .object_sql("just_x")
+                .unwrap()
+                .is_some(),
+            "the view was created"
+        );
+
+        press(&mut app, 'Z');
+        assert!(app.filter.is_empty(), "Z clears the filter");
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// A view is read-only until SQLite can write to it, and the refusal says
+    /// what is missing rather than failing silently.
+    #[test]
+    fn a_view_refuses_edits_until_it_is_unlocked() {
+        let path = scratch("db");
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE t (a TEXT); INSERT INTO t VALUES ('x');
+             CREATE VIEW v AS SELECT a FROM t;",
+        )
+        .unwrap();
+        drop(conn);
+        let store = Store::Sqlite(SqliteStore::open(&path).unwrap());
+        let mut app = App::with_theme(store, Theme::from_name(ThemeName::NeonSprawl));
+        // Select the view rather than the table.
+        let at = app
+            .sqlite()
+            .unwrap()
+            .tables
+            .iter()
+            .position(|t| t == "v")
+            .unwrap();
+        app.select_table(at);
+        await_queries(&mut app);
+        app.on_key(KeyEvent::from(KeyCode::Tab));
+
+        press(&mut app, 'i');
+        assert_eq!(app.screen, super::Screen::Main, "the form did not open");
+        let rows = frame_rows(&mut app, 90, 12);
+        assert!(contains(&rows, "is a view"), "{rows:?}");
+
+        press(&mut app, 'L');
+        let rows = frame_rows(&mut app, 90, 12);
+        assert!(contains(&rows, "INSTEAD OF"), "{rows:?}");
         let _ = std::fs::remove_file(path);
     }
 

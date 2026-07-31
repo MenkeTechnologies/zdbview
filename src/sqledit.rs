@@ -945,7 +945,7 @@ impl SqlEdit {
                     let per = (width.saturating_sub(6) / columns.len().max(1)).clamp(6, 28);
                     let head: String = columns
                         .iter()
-                        .map(|c| format!("{:<per$}", crate::app::truncate(c, per), per = per))
+                        .map(|c| format!("{:<per$}", crate::text::truncate(c, per), per = per))
                         .collect::<Vec<_>>()
                         .join(" ");
                     out.push(Line::from(Span::styled(
@@ -955,7 +955,7 @@ impl SqlEdit {
                     for r in rows {
                         let line: String = r
                             .iter()
-                            .map(|c| format!("{:<per$}", crate::app::truncate(c, per), per = per))
+                            .map(|c| format!("{:<per$}", crate::text::truncate(c, per), per = per))
                             .collect::<Vec<_>>()
                             .join(" ");
                         out.push(Line::from(Span::styled(

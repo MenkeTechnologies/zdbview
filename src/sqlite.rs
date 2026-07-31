@@ -2010,6 +2010,147 @@ impl SqliteStore {
         }
     }
 
+    // ----- Browse Data operations (DB Browser's data tab) -------------------
+
+    /// Replace `find` with `to` in one column, over the rows the grid's filter
+    /// leaves — DB Browser's Find and Replace, restricted to a column because a
+    /// column is what the cursor is on.
+    ///
+    /// The replacement is `replace()`, so it is substring-wise and exact; a row
+    /// whose value does not contain `find` is not touched, which is what makes
+    /// the reported count meaningful. Like every write it lands in the edit
+    /// buffer, so a replace that went wrong is one `R` away from undone.
+    pub fn replace_in_column(
+        &self,
+        table: &str,
+        column: &str,
+        find: &str,
+        to: &str,
+        filter: &str,
+    ) -> Result<usize> {
+        if find.is_empty() {
+            return Err(anyhow::anyhow!("nothing to find"));
+        }
+        let columns = self.columns(table)?;
+        if !columns.iter().any(|c| c == column) {
+            return Err(anyhow::anyhow!("{table} has no column {column:?}"));
+        }
+        // The filter's parameters come after this statement's own three.
+        let (keep, filter_binds) = Self::and_filter(&columns, filter, 4);
+        let sql = format!(
+            "UPDATE \"{}\" SET \"{}\" = replace(CAST(\"{}\" AS TEXT), ?1, ?2) \
+             WHERE instr(CAST(\"{}\" AS TEXT), ?3) > 0{keep}",
+            esc(table),
+            esc(column),
+            esc(column),
+            esc(column)
+        );
+        let mut binds: Vec<String> = vec![find.to_string(), to.to_string(), find.to_string()];
+        binds.extend(filter_binds);
+        self.begin_edit()?;
+        Ok(self.conn.execute(&sql, rusqlite::params_from_iter(binds))?)
+    }
+
+    /// How many rows one column's value contains `find` in, under the same filter
+    /// — what a replace would touch, asked before it is run.
+    pub fn count_matches(
+        &self,
+        table: &str,
+        column: &str,
+        find: &str,
+        filter: &str,
+    ) -> Result<i64> {
+        let columns = self.columns(table)?;
+        let (keep, mut binds) = Self::and_filter(&columns, filter, 2);
+        let sql = format!(
+            "SELECT count(*) FROM \"{}\" WHERE instr(CAST(\"{}\" AS TEXT), ?1) > 0{keep}",
+            esc(table),
+            esc(column)
+        );
+        binds.insert(0, find.to_string());
+        Ok(self
+            .conn
+            .query_row(&sql, rusqlite::params_from_iter(binds), |r| r.get(0))?)
+    }
+
+    /// `CREATE VIEW` over what the grid is showing — DB Browser's "Save filter as
+    /// view". The filter's patterns are inlined as literals, since a view cannot
+    /// carry parameters.
+    pub fn create_view_from_filter(&self, name: &str, table: &str, filter: &str) -> Result<String> {
+        if name.trim().is_empty() {
+            return Err(anyhow::anyhow!("the view needs a name"));
+        }
+        let columns = self.columns(table)?;
+        let (keep, binds) = Self::and_filter(&columns, filter, 1);
+        // Put each pattern back where its marker is, quoted as a SQL string.
+        let mut where_sql = keep.trim_start_matches(" AND ").to_string();
+        for (i, b) in binds.iter().enumerate() {
+            where_sql = where_sql.replace(
+                &format!("?{}", i + 1),
+                &format!("'{}'", b.replace('\'', "''")),
+            );
+        }
+        let sql = if where_sql.is_empty() {
+            format!(
+                "CREATE VIEW {} AS SELECT * FROM {}",
+                crate::ddl::quote(name),
+                crate::ddl::quote(table)
+            )
+        } else {
+            format!(
+                "CREATE VIEW {} AS SELECT * FROM {} WHERE {}",
+                crate::ddl::quote(name),
+                crate::ddl::quote(table),
+                where_sql
+            )
+        };
+        self.apply_ddl(&crate::ddl::AlterPlan {
+            statements: vec![sql.clone()],
+            rebuild: false,
+        })?;
+        Ok(sql)
+    }
+
+    /// Insert one row from typed values — DB Browser's "Insert Values". A `None`
+    /// is a `NULL`, which is how a column with no value is told from an empty
+    /// string.
+    pub fn insert_values(&self, table: &str, values: &[(String, Option<String>)]) -> Result<usize> {
+        if values.is_empty() {
+            return self.insert_blank(table).map(|_| 1);
+        }
+        let cols = values
+            .iter()
+            .map(|(c, _)| format!("\"{}\"", esc(c)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let marks = (1..=values.len())
+            .map(|i| format!("?{i}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!("INSERT INTO \"{}\" ({cols}) VALUES ({marks})", esc(table));
+        let binds: Vec<Option<String>> = values.iter().map(|(_, v)| v.clone()).collect();
+        self.begin_edit()?;
+        Ok(self.conn.execute(&sql, rusqlite::params_from_iter(binds))?)
+    }
+
+    /// Whether a view can be written to: SQLite refuses unless the view carries
+    /// `INSTEAD OF` triggers for the statement. This is what DB Browser's "Unlock
+    /// view editing" checks before it lets a cell be edited.
+    pub fn view_is_writable(&self, name: &str) -> Result<bool> {
+        let n: i64 = self.conn.query_row(
+            "SELECT count(*) FROM sqlite_master WHERE type = 'trigger' AND tbl_name = ?1 \
+             AND upper(sql) LIKE '%INSTEAD OF%'",
+            params![name],
+            |r| r.get(0),
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Whether `name` is a view rather than a table.
+    pub fn is_view(&self, name: &str) -> bool {
+        matches!(self.object_sql(name), Ok(Some((ty, _))) if ty == "view")
+    }
+
     // ----- editable pragmas (DB Browser's Edit Pragmas) ---------------------
 
     /// One pragma's current value, or `None` when it has no query form —

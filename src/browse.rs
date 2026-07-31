@@ -15,6 +15,7 @@
 //! The one format DB4S offers that is not here is *SpatiaLite Geometry to SVG*,
 //! which needs the SpatiaLite extension loaded to mean anything.
 
+use crate::text::truncate as clip;
 use std::collections::HashMap;
 
 /// A display format applied to one column's values before they are shown.
@@ -290,6 +291,147 @@ pub fn layout(
     (out, scroll)
 }
 
+/// What a key asked of the insert form.
+#[derive(Debug, PartialEq, Eq, Clone)]
+pub enum FormAction {
+    None,
+    Cancel,
+    /// `W` — insert the row the form holds.
+    Insert,
+    Note(String),
+}
+
+/// DB Browser's "Insert Values": one row typed a column at a time, rather than
+/// the blank row `a` inserts.
+///
+/// The distinction the form exists to keep is `NULL` against the empty string.
+/// A column starts as `NULL` — what `INSERT ... DEFAULT VALUES` would leave —
+/// and `n` puts it back there after something has been typed.
+pub struct RowForm {
+    pub table: String,
+    pub columns: Vec<String>,
+    /// One per column; `None` is `NULL`.
+    pub values: Vec<Option<String>>,
+    sel: usize,
+    edit: Option<crate::input::Line>,
+}
+
+impl RowForm {
+    pub fn new(table: &str, columns: Vec<String>) -> Self {
+        RowForm {
+            table: table.to_string(),
+            values: vec![None; columns.len()],
+            columns,
+            sel: 0,
+            edit: None,
+        }
+    }
+
+    /// The values to insert, paired with their columns.
+    pub fn pairs(&self) -> Vec<(String, Option<String>)> {
+        self.columns
+            .iter()
+            .cloned()
+            .zip(self.values.iter().cloned())
+            .collect()
+    }
+
+    pub fn on_key(&mut self, key: crossterm::event::KeyEvent) -> FormAction {
+        use crossterm::event::KeyCode;
+        if let Some(line) = self.edit.as_mut() {
+            match line.on_key(key) {
+                crate::input::Edit::Commit => {
+                    let text = line.buf.clone();
+                    self.edit = None;
+                    self.values[self.sel] = Some(text);
+                }
+                crate::input::Edit::Cancel => self.edit = None,
+                _ => {}
+            }
+            return FormAction::None;
+        }
+        let last = self.columns.len().saturating_sub(1);
+        match key.code {
+            KeyCode::Esc => FormAction::Cancel,
+            KeyCode::Char('W') => FormAction::Insert,
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.sel = (self.sel + 1).min(last);
+                FormAction::None
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.sel = self.sel.saturating_sub(1);
+                FormAction::None
+            }
+            KeyCode::Home => {
+                self.sel = 0;
+                FormAction::None
+            }
+            KeyCode::End => {
+                self.sel = last;
+                FormAction::None
+            }
+            KeyCode::Enter | KeyCode::Char('e') => {
+                let seed = self.values[self.sel].clone().unwrap_or_default();
+                self.edit = Some(crate::input::Line::at_end(&seed));
+                FormAction::None
+            }
+            KeyCode::Char('n') => {
+                self.values[self.sel] = None;
+                FormAction::Note(format!("{} = NULL", self.columns[self.sel]))
+            }
+            _ => FormAction::None,
+        }
+    }
+
+    pub fn render(
+        &mut self,
+        f: &mut ratatui::Frame,
+        area: ratatui::layout::Rect,
+        t: &crate::theme::Theme,
+    ) {
+        use ratatui::style::{Modifier, Style};
+        use ratatui::text::{Line as TextLine, Span};
+        use ratatui::widgets::{Block, Borders, Paragraph};
+
+        let height = area.height.saturating_sub(2) as usize;
+        let first = self.sel.saturating_sub(height.saturating_sub(1));
+        let lines: Vec<TextLine> = self
+            .columns
+            .iter()
+            .enumerate()
+            .skip(first)
+            .take(height)
+            .map(|(i, c)| {
+                let selected = i == self.sel;
+                let shown = match (&self.edit, &self.values[i]) {
+                    (Some(l), _) if selected => format!("{}_", l.buf),
+                    (_, Some(v)) => v.clone(),
+                    (_, None) => "NULL".to_string(),
+                };
+                let value_style = match (&self.values[i], selected) {
+                    (_, true) => Style::default().add_modifier(Modifier::REVERSED),
+                    (None, false) => Style::default().fg(t.dim),
+                    (Some(_), false) => Style::default().fg(t.primary),
+                };
+                TextLine::from(vec![
+                    Span::styled(
+                        format!("{} {:<24} ", if selected { "▸" } else { " " }, c),
+                        Style::default().fg(t.alt),
+                    ),
+                    Span::styled(clip(&shown, 48), value_style),
+                ])
+            })
+            .collect();
+        f.render_widget(
+            Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(format!(
+                " insert into {} — Enter types · n sets NULL · W inserts · Esc cancels ",
+                self.table
+            ))),
+            area,
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -378,6 +520,35 @@ mod tests {
         let (drawn, scroll) = layout(&visible, 2, 0, 5, 4);
         assert_eq!(drawn, vec![0, 1, 7, 8]);
         assert_eq!(scroll, 5);
+    }
+
+    #[test]
+    fn the_insert_form_keeps_null_apart_from_the_empty_string() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let key = |c: char| KeyEvent::new(KeyCode::Char(c), KeyModifiers::empty());
+        let code = |c: KeyCode| KeyEvent::new(c, KeyModifiers::empty());
+
+        let mut form = RowForm::new("t", vec!["a".into(), "b".into()]);
+        assert_eq!(form.pairs(), vec![("a".into(), None), ("b".into(), None)]);
+
+        // Typing nothing at all is an empty string, which is not NULL.
+        form.on_key(code(KeyCode::Enter));
+        form.on_key(code(KeyCode::Enter));
+        assert_eq!(form.values[0], Some(String::new()));
+
+        form.on_key(code(KeyCode::Enter));
+        for c in "hi".chars() {
+            form.on_key(key(c));
+        }
+        form.on_key(code(KeyCode::Enter));
+        assert_eq!(form.values[0], Some("hi".into()));
+
+        // And `n` puts it back to NULL.
+        assert!(matches!(form.on_key(key('n')), FormAction::Note(_)));
+        assert_eq!(form.values[0], None);
+
+        assert_eq!(form.on_key(key('W')), FormAction::Insert);
+        assert_eq!(form.on_key(code(KeyCode::Esc)), FormAction::Cancel);
     }
 
     #[test]

@@ -341,6 +341,12 @@ is published on crates.io); disable with `--no-default-features`.
 | `#` | show the `rowid` as its own column (SQLite) |
 | `m` / `M` | next / previous display format for the cursor column (SQLite) |
 | `%` | custom display format for the cursor column (SQLite) |
+| `r` | find and replace in the cursor column (SQLite) |
+| `i` | insert a row value by value (SQLite) |
+| `V` | save the current filter as a view (SQLite) |
+| `z` / `Z` | clear the sorting / the filter (SQLite) |
+| `L` | unlock a view for editing (SQLite) |
+| `Ctrl-y` | copy the column's name (SQLite) |
 | `A` | column statistics for the table, with a per-column frequency table (SQLite) |
 | `F` | follow the foreign key under the cursor to the row it references (SQLite) |
 | `Y` | copy the row as an `INSERT` (SQLite) |
@@ -622,6 +628,52 @@ strings would.
 
 DB Browser's *SpatiaLite Geometry to SVG* is the one format not implemented: it
 needs the SpatiaLite extension loaded to mean anything.
+
+## Working on the data
+
+The rest of DB Browser's Browse Data tab:
+
+| Key | Does | DB Browser |
+|-----|------|------------|
+| `r` | find and replace in the cursor column | Find and Replace |
+| `i` | insert a row value by value, `n` leaving one `NULL` | Insert Values |
+| `V` | save the current filter as a view | Save filter as view |
+| `z` / `Z` | clear the sorting / the filter | Clear sorting / Clear all filters |
+| `L` | unlock a view for editing | Unlock view editing |
+| `Ctrl-y` | copy the column's name | Copy column name |
+
+**Find and replace** asks in two steps, because a terminal has one prompt line:
+what to find, then what to put there. Between them it counts, so a term that
+matches nothing never reaches the second question:
+
+```
+find in note: cat
+2 rows of note contain "cat"
+replace "cat" with: bird
+replaced "cat" with "bird" in 2 rows of note — R reverts
+```
+
+It works on the cursor column, over the rows the active filter leaves, and the
+match is a substring (`replace()`), so a row that does not contain the term is
+not touched. Like every write it lands in the edit buffer, so a replace that went
+wrong is one `R` away.
+
+**Insert Values** (`i`) exists next to `a` for one reason: a column starts `NULL`
+and stays `NULL` unless something is typed, so `NULL` and the empty string stay
+apart. `n` puts a column back to `NULL` after typing.
+
+**Save filter as view** (`V`) writes the filter's patterns into the statement as
+literals, since a view cannot carry parameters — a quote in the pattern is
+escaped rather than ending the string:
+
+```
+CREATE VIEW "keepers" AS SELECT * FROM "t" WHERE (CAST("tag" AS TEXT) LIKE '%keep%' ESCAPE '\')
+```
+
+**Unlocking a view** reports what SQLite would do rather than pretending the lock
+is zdbview's to lift: a view can only be written to through `INSTEAD OF`
+triggers, so `L` says whether the view has them, and editing a view without them
+is refused with that reason.
 
 ## Editable pragmas (`P`)
 
