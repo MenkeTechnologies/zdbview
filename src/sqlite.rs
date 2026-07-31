@@ -1973,6 +1973,64 @@ impl SqliteStore {
         }
     }
 
+    // ----- editable pragmas (DB Browser's Edit Pragmas) ---------------------
+
+    /// One pragma's current value, or `None` when it has no query form —
+    /// `case_sensitive_like` is settable but not readable.
+    pub fn pragma(&self, name: &str) -> Option<String> {
+        self.conn
+            .query_row(&format!("PRAGMA {name}"), [], |r| {
+                r.get::<_, rusqlite::types::Value>(0)
+            })
+            .ok()
+            .map(|v| match v {
+                rusqlite::types::Value::Integer(i) => i.to_string(),
+                rusqlite::types::Value::Real(f) => f.to_string(),
+                rusqlite::types::Value::Text(t) => t,
+                _ => String::new(),
+            })
+    }
+
+    /// Set one pragma and report what it reads back as.
+    ///
+    /// The read-back is the point: SQLite accepts a pragma it will not apply
+    /// rather than raising. `journal_mode` will not change inside a transaction,
+    /// `max_page_count` clamps to the pages already in use, `page_size` and
+    /// `auto_vacuum` only take effect when the file is next rewritten, and an
+    /// unrecognised value is ignored outright. Showing the requested value would
+    /// be a lie in every one of those cases.
+    pub fn set_pragma(&self, name: &str, value: &str) -> Result<Option<String>> {
+        // A pragma that changes how the file is written cannot be applied over
+        // an open savepoint, and several are silently ignored inside one.
+        if self.pending.get() {
+            return Err(anyhow::anyhow!(
+                "there are unwritten changes — write (W) or revert (R) them first"
+            ));
+        }
+        if !name
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c == '_' || c.is_ascii_digit())
+        {
+            return Err(anyhow::anyhow!("{name} is not a pragma name"));
+        }
+        // A pragma value is never a bound parameter in SQLite, so it goes into
+        // the text — quoted, and only after the value has been checked to be a
+        // number or a bare word.
+        if !value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+            || value.is_empty()
+        {
+            return Err(anyhow::anyhow!("{value:?} is not a pragma value"));
+        }
+        self.conn
+            .execute_batch(&format!("PRAGMA {name} = {value}"))
+            .with_context(|| format!("PRAGMA {name} = {value}"))?;
+        // Changing the page size or the vacuum mode also invalidates what has
+        // been cached about the file's shape.
+        Ok(self.pragma(name))
+    }
+
     // ----- schema editing (DB Browser's Edit Table / Edit Index) -------------
 
     /// The `sqlite_master` row for one object, as `(type, sql)`. An auto-index

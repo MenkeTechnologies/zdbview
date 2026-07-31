@@ -25,6 +25,7 @@ mod input;
 mod monitor;
 mod mru;
 mod overlay;
+mod pragmas;
 mod prefs;
 mod query;
 mod recover;

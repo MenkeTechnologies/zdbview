@@ -564,6 +564,18 @@ leaves the editor, twice when there are unsaved edits. The editor is modal, so
 .BR h " and " c
 are its own motions and digits there rather than the help and scheme keys.
 .TP
+.B P
+Edit the pragmas that decide how the database is written — the eighteen DB
+Browser exposes, from
+.B journal_mode
+and
+.B synchronous
+to
+.BR page_size .
+Space cycles a flag or a named set, Enter types a number. Every change is read
+back and reported as it landed, since SQLite accepts a pragma it will not apply
+rather than raising.
+.TP
 .BR W ", " Ctrl\-s
 Write the changes: commit everything edited since the last write. Every edit —
 a cell, a row, an import, a schema change, a statement run in the editor — is

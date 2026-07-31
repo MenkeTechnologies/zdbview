@@ -334,6 +334,18 @@ Toggle focus between the table list and the row grid.
 From the table list, move focus to the rows; from the row grid, open the detail
 screen for the selected row.
 .TP
+.B P
+Open the editable pragmas: the eighteen settings DB Browser puts in its Edit
+Pragmas tab, which decide how the database is written rather than what is in it.
+Space cycles a flag or a named set, Enter types a number, Esc goes back. Every
+change is read back from the database and reported as it landed — SQLite accepts
+a pragma it will not apply rather than raising, so a
+.B journal_mode
+that cannot change inside a transaction, a
+.B max_page_count
+clamped to the pages in use, and an unrecognised value all look like success
+otherwise. A pragma cannot be applied over unwritten changes.
+.TP
 .BR W ", " Ctrl\-s
 Write the changes. Every edit is buffered in one savepoint — a cell, a row, an
 import, a schema edit, a statement run in the editor — and nothing reaches the

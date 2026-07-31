@@ -335,6 +335,7 @@ is published on crates.io); disable with `--no-default-features`.
 | `a` `e` `r` `d` | create / hex-edit value / rename / delete record (rkyv) |
 | `S` | schema: the objects, and the designers that edit them (SQLite) |
 | `D` | database report: pragmas, integrity check, foreign-key lint, maintenance (SQLite) |
+| `P` | edit the pragmas that decide how the file is written (SQLite) |
 | `A` | column statistics for the table, with a per-column frequency table (SQLite) |
 | `F` | follow the foreign key under the cursor to the row it references (SQLite) |
 | `Y` | copy the row as an `INSERT` (SQLite) |
@@ -567,6 +568,41 @@ Two consequences worth knowing:
 
 The one-shot command-line paths (`--import`) write before exiting: there is no
 user there to ask.
+
+## Editable pragmas (`P`)
+
+`D` prints the pragmas that describe a file. `P` edits the other kind: the
+eighteen settings DB Browser puts in its Edit Pragmas tab, which decide how the
+database is written rather than what is in it.
+
+```
+  pragma                     value          what it does
+▸ auto_vacuum                none           reclaim freed pages on commit, or only on incremental_vacuum
+  automatic_index            on             let the planner build a transient index for a scan it would repeat
+  case_sensitive_like        —              make LIKE case-sensitive for ASCII (no query form: shows what this session set)
+  journal_mode               wal            how the rollback journal is kept; wal lets a reader and a writer overlap
+  synchronous                full           how hard a commit is flushed — off risks the file on a power loss
+```
+
+`j`/`k` select, `Space` (or `←`/`→`) cycles a flag or a named set, `Enter` types
+a number, `P` or `Esc` goes back. A value is shown as the word SQLite means by it
+— `synchronous` reads back as `2` and is displayed `full`.
+
+**Every change is read back.** SQLite accepts a pragma it will not apply rather
+than raising: `journal_mode` will not change inside a transaction,
+`max_page_count` clamps to the pages already in use, an unrecognised value is
+ignored outright. The screen shows what the database reports afterwards, and says
+so when that is not what was asked for:
+
+```
+max_page_count stayed 2: SQLite would not take 1
+page_size = 8192 — takes effect on the next VACUUM
+```
+
+`case_sensitive_like` has no query form at all — it can be set but never read —
+so it shows `—` until this session sets it, rather than a value invented for the
+display. Pragmas cannot be applied over unwritten changes, so the screen says to
+write or revert first.
 
 ## Schema editing (`S`)
 

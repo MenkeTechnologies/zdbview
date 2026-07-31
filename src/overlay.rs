@@ -68,6 +68,8 @@ pub enum HelpCtx {
     Frames,
     /// The schema screen, where the designers are reached from.
     Schema,
+    /// The editable pragmas.
+    Pragmas,
 }
 
 /// The overlay layer: active scheme plus help / chooser / editor / toast state.
@@ -738,6 +740,7 @@ impl HelpCtx {
             HelpCtx::Stats => "column statistics",
             HelpCtx::Frames => "write-ahead log",
             HelpCtx::Schema => "schema",
+            HelpCtx::Pragmas => "pragmas",
         }
     }
 }
@@ -853,6 +856,24 @@ fn help_sections(ctx: HelpCtx) -> Vec<HelpSection> {
             },
         ];
     }
+    if ctx == HelpCtx::Pragmas {
+        return vec![
+            HelpSection {
+                title: "PRAGMAS",
+                keys: &[
+                    ("j/k ↑↓", "Select a pragma"),
+                    ("Space / ←→", "Cycle the value"),
+                    ("Enter", "Cycle, or type a number"),
+                    ("P / Esc", "Back to the data"),
+                ],
+            },
+            HelpSection {
+                title: "DISPLAY",
+                keys: DISPLAY_KEYS,
+            },
+        ];
+    }
+
     if ctx == HelpCtx::Schema {
         return vec![
             HelpSection {

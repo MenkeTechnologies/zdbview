@@ -256,6 +256,8 @@ enum Screen {
     TableDesign,
     /// The index designer — DB Browser's "Edit Index".
     IndexDesign,
+    /// The editable pragmas — DB Browser's "Edit Pragmas" tab.
+    Pragmas,
 }
 
 /// How the value pane renders raw bytes.
@@ -330,6 +332,8 @@ pub struct App {
     design: Option<crate::designer::TableDesigner>,
     /// The index designer, while `screen` is `Screen::IndexDesign`.
     index_design: Option<crate::designer::IndexDesigner>,
+    /// The pragma form, while `screen` is `Screen::Pragmas`.
+    pragmas: Option<crate::pragmas::PragmaEditor>,
 
     // Mouse hit-testing: the on-screen rect and scroll offset of each clickable
     // list/grid, captured during render so a click maps to the right index.
@@ -464,6 +468,7 @@ impl App {
             schema_idx: 0,
             design: None,
             index_design: None,
+            pragmas: None,
             click_left: Rect::ZERO,
             click_right: Rect::ZERO,
             click_records: Rect::ZERO,
@@ -576,6 +581,9 @@ impl App {
             Screen::Schema | Screen::TableDesign | Screen::IndexDesign
         ) {
             return HelpCtx::Schema;
+        }
+        if self.screen == Screen::Pragmas {
+            return HelpCtx::Pragmas;
         }
         match &self.store {
             Store::Sqlite(_) => HelpCtx::Sqlite,
@@ -769,6 +777,7 @@ impl App {
             Screen::Schema => return self.key_schema(code),
             Screen::TableDesign => return self.key_table_design(key),
             Screen::IndexDesign => return self.key_index_design(key),
+            Screen::Pragmas => return self.key_pragmas(key),
             Screen::Main => {}
         }
 
@@ -1430,6 +1439,8 @@ impl App {
                 }
             }
             KeyCode::Char('S') => self.open_schema(),
+            // `P` for the pragmas that decide how the file is written.
+            KeyCode::Char('P') => self.open_pragmas(),
             // `D` for the database's own facts, the shell's `.dbinfo`.
             KeyCode::Char('D') => self.open_dbinfo(),
             // `A` analyzes the table's columns, `Y` copies the row as an INSERT.
@@ -1805,6 +1816,85 @@ impl App {
     fn commit_search(&mut self, pattern: &str) {
         self.search = pattern.to_string();
         self.search_next(true);
+    }
+
+    // ----- editable pragmas (DB Browser's Edit Pragmas) ---------------------
+
+    /// `P`: the settings that decide how the database is written, editable. The
+    /// values are read when the screen opens, and re-read from the database after
+    /// every change rather than assumed.
+    fn open_pragmas(&mut self) {
+        let values = match self.sqlite() {
+            Some(s) => crate::pragmas::EDITABLE
+                .iter()
+                .map(|spec| s.pragma(spec.name).unwrap_or_default())
+                .collect(),
+            None => return,
+        };
+        self.pragmas = Some(crate::pragmas::PragmaEditor::new(values));
+        self.screen = Screen::Pragmas;
+    }
+
+    fn key_pragmas(&mut self, key: KeyEvent) {
+        let action = match self.pragmas.as_mut() {
+            Some(p) => p.on_key(key),
+            None => {
+                self.screen = Screen::Main;
+                return;
+            }
+        };
+        match action {
+            crate::pragmas::Action::None => {}
+            crate::pragmas::Action::Note(msg) => self.notify(msg),
+            crate::pragmas::Action::Cancel => {
+                self.pragmas = None;
+                self.screen = Screen::Main;
+            }
+            crate::pragmas::Action::Set(name, value) => self.set_pragma(name, &value),
+        }
+    }
+
+    fn set_pragma(&mut self, name: &'static str, value: &str) {
+        let spec = crate::pragmas::EDITABLE.iter().find(|s| s.name == name);
+        let before = self
+            .pragmas
+            .as_ref()
+            .and_then(|p| p.value(name))
+            .unwrap_or_default()
+            .to_string();
+        let result = match self.sqlite() {
+            Some(s) => s.set_pragma(name, value),
+            None => return,
+        };
+        match result {
+            Ok(read_back) => {
+                // A pragma with no query form reports nothing, so what this
+                // session asked for is the only value there is to show.
+                let effective = read_back.clone().unwrap_or_else(|| value.to_string());
+                if let Some(p) = self.pragmas.as_mut() {
+                    p.update(name, effective.clone());
+                }
+                // Reading the value back is what catches a change SQLite took but
+                // did not apply — the interesting half of this screen.
+                let note = if effective.trim().eq_ignore_ascii_case(value) {
+                    match spec {
+                        Some(s) if s.needs_vacuum => {
+                            format!(
+                                "{name}: {before} → {effective} — takes effect on the next VACUUM"
+                            )
+                        }
+                        _ => format!("{name}: {before} → {effective}"),
+                    }
+                } else {
+                    format!("{name} stayed {effective}: SQLite would not take {value}")
+                };
+                self.notify(note);
+                // page_size and auto_vacuum change how the file is laid out, so
+                // nothing cached about it still holds.
+                self.schema_changed();
+            }
+            Err(e) => self.notify(e.to_string()),
+        }
     }
 
     // ----- the edit buffer (DB Browser's Write / Revert Changes) ------------
@@ -3002,6 +3092,12 @@ impl App {
                 let t = self.ov.theme;
                 if let Some(d) = self.index_design.as_mut() {
                     d.render(f, outer[0], &t);
+                }
+            }
+            Screen::Pragmas => {
+                let t = self.ov.theme;
+                if let Some(p) = self.pragmas.as_mut() {
+                    p.render(f, outer[0], &t);
                 }
             }
             Screen::Main => match &self.store {
@@ -7926,6 +8022,111 @@ mod tests {
         assert_eq!(find_bytes(hay, b"ab", 4, false), Some(0));
         assert_eq!(find_bytes(hay, b"zz", 0, true), None); // case-sensitive
         assert_eq!(find_bytes(hay, b"", 0, true), None);
+    }
+
+    // ----- editable pragmas --------------------------------------------------
+
+    /// `P` opens the pragmas, Space cycles one, and what the screen shows is what
+    /// the database reported afterwards — not what was asked for.
+    #[test]
+    fn the_pragma_screen_writes_and_reads_back() {
+        let (mut app, path) = sqlite_app();
+        press(&mut app, 'P');
+        assert_eq!(app.screen, super::Screen::Pragmas);
+        let rows = frame_rows(&mut app, 100, 24);
+        assert!(contains(&rows, "foreign_keys"), "{rows:?}");
+        assert!(contains(&rows, "journal_mode"), "{rows:?}");
+
+        // foreign_keys is a flag. Which way it starts depends on how SQLite was
+        // built, so the test flips it rather than assuming a default.
+        let at = crate::pragmas::EDITABLE
+            .iter()
+            .position(|s| s.name == "foreign_keys")
+            .unwrap();
+        let before = app
+            .pragmas
+            .as_ref()
+            .unwrap()
+            .value("foreign_keys")
+            .unwrap()
+            .to_string();
+        let want = if before == "1" { "0" } else { "1" };
+        for _ in 0..at {
+            app.on_key(KeyEvent::from(KeyCode::Down));
+        }
+        press(&mut app, ' ');
+        assert_eq!(
+            app.pragmas.as_ref().unwrap().value("foreign_keys"),
+            Some(want)
+        );
+        assert_eq!(
+            app.sqlite().unwrap().pragma("foreign_keys").as_deref(),
+            Some(want),
+            "the database took it, not just the form"
+        );
+
+        // The screen shows the word, not the number.
+        let word = if want == "1" { "on" } else { "off" };
+        let rows = frame_rows(&mut app, 100, 24);
+        assert!(
+            rows.iter()
+                .any(|r| r.contains("foreign_keys") && r.contains(word)),
+            "{rows:?}"
+        );
+        press(&mut app, 'P');
+        assert_eq!(app.screen, super::Screen::Main);
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// A pragma SQLite takes but does not apply must not be reported as applied.
+    /// `max_page_count` cannot go below the pages already in use, so asking for
+    /// one page on a database that has more comes back clamped.
+    #[test]
+    fn a_pragma_that_sqlite_clamps_is_reported_as_it_landed() {
+        let (mut app, path) = sqlite_app();
+        press(&mut app, 'P');
+        let at = crate::pragmas::EDITABLE
+            .iter()
+            .position(|s| s.name == "max_page_count")
+            .unwrap();
+        for _ in 0..at {
+            app.on_key(KeyEvent::from(KeyCode::Down));
+        }
+        app.on_key(KeyEvent::from(KeyCode::Enter));
+        app.on_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        press(&mut app, '1');
+        app.on_key(KeyEvent::from(KeyCode::Enter));
+
+        let landed = app
+            .pragmas
+            .as_ref()
+            .unwrap()
+            .value("max_page_count")
+            .unwrap()
+            .to_string();
+        assert_ne!(landed, "1", "the database already uses more than one page");
+        let rows = frame_rows(&mut app, 100, 24);
+        assert!(contains(&rows, "stayed"), "the status says so: {rows:?}");
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// A pragma cannot be applied over an open savepoint, so it says what to do
+    /// instead of appearing to work.
+    #[test]
+    fn a_pragma_refuses_while_changes_are_unwritten() {
+        let (mut app, path) = sqlite_app();
+        await_queries(&mut app);
+        app.on_key(KeyEvent::from(KeyCode::Tab));
+        press(&mut app, 'e');
+        press(&mut app, 'q');
+        app.on_key(KeyEvent::from(KeyCode::Enter));
+        assert!(app.has_pending());
+
+        press(&mut app, 'P');
+        press(&mut app, ' ');
+        let rows = frame_rows(&mut app, 100, 24);
+        assert!(contains(&rows, "unwritten changes"), "{rows:?}");
+        let _ = std::fs::remove_file(path);
     }
 
     // ----- the edit buffer ---------------------------------------------------
