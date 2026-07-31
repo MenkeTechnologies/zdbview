@@ -1344,6 +1344,40 @@ zdbview ~/.zshrs/history.db --backup /tmp/history-copy.db
 # wrote /tmp/history-copy.db (36864 bytes)
 ```
 
+## What is ported from DB Browser for SQLite, and what is not
+
+The list below is the action set taken out of DB Browser for SQLite 3.13.1
+itself — the `setObjectName` strings in its binary — rather than from its
+documentation, so it is what the program actually has.
+
+**Ported.** New / in-memory / read-only databases, attach and detach, write and
+revert changes, compact, export to CSV / JSON / SQL, import from CSV and from a
+SQL script, projects, recent files. Create and modify table, create index, delete
+object, copy CREATE statement, row counts, refresh. Browse Data: per-column
+filters, sorting, hide / show / freeze columns, the rowid column, display formats
+including a custom expression, conditional formats, find and replace, insert
+values, set to NULL, copy column name, copy with hex/ASCII, open in external
+application, save filter as view, unlock view editing, clear filters and sorting.
+Edit Pragmas. Execute SQL: tabs, open and save `.sql`, execute all, execute
+current line, stop, toggle comment, find and replace, word wrap, export results,
+save results as view. Integrity check, quick check, foreign-key check, optimize,
+load extension, print.
+
+**Not ported, and why:**
+
+| DB Browser feature | Why not |
+|--------------------|---------|
+| SQLCipher encryption | Needs a SQLCipher build of SQLite in place of the bundled one, which changes what every release binary links against |
+| dbhub.io remote (push, fetch, clone, commits) | A network client for a third-party service |
+| Rich-text cell formatting (bold, italic, colours, alignment) | A terminal grid has no rich text; conditional formats cover colour |
+| Image and PDF preview of a blob cell, print image | No image surface in a terminal — `Ctrl-e` hands the bytes to an application that has one |
+| Plot pane | Same reason |
+| Import CSV from the clipboard | A terminal can write the system clipboard (OSC 52) but not read it |
+| Print the database structure or the SQL transcript | Only the table prints; the rest is what `.schema` and the transcript already show |
+| SpatiaLite Geometry to SVG display format | Needs the SpatiaLite extension loaded to mean anything |
+| Select whole column | Selection is a mouse-drag idea; `Ctrl-y` copies the name and `x` exports the data |
+| Docks, toolbars, "What's this", drag-and-drop SQL options | Qt window furniture with nothing behind it |
+
 ## Man pages
 
 Installed by the Homebrew formula — `man zdbview` works straight after

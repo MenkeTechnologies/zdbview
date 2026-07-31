@@ -435,6 +435,26 @@ zdbview --project session.zdbp  # open the database a project names, as it was l
       </section>
 
       <section class="tutorial-section">
+        <h2>DB Browser for SQLite parity</h2>
+        <p>The comparison below is against the action set taken out of DB Browser for SQLite 3.13.1 itself — the <code>setObjectName</code> strings in its binary — rather than from its documentation, so it is what the program actually has.</p>
+        <p><strong>Ported:</strong> new / in-memory / read-only databases, attach and detach, write and revert changes, compact, export to CSV / JSON / SQL, import from CSV and from a SQL script, projects, recent files; create and modify table, create index, delete object, copy CREATE statement, row counts, refresh; the Browse Data tab — per-column filters, sorting, hide / show / freeze columns, the rowid column, display formats including a custom expression, conditional formats, find and replace, insert values, set to NULL, copy column name, copy with hex/ASCII, open in external application, save filter as view, unlock view editing, clear filters and sorting; Edit Pragmas; the Execute SQL tab — tabs, open and save <code>.sql</code>, execute all, execute current line, stop, toggle comment, find and replace, word wrap, export results, save results as view; integrity check, quick check, foreign-key check, optimize, load extension, print.</p>
+        <table class="doc-table">
+          <thead><tr><th>Not ported</th><th>Why</th></tr></thead>
+          <tbody>
+            <tr><td>SQLCipher encryption</td><td>Needs a SQLCipher build of SQLite in place of the bundled one, which changes what every release binary links against</td></tr>
+            <tr><td>dbhub.io remote</td><td>A network client for a third-party service</td></tr>
+            <tr><td>Rich-text cell formatting</td><td>A terminal grid has no rich text; conditional formats cover colour</td></tr>
+            <tr><td>Image / PDF preview of a blob, print image, plot pane</td><td>No image surface in a terminal — <code>Ctrl-e</code> hands the bytes to an application that has one</td></tr>
+            <tr><td>Import CSV from the clipboard</td><td>A terminal can write the system clipboard (OSC 52) but not read it</td></tr>
+            <tr><td>Print the database structure or the SQL transcript</td><td>Only the table prints; the rest is what <code>.schema</code> and the transcript already show</td></tr>
+            <tr><td>SpatiaLite Geometry to SVG</td><td>Needs the SpatiaLite extension loaded to mean anything</td></tr>
+            <tr><td>Select whole column</td><td>Selection is a mouse-drag idea; <code>Ctrl-y</code> copies the name and <code>x</code> exports the data</td></tr>
+            <tr><td>Docks, toolbars, drag-and-drop SQL options</td><td>Qt window furniture with nothing behind it</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section class="tutorial-section">
         <h2>Repository &amp; links</h2>
         <ul>
           <li><strong>Source</strong> — <a href="https://github.com/MenkeTechnologies/zdbview" target="_blank" rel="noopener noreferrer">GitHub repo</a></li>
