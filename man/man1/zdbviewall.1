@@ -334,6 +334,18 @@ Toggle focus between the table list and the row grid.
 From the table list, move focus to the rows; from the row grid, open the detail
 screen for the selected row.
 .TP
+.BR W ", " Ctrl\-s
+Write the changes. Every edit is buffered in one savepoint — a cell, a row, an
+import, a schema edit, a statement run in the editor — and nothing reaches the
+file until this. While anything is unwritten the row grid reads its pages on the
+store's own connection, because no other connection can see an open transaction,
+and VACUUM, ANALYZE, REINDEX and \-\-backup refuse to run.
+.TP
+.B R
+Revert the changes: roll the savepoint back to the state before the first
+unwritten edit. Quitting or going back to the file list with unwritten changes
+asks first.
+.TP
 .B S
 Open the schema screen: every object with its CREATE statement, and the
 designers that edit them. On that screen

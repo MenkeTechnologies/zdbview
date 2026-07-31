@@ -328,6 +328,7 @@ is published on crates.io); disable with `--no-default-features`.
 | `n` / `N` | next / previous match — inside the active filter, in display order |
 | `Ctrl-f` / `Ctrl-b`, `PgUp` / `PgDn` | page by a screenful (every view) |
 | `e` `a` `d` `:` | edit / add / delete / SQL (SQLite) |
+| `W` / `Ctrl-s`, `R` | write / revert the unwritten changes (SQLite) |
 | `E` | edit the cell **as bytes**, whatever it holds (SQLite) |
 | `s` | sort by the cursor column (ascending → descending → off) |
 | `<` / `>` | move the sort to the previous / next column |
@@ -534,6 +535,38 @@ index.
 History persists to `$XDG_CACHE_HOME/zdbview/sql_history` (200 statements, newlines
 escaped so one statement stays one line), written temp-plus-rename like the other
 appdata.
+
+## Writing and reverting (`W` / `R`)
+
+Every edit — a cell, a row, an import, a schema change, a statement typed into
+the editor — is buffered until it is written, which is how DB Browser works:
+changes belong to the session, not to the file, until `W` (or `Ctrl-s`) commits
+them. `R` throws them all away and puts the database back to what it was when the
+first unwritten edit was made. Both are one savepoint, so a schema edit and a
+hundred cell edits revert together.
+
+The status line carries a marker while anything is unwritten, and leaving the
+file — `q`, `Esc`, `o` — asks first, because closing the connection would roll
+the savepoint back:
+
+```
+● unwritten changes (W write · R revert)
+unwritten changes: w = write, r = revert, any = stay
+```
+
+Two consequences worth knowing:
+
+* **The grid reads differently while changes are pending.** Pages normally come
+  from reader threads on their own connections, and no connection can see
+  another's open transaction, so an unwritten edit would still show its old
+  value. While anything is pending the page is fetched on the store's own
+  connection instead; when it is written, paging goes back off the render thread.
+* **`VACUUM`, `ANALYZE`, `REINDEX` and `--backup` refuse to run** with unwritten
+  changes. They rewrite the whole file and cannot run inside a transaction, so
+  they say to write or revert first rather than failing with SQLite's wording.
+
+The one-shot command-line paths (`--import`) write before exiting: there is no
+user there to ask.
 
 ## Schema editing (`S`)
 

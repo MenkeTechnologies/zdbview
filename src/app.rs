@@ -185,6 +185,17 @@ enum Mode {
     /// Confirm dropping a schema object, as `(type, name)`. Dropping a table
     /// takes its rows with it, so it is the one schema edit that asks first.
     ConfirmDrop(String, String),
+    /// Leaving the file with changes that have not been written: write them,
+    /// revert them, or stay.
+    ConfirmClose(Exit),
+}
+
+/// Where a confirmed close goes.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum Exit {
+    Quit,
+    /// Back to the file picker, which closes this store just as a quit does.
+    Files,
 }
 
 /// The views for a rkyv/binary file. `Records` is only available when the
@@ -509,6 +520,11 @@ impl App {
     /// Leave the open file and ask for the picker again (`o`, or `Esc` on the
     /// first level).
     fn back_to_files(&mut self) {
+        // Closing the store rolls its open savepoint back, so an unwritten
+        // change has to be answered for first.
+        if self.guard_pending(Exit::Files) {
+            return;
+        }
         self.reopen = true;
         self.quit = true;
     }
@@ -662,6 +678,7 @@ impl App {
             Rename(String),
             Confirm,
             Drop(String, String),
+            Close(Exit),
             None,
         }
         let modal = match &self.mode {
@@ -671,6 +688,7 @@ impl App {
             Mode::RenameRecord(buf) => Modal::Rename(buf.clone()),
             Mode::ConfirmDelete => Modal::Confirm,
             Mode::ConfirmDrop(ty, name) => Modal::Drop(ty.clone(), name.clone()),
+            Mode::ConfirmClose(exit) => Modal::Close(*exit),
             Mode::Normal => Modal::None,
         };
         match modal {
@@ -712,6 +730,7 @@ impl App {
             }
             Modal::Confirm => return self.key_confirm_delete(code),
             Modal::Drop(ty, name) => return self.key_confirm_drop(code, &ty, &name),
+            Modal::Close(exit) => return self.key_confirm_close(code, exit),
             Modal::None => {}
         }
 
@@ -853,7 +872,11 @@ impl App {
     fn key_detail(&mut self, code: KeyCode) {
         let max_scroll = self.detail_value.len() / 16;
         match code {
-            KeyCode::Char('q') => self.quit = true,
+            KeyCode::Char('q') => {
+                if !self.guard_pending(Exit::Quit) {
+                    self.quit = true;
+                }
+            }
             KeyCode::Esc | KeyCode::Enter => {
                 self.screen = Screen::Main;
                 self.detail_scroll = 0;
@@ -910,7 +933,11 @@ impl App {
     fn key_schema(&mut self, code: KeyCode) {
         let last = self.schema.len().saturating_sub(1);
         match code {
-            KeyCode::Char('q') => self.quit = true,
+            KeyCode::Char('q') => {
+                if !self.guard_pending(Exit::Quit) {
+                    self.quit = true;
+                }
+            }
             KeyCode::Esc | KeyCode::Char('S') => {
                 self.screen = Screen::Main;
                 self.schema_scroll = 0;
@@ -1301,11 +1328,13 @@ impl App {
         let code = key.code;
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
 
-        // Ctrl-f / Ctrl-b page forward / back (vim page motions).
+        // Ctrl-f / Ctrl-b page forward / back (vim page motions); Ctrl-s writes
+        // the pending changes, which is the chord DB Browser uses for it.
         if ctrl {
             match code {
                 KeyCode::Char('f') => self.page_sqlite(true),
                 KeyCode::Char('b') => self.page_sqlite(false),
+                KeyCode::Char('s') => self.write_changes(),
                 _ => {}
             }
             return;
@@ -1329,7 +1358,11 @@ impl App {
             KeyCode::Char('/') => self.open_modal(Mode::Search(String::new())),
             KeyCode::Char('n') => self.search_next(true),
             KeyCode::Char('N') => self.search_next(false),
-            KeyCode::Char('q') => self.quit = true,
+            KeyCode::Char('q') => {
+                if !self.guard_pending(Exit::Quit) {
+                    self.quit = true;
+                }
+            }
             // First level: Esc backs out to the file list, as it does from any
             // nested screen; `q` is the one that quits.
             KeyCode::Esc => self.back_to_files(),
@@ -1414,6 +1447,9 @@ impl App {
             KeyCode::Char('y') => self.copy_sqlite_cell(),
             // `:` opens the SQL editor (multi-line, completion, transcript).
             KeyCode::Char(':') => self.open_sql(),
+            // DB Browser's Write Changes / Revert Changes.
+            KeyCode::Char('W') => self.write_changes(),
+            KeyCode::Char('R') => self.revert_changes(),
             _ => {}
         }
     }
@@ -1468,7 +1504,11 @@ impl App {
             KeyCode::Char('/') => self.open_modal(Mode::Search(String::new())),
             KeyCode::Char('n') => self.search_next(true),
             KeyCode::Char('N') => self.search_next(false),
-            KeyCode::Char('q') => self.quit = true,
+            KeyCode::Char('q') => {
+                if !self.guard_pending(Exit::Quit) {
+                    self.quit = true;
+                }
+            }
             // First level: Esc backs out to the file list, as it does from any
             // nested screen; `q` is the one that quits.
             KeyCode::Esc => self.back_to_files(),
@@ -1765,6 +1805,88 @@ impl App {
     fn commit_search(&mut self, pattern: &str) {
         self.search = pattern.to_string();
         self.search_next(true);
+    }
+
+    // ----- the edit buffer (DB Browser's Write / Revert Changes) ------------
+
+    /// Whether the store is holding changes that have not reached the file.
+    fn has_pending(&self) -> bool {
+        self.sqlite().is_some_and(|s| s.has_pending())
+    }
+
+    /// `W` / `Ctrl-s`: commit everything edited since the last write.
+    fn write_changes(&mut self) {
+        let done = match self.sqlite() {
+            Some(s) => s.write_changes(),
+            None => return,
+        };
+        match done {
+            Ok(true) => {
+                // The file has changed, so every reader thread's snapshot is old.
+                self.schema_changed();
+                self.load_table();
+                self.notify("changes written");
+            }
+            Ok(false) => self.notify("nothing to write"),
+            Err(e) => self.notify(format!("write failed: {e}")),
+        }
+    }
+
+    /// `R`: throw the unwritten changes away.
+    fn revert_changes(&mut self) {
+        let done = match &mut self.store {
+            Store::Sqlite(s) => s.revert_changes(),
+            Store::Rkyv(_) => return,
+        };
+        match done {
+            Ok(true) => {
+                self.schema_changed();
+                if let Some(s) = self.sqlite() {
+                    self.schema = s.schema().unwrap_or_default();
+                }
+                self.select_table(self.table_idx);
+                self.notify("changes reverted");
+            }
+            Ok(false) => self.notify("nothing to revert"),
+            Err(e) => self.notify(format!("revert failed: {e}")),
+        }
+    }
+
+    /// Leaving the file with unwritten changes would drop them on the floor when
+    /// the connection closes, so it asks first — the one question DB Browser also
+    /// asks. Returns true when the caller should stop and let the prompt answer.
+    fn guard_pending(&mut self, exit: Exit) -> bool {
+        if !self.has_pending() {
+            return false;
+        }
+        self.mode = Mode::ConfirmClose(exit);
+        true
+    }
+
+    fn key_confirm_close(&mut self, code: KeyCode, exit: Exit) {
+        match code {
+            KeyCode::Char('w') | KeyCode::Char('W') => {
+                self.mode = Mode::Normal;
+                self.write_changes();
+                self.leave(exit);
+            }
+            KeyCode::Char('r') | KeyCode::Char('R') => {
+                self.mode = Mode::Normal;
+                self.revert_changes();
+                self.leave(exit);
+            }
+            _ => self.mode = Mode::Normal,
+        }
+    }
+
+    fn leave(&mut self, exit: Exit) {
+        match exit {
+            Exit::Quit => self.quit = true,
+            Exit::Files => {
+                self.reopen = true;
+                self.quit = true;
+            }
+        }
     }
 
     fn key_confirm_delete(&mut self, code: KeyCode) {
@@ -2153,6 +2275,21 @@ impl App {
                 filter: self.filter.clone(),
             }),
         };
+        // An unwritten change lives in this store's own open savepoint, and no
+        // other connection can see another's open transaction — so while
+        // anything is pending the page comes from the store itself rather than
+        // from the reader threads, which would still show the old cell.
+        if self.sqlite().is_some_and(|s| s.has_pending()) {
+            let result = self
+                .sqlite()
+                .unwrap()
+                .rows(&page.query())
+                .map_err(|e| e.to_string());
+            self.page_generation += 1;
+            let generation = self.page_generation;
+            self.install_page(crate::query::PageDone { generation, result });
+            return;
+        }
         if let Some(engine) = self.engine.as_mut() {
             self.page_generation = engine.request(page, count);
             // A cheap page — the common case now that the count is bounded and
@@ -2887,6 +3024,11 @@ impl App {
                 };
                 self.render_input(f, &format!("delete this {}? (y = yes, any = no)", what), "")
             }
+            Mode::ConfirmClose(_) => self.render_input(
+                f,
+                "unwritten changes: w = write, r = revert, any = stay",
+                "",
+            ),
             Mode::ConfirmDrop(ty, name) => {
                 let extra = if ty == "table" { ", with its rows" } else { "" };
                 let title = format!(
@@ -3057,7 +3199,11 @@ impl App {
 
     fn key_stats(&mut self, code: KeyCode) {
         match code {
-            KeyCode::Char('q') => self.quit = true,
+            KeyCode::Char('q') => {
+                if !self.guard_pending(Exit::Quit) {
+                    self.quit = true;
+                }
+            }
             KeyCode::Esc | KeyCode::Char('A') => {
                 // The frequency table is a step deeper, so Esc closes that first.
                 if self.stats_freq.is_some() {
@@ -3340,7 +3486,11 @@ impl App {
                 self.dbinfo_scroll = 0;
             }
             // `q` still quits, as on every other screen.
-            KeyCode::Char('q') => self.quit = true,
+            KeyCode::Char('q') => {
+                if !self.guard_pending(Exit::Quit) {
+                    self.quit = true;
+                }
+            }
             // `i` and `Q` are the shell's two checks; `f` is `.lint fkey-indexes`.
             KeyCode::Char('i') | KeyCode::Char('Q') => {
                 let quick = code == KeyCode::Char('Q');
@@ -3931,7 +4081,11 @@ impl App {
                 self.top = None;
                 self.screen = Screen::Main;
             }
-            crate::monitor::Action::Quit => self.quit = true,
+            crate::monitor::Action::Quit => {
+                if !self.guard_pending(Exit::Quit) {
+                    self.quit = true;
+                }
+            }
             // Opening from the monitor leaves the app the way `o` does, with the
             // chosen file carried out.
             crate::monitor::Action::Open(path) => {
@@ -3980,7 +4134,11 @@ impl App {
                 // Back to the monitor it was opened from, which is still there.
                 self.screen = Screen::Top;
             }
-            crate::frames::Action::Quit => self.quit = true,
+            crate::frames::Action::Quit => {
+                if !self.guard_pending(Exit::Quit) {
+                    self.quit = true;
+                }
+            }
         }
     }
 
@@ -4458,8 +4616,25 @@ impl App {
     }
 
     fn render_status(&self, f: &mut Frame, area: Rect) {
-        let p = Paragraph::new(self.status.clone())
-            .style(Style::default().fg(Color::Black).bg(Color::Gray));
+        // Unwritten changes are the one piece of state that is invisible in the
+        // grid — the cell already shows its new value — so the status line says
+        // so until they are written or reverted.
+        let line = if self.has_pending() {
+            Line::from(vec![
+                Span::styled(
+                    " ● unwritten changes (W write · R revert) ",
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(self.ov.theme.primary)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(" "),
+                Span::raw(self.status.clone()),
+            ])
+        } else {
+            Line::from(self.status.clone())
+        };
+        let p = Paragraph::new(line).style(Style::default().fg(Color::Black).bg(Color::Gray));
         f.render_widget(p, area);
     }
 
@@ -5979,6 +6154,9 @@ mod tests {
             app.detail_value, b"TWO",
             "the value pane must show what was just written"
         );
+        // An edit is buffered until it is written, so nothing reaches another
+        // connection before this.
+        app.write_changes();
         let store = SqliteStore::open(&path).unwrap();
         let view = store.rows(&crate::sqlite::PageQuery::all("t", 10)).unwrap();
         assert_eq!(view.rows[0], vec!["one".to_string(), "TWO".to_string()]);
@@ -6020,6 +6198,7 @@ mod tests {
         press(&mut app, '4');
         press(&mut app, '1');
         app.on_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+        app.write_changes();
         let store = SqliteStore::open(&path).unwrap();
         let key = crate::sqlite::RowKey::Rowid(1);
         assert_eq!(store.cell_bytes_keyed("t", &key, "txt").unwrap(), b"Ai");
@@ -6040,6 +6219,7 @@ mod tests {
         );
         press(&mut app, 'o'); // insert a byte to have something to write
         app.on_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+        app.write_changes();
         let store = SqliteStore::open(&path).unwrap();
         assert!(
             store.cell_is_blob_keyed("t", &key, "empty").unwrap(),
@@ -6313,6 +6493,7 @@ mod tests {
         press(&mut app, '4');
         press(&mut app, '1');
         app.on_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+        app.write_changes();
         let store = SqliteStore::open(&path).unwrap();
         assert_eq!(
             store
@@ -7745,6 +7926,117 @@ mod tests {
         assert_eq!(find_bytes(hay, b"ab", 4, false), Some(0));
         assert_eq!(find_bytes(hay, b"zz", 0, true), None); // case-sensitive
         assert_eq!(find_bytes(hay, b"", 0, true), None);
+    }
+
+    // ----- the edit buffer ---------------------------------------------------
+
+    /// The grid reads its pages off the reader threads, which cannot see this
+    /// connection's open savepoint — so while a change is unwritten the page has
+    /// to come from the store itself, or the cell would still show its old value.
+    #[test]
+    fn the_grid_shows_an_edit_that_has_not_been_written() {
+        let (mut app, path) = sqlite_app();
+        await_queries(&mut app);
+        app.on_key(KeyEvent::from(KeyCode::Tab));
+        press(&mut app, 'e');
+        app.on_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        for c in "EDITED".chars() {
+            press(&mut app, c);
+        }
+        app.on_key(KeyEvent::from(KeyCode::Enter));
+
+        assert!(app.has_pending(), "the edit is buffered");
+        let rows = frame_rows(&mut app, 90, 12);
+        assert!(contains(&rows, "EDITED"), "{rows:?}");
+        assert!(
+            contains(&rows, "unwritten changes"),
+            "the status line says so: {rows:?}"
+        );
+        // And the file still holds the old value.
+        let other = rusqlite::Connection::open(&path).unwrap();
+        let v: String = other
+            .query_row("SELECT a FROM t", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, "x");
+        drop(other);
+
+        press(&mut app, 'W');
+        assert!(!app.has_pending());
+        await_queries(&mut app);
+        let rows = frame_rows(&mut app, 90, 12);
+        assert!(contains(&rows, "EDITED"), "still there after the write");
+        assert!(!contains(&rows, "unwritten changes"));
+        let other = rusqlite::Connection::open(&path).unwrap();
+        let v: String = other
+            .query_row("SELECT a FROM t", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, "EDITED");
+        drop(other);
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// `R` throws the unwritten edits away and the grid goes back to what the
+    /// file holds.
+    #[test]
+    fn r_reverts_the_grid_to_what_the_file_holds() {
+        let (mut app, path) = sqlite_app();
+        await_queries(&mut app);
+        app.on_key(KeyEvent::from(KeyCode::Tab));
+        press(&mut app, 'e');
+        app.on_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        for c in "GONE".chars() {
+            press(&mut app, c);
+        }
+        app.on_key(KeyEvent::from(KeyCode::Enter));
+        assert!(app.has_pending());
+        assert!(contains(&frame_rows(&mut app, 90, 12), "GONE"));
+
+        press(&mut app, 'R');
+        assert!(!app.has_pending());
+        await_queries(&mut app);
+        let rows = frame_rows(&mut app, 90, 12);
+        assert!(!contains(&rows, "GONE"), "the edit is gone: {rows:?}");
+        assert!(contains(&rows, "reverted"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// Closing the store rolls its savepoint back, so leaving with unwritten
+    /// changes asks first — `w` writes and goes, `r` discards and goes, anything
+    /// else stays.
+    #[test]
+    fn leaving_with_unwritten_changes_asks_first() {
+        let (mut app, path) = sqlite_app();
+        await_queries(&mut app);
+        app.on_key(KeyEvent::from(KeyCode::Tab));
+        press(&mut app, 'e');
+        app.on_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        for c in "kept".chars() {
+            press(&mut app, c);
+        }
+        app.on_key(KeyEvent::from(KeyCode::Enter));
+
+        press(&mut app, 'q');
+        assert!(!app.quit, "the quit was held");
+        assert!(matches!(app.mode, super::Mode::ConfirmClose(_)));
+        let rows = frame_rows(&mut app, 90, 12);
+        assert!(contains(&rows, "unwritten changes"), "{rows:?}");
+
+        // Anything else stays in the file.
+        press(&mut app, 'x');
+        assert!(!app.quit);
+        assert!(app.has_pending());
+
+        press(&mut app, 'q');
+        press(&mut app, 'w');
+        assert!(app.quit, "w writes and leaves");
+        assert!(!app.has_pending());
+        let other = rusqlite::Connection::open(&path).unwrap();
+        let v: String = other
+            .query_row("SELECT a FROM t", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, "kept");
+        drop(other);
+        let _ = std::fs::remove_file(path);
     }
 
     // ----- schema screen and designers --------------------------------------

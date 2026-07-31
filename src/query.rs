@@ -50,6 +50,23 @@ pub struct PageReq {
     pub known_total: Option<i64>,
 }
 
+impl PageReq {
+    /// The store query this request runs. Shared by the worker thread and by the
+    /// synchronous path the app takes while an edit is unwritten, so both fetch
+    /// the same page for the same request.
+    pub fn query(&self) -> crate::sqlite::PageQuery<'_> {
+        crate::sqlite::PageQuery {
+            table: &self.table,
+            limit: self.limit,
+            offset: self.offset,
+            sort: self.sort.as_ref(),
+            filter: &self.filter,
+            hint: self.hint.as_ref(),
+            known_total: self.known_total,
+        }
+    }
+}
+
 /// What total the title wants.
 #[derive(Debug, Clone)]
 pub struct CountReq {
@@ -151,17 +168,7 @@ impl Engine {
             pages: spawn_worker(path.to_path_buf(), |store, generation, req: PageReq| {
                 PageDone {
                     generation,
-                    result: store
-                        .rows(&crate::sqlite::PageQuery {
-                            table: &req.table,
-                            limit: req.limit,
-                            offset: req.offset,
-                            sort: req.sort.as_ref(),
-                            filter: &req.filter,
-                            hint: req.hint.as_ref(),
-                            known_total: req.known_total,
-                        })
-                        .map_err(|e| e.to_string()),
+                    result: store.rows(&req.query()).map_err(|e| e.to_string()),
                 }
             }),
             counts: spawn_worker(path.to_path_buf(), |store, generation, req: CountReq| {

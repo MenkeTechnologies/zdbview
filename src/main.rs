@@ -422,7 +422,13 @@ fn run_import(cli: &Cli, src: &std::path::Path) -> Result<()> {
     let csv = import::parse(&text, sep)?;
     let (store, _) = store::Store::open(&file, kind)?;
     let n = match &store {
-        Store::Sqlite(s) => s.import_rows(&table, &csv.header, &csv.rows)?,
+        Store::Sqlite(s) => {
+            let n = s.import_rows(&table, &csv.header, &csv.rows)?;
+            // A write from the TUI is buffered until the user writes it; a
+            // one-shot command has no user to ask, so it commits before exiting.
+            s.write_changes()?;
+            n
+        }
         _ => return Err(anyhow!("not a SQLite database")),
     };
     println!("imported {} rows into {}", n, table);

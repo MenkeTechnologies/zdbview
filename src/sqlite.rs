@@ -24,7 +24,15 @@ pub struct SqliteStore {
     cache: Box<Cache>,
     /// Installed on every connection this store owns, see [`Self::set_cancel`].
     cancel: Option<(i32, Cancel)>,
+    /// Whether the edit savepoint is open — there are changes not yet written.
+    /// See [`Self::begin_edit`].
+    pending: std::cell::Cell<bool>,
 }
+
+/// Name of the savepoint every unwritten change sits inside. A savepoint rather
+/// than a transaction because it nests: a schema edit and a bulk import each run
+/// their own, inside whatever the session already has open.
+const EDIT_SAVEPOINT: &str = "zdbview_edit";
 
 /// Everything a store keeps between queries so a page does not have to re-derive
 /// it. All of it is dropped by [`SqliteStore::invalidate`].
@@ -490,6 +498,7 @@ impl SqliteStore {
             tables,
             cache: Box::default(),
             cancel: None,
+            pending: std::cell::Cell::new(false),
         })
     }
 
@@ -515,6 +524,69 @@ impl SqliteStore {
         if let Ok(t) = list_tables(&self.conn) {
             self.tables = t;
         }
+    }
+
+    // ----- the edit buffer (DB Browser's Write / Revert Changes) -------------
+
+    /// Whether anything has been changed and not yet written.
+    pub fn has_pending(&self) -> bool {
+        self.pending.get()
+    }
+
+    /// Open the edit savepoint if it is not open already. Every write goes
+    /// through here, so nothing reaches the file until [`Self::write_changes`].
+    ///
+    /// This is what DB Browser does: an edit is a change to the session, not to
+    /// the database, until it is written. The cost is that the change is visible
+    /// only on this connection — a reader has no way to see another connection's
+    /// open transaction — which is why the grid reads its pages here rather than
+    /// off the query threads while anything is pending.
+    fn begin_edit(&self) -> Result<()> {
+        if !self.pending.get() {
+            self.conn
+                .execute_batch(&format!("SAVEPOINT {EDIT_SAVEPOINT}"))?;
+            self.pending.set(true);
+        }
+        Ok(())
+    }
+
+    /// Commit every unwritten change. Returns false when there was nothing to
+    /// write, so the caller can say so rather than claim a write happened.
+    pub fn write_changes(&self) -> Result<bool> {
+        if !self.pending.get() {
+            return Ok(false);
+        }
+        self.conn
+            .execute_batch(&format!("RELEASE {EDIT_SAVEPOINT}"))?;
+        self.pending.set(false);
+        Ok(true)
+    }
+
+    /// Throw every unwritten change away. The savepoint is rolled back and
+    /// released, which leaves the database exactly as it was when the first
+    /// unwritten edit was made.
+    pub fn revert_changes(&mut self) -> Result<bool> {
+        if !self.pending.get() {
+            return Ok(false);
+        }
+        self.conn.execute_batch(&format!(
+            "ROLLBACK TO {EDIT_SAVEPOINT}; RELEASE {EDIT_SAVEPOINT}"
+        ))?;
+        self.pending.set(false);
+        // A reverted schema edit puts the old columns back, so everything
+        // derived from the schema is stale.
+        self.invalidate();
+        Ok(true)
+    }
+
+    /// How many rows have been changed and what schema version is current — the
+    /// pair that says whether an arbitrary statement actually wrote anything.
+    fn write_marks(&self) -> (i64, i64) {
+        let schema: i64 = self
+            .conn
+            .query_row("PRAGMA schema_version", [], |r| r.get(0))
+            .unwrap_or(0);
+        (self.conn.total_changes() as i64, schema)
     }
 
     /// Cached [`TableMeta`] for `table`.
@@ -1136,6 +1208,7 @@ impl SqliteStore {
             clause
         );
         binds.push(val.to_string());
+        self.begin_edit()?;
         Ok(self.conn.execute(&sql, rusqlite::params_from_iter(binds))?)
     }
 
@@ -1158,12 +1231,14 @@ impl SqliteStore {
         let mut params: Vec<&dyn rusqlite::ToSql> =
             binds.iter().map(|b| b as &dyn rusqlite::ToSql).collect();
         params.push(&bytes);
+        self.begin_edit()?;
         Ok(self.conn.execute(&sql, params.as_slice())?)
     }
 
     pub fn delete_row_keyed(&self, table: &str, key: &RowKey) -> Result<usize> {
         let (clause, binds) = Self::where_key(key);
         let sql = format!("DELETE FROM \"{}\" WHERE {}", esc(table), clause);
+        self.begin_edit()?;
         Ok(self.conn.execute(&sql, rusqlite::params_from_iter(binds))?)
     }
 
@@ -1206,6 +1281,7 @@ impl SqliteStore {
 
     /// Insert one row using each column's default value.
     pub fn insert_blank(&self, table: &str) -> Result<()> {
+        self.begin_edit()?;
         self.conn.execute(
             &format!("INSERT INTO \"{}\" DEFAULT VALUES", esc(table)),
             [],
@@ -1214,8 +1290,21 @@ impl SqliteStore {
     }
 
     /// Run an arbitrary statement (the `:` command line). Returns rows affected.
+    /// Run one statement that returns nothing.
+    ///
+    /// Whether it writes is not knowable from the text, so the edit savepoint is
+    /// opened around it and dropped again when the statement turns out to have
+    /// changed neither a row nor the schema. A `SELECT` typed into the editor
+    /// must not leave the session looking dirty.
     pub fn exec(&self, sql: &str) -> Result<usize> {
-        Ok(self.conn.execute(sql, [])?)
+        let opened = !self.pending.get();
+        let before = self.write_marks();
+        self.begin_edit()?;
+        let n = self.conn.execute(sql, []);
+        if opened && self.write_marks() == before {
+            let _ = self.write_changes();
+        }
+        Ok(n?)
     }
 
     /// Run one arbitrary statement. A statement that returns columns comes back
@@ -1514,6 +1603,13 @@ impl SqliteStore {
     /// `VACUUM INTO` — the shell's `.backup` in one statement, and the only way to
     /// copy a live database consistently without stopping writers.
     pub fn backup_to(&self, path: &std::path::Path) -> Result<()> {
+        // `VACUUM INTO` cannot run inside a transaction, and an unwritten change
+        // would not be in the copy anyway.
+        if self.pending.get() {
+            return Err(anyhow::anyhow!(
+                "there are unwritten changes — write (W) or revert (R) them first"
+            ));
+        }
         let target = path.to_string_lossy().replace('\'', "''");
         self.conn
             .execute_batch(&format!("VACUUM INTO '{target}'"))?;
@@ -1793,6 +1889,11 @@ impl SqliteStore {
     /// "Compact Database" and sqlite-utils exposes as its own subcommands. Returns
     /// the change in file size, which is the only visible result of a vacuum.
     pub fn maintain(&self, op: Maintenance) -> Result<i64> {
+        if self.pending.get() {
+            return Err(anyhow::anyhow!(
+                "there are unwritten changes — write (W) or revert (R) them first"
+            ));
+        }
         let before = std::fs::metadata(&self.path).map(|m| m.len()).unwrap_or(0) as i64;
         self.conn.execute_batch(match op {
             Maintenance::Vacuum => "VACUUM",
@@ -1837,8 +1938,11 @@ impl SqliteStore {
             cols,
             marks
         );
-        // One transaction, or a thousand-row file is a thousand fsyncs.
-        self.conn.execute_batch("BEGIN")?;
+        // One transaction, or a thousand-row file is a thousand fsyncs. A
+        // savepoint rather than BEGIN, because the session may already have the
+        // edit savepoint open and a transaction cannot nest inside one.
+        self.begin_edit()?;
+        self.conn.execute_batch("SAVEPOINT zdbview_import")?;
         let mut done = 0usize;
         let result = (|| -> Result<()> {
             let mut stmt = self.conn.prepare(&sql)?;
@@ -1858,11 +1962,12 @@ impl SqliteStore {
         })();
         match result {
             Ok(()) => {
-                self.conn.execute_batch("COMMIT")?;
+                self.conn.execute_batch("RELEASE zdbview_import")?;
                 Ok(done)
             }
             Err(e) => {
-                self.conn.execute_batch("ROLLBACK")?;
+                self.conn
+                    .execute_batch("ROLLBACK TO zdbview_import; RELEASE zdbview_import")?;
                 Err(e)
             }
         }
@@ -1965,7 +2070,8 @@ impl SqliteStore {
             self.conn.execute_batch("PRAGMA foreign_keys = OFF")?;
         }
         let run = || -> Result<()> {
-            self.conn.execute_batch("BEGIN")?;
+            self.begin_edit()?;
+            self.conn.execute_batch("SAVEPOINT zdbview_ddl")?;
             for sql in plan.statements.iter().filter(|s| !s.trim().is_empty()) {
                 self.conn
                     .execute_batch(sql)
@@ -1992,12 +2098,20 @@ impl SqliteStore {
                     ));
                 }
             }
-            self.conn.execute_batch("COMMIT")?;
+            self.conn.execute_batch("RELEASE zdbview_ddl")?;
             Ok(())
         };
+        let opened = !self.pending.get();
         let result = run();
         if result.is_err() {
-            let _ = self.conn.execute_batch("ROLLBACK");
+            let _ = self
+                .conn
+                .execute_batch("ROLLBACK TO zdbview_ddl; RELEASE zdbview_ddl");
+            // A failed edit changed nothing, so the session is not dirty — unless
+            // it already was before this call.
+            if opened {
+                let _ = self.write_changes();
+            }
         }
         if plan.rebuild && fk_on != 0 {
             let _ = self.conn.execute_batch("PRAGMA foreign_keys = ON");

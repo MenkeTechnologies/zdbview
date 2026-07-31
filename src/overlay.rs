@@ -1021,6 +1021,8 @@ fn help_sections(ctx: HelpCtx) -> Vec<HelpSection> {
                 ("E", "Edit cell as bytes"),
                 ("a", "Add row"),
                 ("d", "Delete row"),
+                ("W / Ctrl-s", "Write changes"),
+                ("R", "Revert changes"),
                 (":", "Raw SQL"),
                 ("S", "Schema view"),
                 ("D", "Database info"),

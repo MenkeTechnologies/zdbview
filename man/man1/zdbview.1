@@ -564,6 +564,17 @@ leaves the editor, twice when there are unsaved edits. The editor is modal, so
 .BR h " and " c
 are its own motions and digits there rather than the help and scheme keys.
 .TP
+.BR W ", " Ctrl\-s
+Write the changes: commit everything edited since the last write. Every edit —
+a cell, a row, an import, a schema change, a statement run in the editor — is
+buffered in one savepoint until this, so nothing reaches the file until it is
+asked for.
+.TP
+.B R
+Revert the changes: roll the savepoint back, leaving the database as it was when
+the first unwritten edit was made. Leaving the file with unwritten changes asks
+first, since closing the connection would roll them back anyway.
+.TP
 .B S
 Show the SQLite schema: every object with its CREATE statement, plus the table
 and index designers.

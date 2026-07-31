@@ -1495,6 +1495,11 @@ fn a_table_without_rowid_is_edited_by_its_primary_key() {
     assert_eq!(store.update_cell_keyed("kv", &gone, "v", "x").unwrap(), 0);
     assert_eq!(store.delete_row_keyed("kv", &gone).unwrap(), 0);
 
+    // Every edit above is buffered in the store's savepoint, which holds the
+    // write lock until it is written — so nothing else can write until here.
+    assert!(store.has_pending());
+    store.write_changes().unwrap();
+
     // An ordinary table still reports its rowids and no key columns.
     let conn = rusqlite::Connection::open(&path).unwrap();
     conn.execute_batch("CREATE TABLE plain (a TEXT); INSERT INTO plain VALUES ('x')")
@@ -1606,6 +1611,8 @@ fn rebuilding_a_table_keeps_its_rows_indexes_triggers_and_views() {
     let plan = ddl::plan(&old, &new, &aux);
     assert!(plan.rebuild);
     store.apply_ddl(&plan).expect("the rebuild must apply");
+    store.write_changes().unwrap();
+    drop(store);
 
     let after = SqliteStore::open(&path).unwrap();
     let def = after.table_def("t").unwrap();
@@ -1733,6 +1740,8 @@ fn a_created_table_carries_every_constraint_the_designer_sets() {
     def.columns[1].check = "length(sku) > 0".into();
     def.columns[2].fk = "REFERENCES parent(id)".into();
     store.apply_ddl(&ddl::plan_create(&def)).unwrap();
+    store.write_changes().unwrap();
+    drop(store);
 
     // Read it back through the parser: what was set is what is stored.
     let after = SqliteStore::open(&path).unwrap();
@@ -1758,5 +1767,153 @@ fn a_created_table_carries_every_constraint_the_designer_sets() {
         "NOCASE UNIQUE must reject a case-folded duplicate"
     );
     drop(conn);
+    let _ = std::fs::remove_file(&path);
+}
+
+// ----- the edit buffer (DB Browser's Write / Revert Changes) -----------------
+
+/// An edit is a change to the session until it is written: another connection
+/// reads the old value, and only `write_changes` puts it in the file. This is
+/// DB Browser's model, and the reason the grid reads its pages off the store
+/// while anything is pending.
+#[test]
+fn an_edit_is_invisible_to_other_connections_until_it_is_written() {
+    let path = tmp("buffer_write.db");
+    let _ = std::fs::remove_file(&path);
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute_batch("CREATE TABLE t (v TEXT); INSERT INTO t VALUES ('before')")
+        .unwrap();
+    drop(conn);
+
+    let store = SqliteStore::open(&path).unwrap();
+    assert!(!store.has_pending(), "a freshly opened store is clean");
+    let key = sqlite::RowKey::Rowid(1);
+    store.update_cell_keyed("t", &key, "v", "after").unwrap();
+    assert!(store.has_pending());
+
+    // This store sees its own change...
+    let view = store.rows(&pq("t", 10, 0, None, "")).unwrap();
+    assert_eq!(view.rows[0][0], "after");
+    // ...and nobody else does.
+    let other = rusqlite::Connection::open(&path).unwrap();
+    let seen: String = other
+        .query_row("SELECT v FROM t", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(seen, "before", "an unwritten change is not in the file");
+    drop(other);
+
+    assert!(store.write_changes().unwrap(), "something was written");
+    assert!(!store.has_pending());
+    assert!(
+        !store.write_changes().unwrap(),
+        "a second write has nothing to do"
+    );
+    let other = rusqlite::Connection::open(&path).unwrap();
+    let seen: String = other
+        .query_row("SELECT v FROM t", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(seen, "after");
+    drop(other);
+    let _ = std::fs::remove_file(&path);
+}
+
+/// Revert takes the rows *and* the schema back, however many edits are stacked
+/// up, because they are all inside the one savepoint.
+#[test]
+fn reverting_undoes_every_unwritten_row_and_schema_edit() {
+    let path = tmp("buffer_revert.db");
+    let _ = std::fs::remove_file(&path);
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute_batch("CREATE TABLE t (v TEXT); INSERT INTO t VALUES ('keep')")
+        .unwrap();
+    drop(conn);
+
+    let mut store = SqliteStore::open(&path).unwrap();
+    let key = sqlite::RowKey::Rowid(1);
+    store.update_cell_keyed("t", &key, "v", "changed").unwrap();
+    store.insert_blank("t").unwrap();
+    let def = store.table_def("t").unwrap();
+    let mut wider = def.clone();
+    wider.columns.push(ddl::ColumnDef::new("extra", "TEXT"));
+    store.apply_ddl(&ddl::plan(&def, &wider, &[])).unwrap();
+    assert_eq!(store.columns("t").unwrap().len(), 2);
+    assert_eq!(store.count_exact("t", "").unwrap(), 2);
+
+    assert!(store.revert_changes().unwrap());
+    assert!(!store.has_pending());
+    assert_eq!(
+        store.columns("t").unwrap(),
+        vec!["v".to_string()],
+        "the added column is gone and the cached shape was invalidated"
+    );
+    assert_eq!(store.count_exact("t", "").unwrap(), 1);
+    let v: String = store
+        .rows(&pq("t", 10, 0, None, ""))
+        .unwrap()
+        .rows
+        .remove(0)
+        .remove(0);
+    assert_eq!(v, "keep");
+    assert!(
+        !store.revert_changes().unwrap(),
+        "a second revert has nothing to do"
+    );
+    let _ = std::fs::remove_file(&path);
+}
+
+/// Reading is not editing: a statement that changes neither a row nor the schema
+/// leaves the session clean, so the status line does not claim unwritten work
+/// after a `SELECT` or a failed statement.
+#[test]
+fn a_read_only_statement_leaves_the_session_clean() {
+    let path = tmp("buffer_clean.db");
+    let _ = std::fs::remove_file(&path);
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute_batch("CREATE TABLE t (v TEXT); INSERT INTO t VALUES ('x')")
+        .unwrap();
+    drop(conn);
+
+    let store = SqliteStore::open(&path).unwrap();
+    store.run("SELECT * FROM t", 10).unwrap();
+    assert!(!store.has_pending(), "a SELECT is not an edit");
+    assert!(store.exec("UPDATE t SET v = 'x' WHERE 0").is_ok());
+    assert!(
+        !store.has_pending(),
+        "an UPDATE that matched nothing is not"
+    );
+    assert!(store.exec("UPDATE nosuch SET v = 1").is_err());
+    assert!(!store.has_pending(), "a failed statement is not either");
+
+    store.exec("UPDATE t SET v = 'y'").unwrap();
+    assert!(store.has_pending(), "one that did change a row is");
+    store.write_changes().unwrap();
+
+    store.exec("CREATE TABLE t2 (a)").unwrap();
+    assert!(store.has_pending(), "so is a schema change with no rows");
+    store.write_changes().unwrap();
+    let _ = std::fs::remove_file(&path);
+}
+
+/// Maintenance rewrites the whole file and cannot run inside a transaction, so
+/// it says what to do rather than failing with SQLite's own wording.
+#[test]
+fn vacuum_refuses_while_changes_are_unwritten() {
+    let path = tmp("buffer_vacuum.db");
+    let _ = std::fs::remove_file(&path);
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute_batch("CREATE TABLE t (v TEXT); INSERT INTO t VALUES ('x')")
+        .unwrap();
+    drop(conn);
+    let store = SqliteStore::open(&path).unwrap();
+    store
+        .update_cell_keyed("t", &sqlite::RowKey::Rowid(1), "v", "y")
+        .unwrap();
+    let err = store
+        .maintain(sqlite::Maintenance::Vacuum)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("unwritten changes"), "{err}");
+    store.write_changes().unwrap();
+    assert!(store.maintain(sqlite::Maintenance::Vacuum).is_ok());
     let _ = std::fs::remove_file(&path);
 }
