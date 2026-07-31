@@ -357,6 +357,25 @@ rule — which is the only way to reach a blob's bytes, since the grid receives
 cells that are already display strings. The column keeps its own name, so
 sorting, filtering and editing still address the raw value.
 .TP
+.B !
+Manage the conditional formats for the column under the cursor: rules that paint
+a cell when its value matches.
+.B a
+adds a rule,
+.B Enter
+edits its condition,
+.B c
+cycles the colour,
+.B b
+toggles bold,
+.B d
+drops it, and
+.BR J / K
+reorder — the first rule that matches wins. A condition is an operator and a
+value (> 5, = done, <> 0, like a%), null / not null, or bare text meaning
+\(lqcontains\(rq. Comparisons are numeric when both sides read as numbers and
+textual otherwise.
+.TP
 .B r
 Find and replace in the column under the cursor, asked in two steps: what to
 find, then what to put there. Between them it counts the rows that match, so a

@@ -271,6 +271,9 @@ enum Screen {
     Pragmas,
     /// The insert form — DB Browser's "Insert Values".
     InsertRow,
+    /// The conditional-format rules for one column — DB Browser's Conditional
+    /// Formats manager.
+    CondFormat,
 }
 
 /// How the value pane renders raw bytes.
@@ -357,6 +360,8 @@ pub struct App {
     replace_find: String,
     /// The insert form, while `screen` is `Screen::InsertRow`.
     insert_form: Option<crate::browse::RowForm>,
+    /// The conditional-format manager, while `screen` is `Screen::CondFormat`.
+    cond_format: Option<crate::browse::RulesEditor>,
     /// Views the user has unlocked for editing this session — DB Browser's
     /// "Unlock view editing".
     unlocked_views: Vec<String>,
@@ -499,6 +504,7 @@ impl App {
             col_scroll: 0,
             replace_find: String::new(),
             insert_form: None,
+            cond_format: None,
             unlocked_views: Vec::new(),
             click_left: Rect::ZERO,
             click_right: Rect::ZERO,
@@ -581,9 +587,15 @@ impl App {
     fn screen_owns_keys(&self) -> bool {
         matches!(
             self.screen,
-            // The designers take every printable key: `c`, `h` and `w` are text
-            // in a column name as readily as anywhere else.
-            Screen::HexEdit | Screen::Sql | Screen::TableDesign | Screen::IndexDesign
+            // The designers and the two forms take every printable key: `c`, `h`
+            // and `w` are text in a column name — or a rule's condition — as
+            // readily as anywhere else.
+            Screen::HexEdit
+                | Screen::Sql
+                | Screen::TableDesign
+                | Screen::IndexDesign
+                | Screen::InsertRow
+                | Screen::CondFormat
         )
     }
 
@@ -828,6 +840,7 @@ impl App {
             Screen::IndexDesign => return self.key_index_design(key),
             Screen::Pragmas => return self.key_pragmas(key),
             Screen::InsertRow => return self.key_insert_row(key),
+            Screen::CondFormat => return self.key_cond_format(key),
             Screen::Main => {}
         }
 
@@ -1525,6 +1538,7 @@ impl App {
             KeyCode::Char('z') => self.clear_sorting(),
             KeyCode::Char('Z') => self.clear_filter(),
             KeyCode::Char('L') => self.unlock_view_editing(),
+            KeyCode::Char('!') => self.open_cond_format(),
             _ => {}
         }
     }
@@ -2274,6 +2288,59 @@ impl App {
         }
         self.set_filter(String::new());
         self.notify("filter cleared");
+    }
+
+    /// `!`: the conditional formats for the cursor column — DB Browser's
+    /// Conditional Formats manager.
+    fn open_cond_format(&mut self) {
+        let (table, column) = match (self.current_table(), self.cursor_column()) {
+            (Some(t), Some(c)) => (t, c),
+            _ => return,
+        };
+        let rules = self
+            .browse
+            .view(&table)
+            .rules
+            .get(&column)
+            .cloned()
+            .unwrap_or_default();
+        self.cond_format = Some(crate::browse::RulesEditor::new(&column, rules));
+        self.screen = Screen::CondFormat;
+    }
+
+    fn key_cond_format(&mut self, key: KeyEvent) {
+        let action = match self.cond_format.as_mut() {
+            Some(r) => r.on_key(key),
+            None => {
+                self.screen = Screen::Main;
+                return;
+            }
+        };
+        match action {
+            crate::browse::RulesAction::None => {}
+            crate::browse::RulesAction::Note(msg) => self.notify(msg),
+            crate::browse::RulesAction::Cancel => {
+                self.store_rules();
+                self.cond_format = None;
+                self.screen = Screen::Main;
+            }
+            crate::browse::RulesAction::Changed => self.store_rules(),
+        }
+    }
+
+    /// Put the manager's rules back on the table's view. Done on every change so
+    /// the grid behind is already right when the screen closes.
+    fn store_rules(&mut self) {
+        let (table, column, rules) = match (self.current_table(), self.cond_format.as_ref()) {
+            (Some(t), Some(r)) => (t, r.column.clone(), r.rules.clone()),
+            _ => return,
+        };
+        let view = self.browse.view_mut(&table);
+        if rules.is_empty() {
+            view.rules.remove(&column);
+        } else {
+            view.rules.insert(column, rules);
+        }
     }
 
     /// `Ctrl-y`: the column's name on the clipboard — DB Browser's "Copy column
@@ -3633,6 +3700,12 @@ impl App {
                 let t = self.ov.theme;
                 if let Some(form) = self.insert_form.as_mut() {
                     form.render(f, outer[0], &t);
+                }
+            }
+            Screen::CondFormat => {
+                let t = self.ov.theme;
+                if let Some(rules) = self.cond_format.as_mut() {
+                    rules.render(f, outer[0], &t);
                 }
             }
             Screen::Main => match &self.store {
@@ -5024,7 +5097,19 @@ impl App {
                     cells.push(Cell::from(id).style(Style::default().fg(self.ov.theme.dim)));
                 }
                 cells.extend(drawn.iter().map(|&i| {
-                    Cell::from(truncate(row.get(i).map(String::as_str).unwrap_or(""), 40))
+                    let text = row.get(i).map(String::as_str).unwrap_or("");
+                    let cell = Cell::from(truncate(text, 40));
+                    // The first conditional-format rule that matches paints it.
+                    match view.rule_for(&rv.columns[i], text) {
+                        Some(rule) => {
+                            let mut st = Style::default().fg(rule.color.color());
+                            if rule.bold {
+                                st = st.add_modifier(Modifier::BOLD);
+                            }
+                            cell.style(st)
+                        }
+                        None => cell,
+                    }
                 }));
                 Row::new(cells)
             });
@@ -8851,6 +8936,77 @@ mod tests {
         app.on_key(KeyEvent::from(KeyCode::Enter));
         assert!(matches!(app.mode, super::Mode::Normal));
         assert!(contains(&frame_rows(&mut app, 90, 12), "not in note"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// `!` manages the cursor column's conditional formats, and the rules paint
+    /// the grid as soon as they are set.
+    #[test]
+    fn conditional_formats_are_managed_and_painted() {
+        let path = scratch("db");
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch("CREATE TABLE t (n INTEGER); INSERT INTO t VALUES (5), (500)")
+            .unwrap();
+        drop(conn);
+        let store = Store::Sqlite(SqliteStore::open(&path).unwrap());
+        let mut app = App::with_theme(store, Theme::from_name(ThemeName::NeonSprawl));
+        await_queries(&mut app);
+        app.on_key(KeyEvent::from(KeyCode::Tab));
+
+        press(&mut app, '!');
+        assert_eq!(app.screen, super::Screen::CondFormat);
+        let rows = frame_rows(&mut app, 90, 14);
+        assert!(contains(&rows, "no rules"), "{rows:?}");
+
+        press(&mut app, 'a');
+        for c in "> 100".chars() {
+            press(&mut app, c);
+        }
+        app.on_key(KeyEvent::from(KeyCode::Enter));
+        press(&mut app, 'c'); // next colour
+        press(&mut app, 'b'); // bold
+        let rows = frame_rows(&mut app, 90, 14);
+        assert!(contains(&rows, "> 100"), "{rows:?}");
+        assert!(contains(&rows, "bold"), "{rows:?}");
+
+        app.on_key(KeyEvent::from(KeyCode::Esc));
+        assert_eq!(app.screen, super::Screen::Main);
+        let rules = app.browse.view("t").rules;
+        assert_eq!(rules["n"].len(), 1);
+        assert!(rules["n"][0].bold);
+        assert_ne!(rules["n"][0].color, crate::browse::RuleColor::default());
+
+        // The rule paints the row it matches, and only that row.
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(90, 12)).unwrap();
+        term.draw(|f| app.render(f)).unwrap();
+        let buf = term.backend().buffer().clone();
+        // The row that holds 500 is the one the rule matches; 5 is on another row
+        // and must be left alone.
+        let row_colour = |needle: &str| -> Option<ratatui::style::Color> {
+            (0..buf.area().height).find_map(|y| {
+                let line: String = (0..buf.area().width)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect();
+                let at = line.find(needle)?;
+                buf[(at as u16, y)].style().fg
+            })
+        };
+        assert_eq!(
+            row_colour("500"),
+            Some(rules["n"][0].color.color()),
+            "the matching row is painted"
+        );
+        assert_ne!(
+            row_colour("5 "),
+            Some(rules["n"][0].color.color()),
+            "the row the rule does not match is left alone"
+        );
+
+        // Dropping the rule leaves nothing behind.
+        press(&mut app, '!');
+        press(&mut app, 'd');
+        app.on_key(KeyEvent::from(KeyCode::Esc));
+        assert!(app.browse.view("t").rules.is_empty());
         let _ = std::fs::remove_file(path);
     }
 

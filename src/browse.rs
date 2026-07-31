@@ -166,6 +166,196 @@ impl Format {
     }
 }
 
+/// A colour a conditional format can paint a cell in. A terminal has no colour
+/// picker, so this is the named set every scheme already draws with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RuleColor {
+    #[default]
+    Red,
+    Green,
+    Yellow,
+    Blue,
+    Magenta,
+    Cyan,
+    Gray,
+}
+
+impl RuleColor {
+    pub const ALL: [RuleColor; 7] = [
+        RuleColor::Red,
+        RuleColor::Green,
+        RuleColor::Yellow,
+        RuleColor::Blue,
+        RuleColor::Magenta,
+        RuleColor::Cyan,
+        RuleColor::Gray,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            RuleColor::Red => "red",
+            RuleColor::Green => "green",
+            RuleColor::Yellow => "yellow",
+            RuleColor::Blue => "blue",
+            RuleColor::Magenta => "magenta",
+            RuleColor::Cyan => "cyan",
+            RuleColor::Gray => "gray",
+        }
+    }
+
+    pub fn color(self) -> ratatui::style::Color {
+        use ratatui::style::Color;
+        match self {
+            RuleColor::Red => Color::LightRed,
+            RuleColor::Green => Color::LightGreen,
+            RuleColor::Yellow => Color::LightYellow,
+            RuleColor::Blue => Color::LightBlue,
+            RuleColor::Magenta => Color::LightMagenta,
+            RuleColor::Cyan => Color::LightCyan,
+            RuleColor::Gray => Color::Gray,
+        }
+    }
+
+    pub fn next(self) -> RuleColor {
+        let i = RuleColor::ALL.iter().position(|c| *c == self).unwrap_or(0);
+        RuleColor::ALL[(i + 1) % RuleColor::ALL.len()]
+    }
+}
+
+/// One conditional-format rule: a condition on the cell's value and how to paint
+/// it when the condition holds. DB4S's dialog carries a font and an alignment
+/// too, neither of which a terminal grid has.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Rule {
+    /// The condition, in DB4S's filter vocabulary: an operator and a value
+    /// (`> 5`, `= done`, `<> 0`, `like a%`), `null` / `not null`, or bare text,
+    /// which means "contains".
+    pub condition: String,
+    pub color: RuleColor,
+    pub bold: bool,
+}
+
+impl Rule {
+    pub fn new(condition: &str) -> Self {
+        Rule {
+            condition: condition.trim().to_string(),
+            color: RuleColor::default(),
+            bold: false,
+        }
+    }
+
+    /// Whether this rule's condition holds for a displayed cell.
+    ///
+    /// Comparisons are numeric when both sides read as numbers and textual
+    /// otherwise, which is the rule SQLite itself follows closely enough that
+    /// `> 9` does not match `10` here either.
+    pub fn matches(&self, cell: &str) -> bool {
+        let cond = self.condition.trim();
+        let lower = cond.to_ascii_lowercase();
+        if lower == "null" || lower == "is null" {
+            return cell.is_empty();
+        }
+        if lower == "not null" || lower == "is not null" {
+            return !cell.is_empty();
+        }
+        let (op, rhs) = split_operator(cond);
+        let rhs = rhs.trim();
+        match op {
+            Some(op) => match (cell.trim().parse::<f64>(), rhs.parse::<f64>()) {
+                (Ok(a), Ok(b)) => match op {
+                    Op::Eq => a == b,
+                    Op::Ne => a != b,
+                    Op::Lt => a < b,
+                    Op::Le => a <= b,
+                    Op::Gt => a > b,
+                    Op::Ge => a >= b,
+                    Op::Like => like_matches(&a.to_string(), rhs),
+                },
+                _ => {
+                    let a = cell.trim();
+                    match op {
+                        Op::Eq => a.eq_ignore_ascii_case(rhs),
+                        Op::Ne => !a.eq_ignore_ascii_case(rhs),
+                        Op::Lt => a < rhs,
+                        Op::Le => a <= rhs,
+                        Op::Gt => a > rhs,
+                        Op::Ge => a >= rhs,
+                        Op::Like => like_matches(a, rhs),
+                    }
+                }
+            },
+            // No operator: DB4S treats a bare value as "contains".
+            None => cell.to_lowercase().contains(&lower),
+        }
+    }
+}
+
+/// The comparisons a condition can use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Op {
+    Eq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+    Like,
+}
+
+/// Split a condition into its operator and the value after it. The two-character
+/// operators are tested first, or `>=` would read as `>` with a value of `=5`.
+fn split_operator(cond: &str) -> (Option<Op>, &str) {
+    for (text, op) in [
+        (">=", Op::Ge),
+        ("<=", Op::Le),
+        ("<>", Op::Ne),
+        ("!=", Op::Ne),
+        ("==", Op::Eq),
+        (">", Op::Gt),
+        ("<", Op::Lt),
+        ("=", Op::Eq),
+    ] {
+        if let Some(rest) = cond.strip_prefix(text) {
+            return (Some(op), rest);
+        }
+    }
+    let lower = cond.to_ascii_lowercase();
+    if let Some(rest) = lower.strip_prefix("like ") {
+        return (Some(Op::Like), &cond[cond.len() - rest.len()..]);
+    }
+    (None, cond)
+}
+
+/// SQL `LIKE` against a pattern: `%` is any run, `_` is one character. Case is
+/// ignored, as it is in SQLite for ASCII.
+fn like_matches(value: &str, pattern: &str) -> bool {
+    let v: Vec<char> = value.to_lowercase().chars().collect();
+    let p: Vec<char> = pattern.to_lowercase().chars().collect();
+    // The usual two-pointer walk with one backtrack point per `%`.
+    let (mut vi, mut pi) = (0usize, 0usize);
+    let (mut star, mut mark) = (usize::MAX, 0usize);
+    while vi < v.len() {
+        if pi < p.len() && (p[pi] == '_' || p[pi] == v[vi]) {
+            vi += 1;
+            pi += 1;
+        } else if pi < p.len() && p[pi] == '%' {
+            star = pi;
+            mark = vi;
+            pi += 1;
+        } else if star != usize::MAX {
+            pi = star + 1;
+            mark += 1;
+            vi = mark;
+        } else {
+            return false;
+        }
+    }
+    while pi < p.len() && p[pi] == '%' {
+        pi += 1;
+    }
+    pi == p.len()
+}
+
 /// What one table's grid is set to show. Kept per table, so going back to a
 /// table finds it as it was left.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -179,6 +369,9 @@ pub struct TableView {
     pub show_rowid: bool,
     /// Per-column display format; a column with none is [`Format::Default`].
     pub formats: HashMap<String, Format>,
+    /// Per-column conditional formats, in the order they are tried — the first
+    /// rule that matches paints the cell, which is how DB4S orders its own list.
+    pub rules: HashMap<String, Vec<Rule>>,
 }
 
 impl TableView {
@@ -210,6 +403,11 @@ impl TableView {
         } else {
             self.formats.insert(column.to_string(), f);
         }
+    }
+
+    /// The rule that paints `cell` in `column`, if any.
+    pub fn rule_for(&self, column: &str, cell: &str) -> Option<&Rule> {
+        self.rules.get(column)?.iter().find(|r| r.matches(cell))
     }
 
     /// The columns actually drawn, in order, as indexes into the table's full
@@ -289,6 +487,205 @@ pub fn layout(
     let mut out: Vec<usize> = visible[..frozen].to_vec();
     out.extend(scrolling.iter().skip(scroll).take(room).copied());
     (out, scroll)
+}
+
+/// What a key asked of the conditional-format manager.
+#[derive(Debug, PartialEq, Eq, Clone)]
+pub enum RulesAction {
+    None,
+    Cancel,
+    /// The rules changed; the caller stores them and redraws.
+    Changed,
+    Note(String),
+}
+
+/// DB Browser's Conditional Formats manager, for one column.
+pub struct RulesEditor {
+    pub column: String,
+    pub rules: Vec<Rule>,
+    sel: usize,
+    edit: Option<crate::input::Line>,
+    /// The edit is on a rule being added, so cancelling drops it rather than
+    /// leaving a rule with an empty condition behind.
+    adding: bool,
+}
+
+impl RulesEditor {
+    pub fn new(column: &str, rules: Vec<Rule>) -> Self {
+        RulesEditor {
+            column: column.to_string(),
+            rules,
+            sel: 0,
+            edit: None,
+            adding: false,
+        }
+    }
+
+    pub fn on_key(&mut self, key: crossterm::event::KeyEvent) -> RulesAction {
+        use crossterm::event::KeyCode;
+        if let Some(line) = self.edit.as_mut() {
+            return match line.on_key(key) {
+                crate::input::Edit::Commit => {
+                    let text = line.buf.trim().to_string();
+                    self.edit = None;
+                    self.adding = false;
+                    if text.is_empty() {
+                        self.rules.remove(self.sel);
+                        RulesAction::Note("a rule needs a condition".into())
+                    } else {
+                        self.rules[self.sel].condition = text;
+                        RulesAction::Changed
+                    }
+                }
+                crate::input::Edit::Cancel => {
+                    self.edit = None;
+                    if self.adding {
+                        self.rules.remove(self.sel);
+                        self.adding = false;
+                        self.sel = self.sel.saturating_sub(1);
+                    }
+                    RulesAction::None
+                }
+                _ => RulesAction::None,
+            };
+        }
+        let last = self.rules.len().saturating_sub(1);
+        match key.code {
+            KeyCode::Esc => RulesAction::Cancel,
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.sel = (self.sel + 1).min(last);
+                RulesAction::None
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.sel = self.sel.saturating_sub(1);
+                RulesAction::None
+            }
+            KeyCode::Char('a') => {
+                self.sel = self.rules.len();
+                self.rules.push(Rule::new(""));
+                self.adding = true;
+                self.edit = Some(crate::input::Line::default());
+                RulesAction::None
+            }
+            KeyCode::Enter | KeyCode::Char('e') => {
+                if self.rules.is_empty() {
+                    return RulesAction::Note("a to add a rule".into());
+                }
+                self.edit = Some(crate::input::Line::at_end(&self.rules[self.sel].condition));
+                RulesAction::None
+            }
+            KeyCode::Char('c') => {
+                if self.rules.is_empty() {
+                    return RulesAction::None;
+                }
+                self.rules[self.sel].color = self.rules[self.sel].color.next();
+                RulesAction::Changed
+            }
+            KeyCode::Char('b') => {
+                if self.rules.is_empty() {
+                    return RulesAction::None;
+                }
+                self.rules[self.sel].bold = !self.rules[self.sel].bold;
+                RulesAction::Changed
+            }
+            KeyCode::Char('d') => {
+                if self.rules.is_empty() {
+                    return RulesAction::None;
+                }
+                let gone = self.rules.remove(self.sel);
+                self.sel = self.sel.min(self.rules.len().saturating_sub(1));
+                RulesAction::Note(format!("removed {:?}", gone.condition))
+            }
+            // The order decides which rule wins, so it has to be editable.
+            KeyCode::Char('J') => {
+                if self.sel + 1 < self.rules.len() {
+                    self.rules.swap(self.sel, self.sel + 1);
+                    self.sel += 1;
+                    return RulesAction::Changed;
+                }
+                RulesAction::None
+            }
+            KeyCode::Char('K') => {
+                if self.sel > 0 {
+                    self.rules.swap(self.sel, self.sel - 1);
+                    self.sel -= 1;
+                    return RulesAction::Changed;
+                }
+                RulesAction::None
+            }
+            _ => RulesAction::None,
+        }
+    }
+
+    pub fn render(
+        &mut self,
+        f: &mut ratatui::Frame,
+        area: ratatui::layout::Rect,
+        t: &crate::theme::Theme,
+    ) {
+        use ratatui::style::{Modifier, Style};
+        use ratatui::text::{Line as TextLine, Span};
+        use ratatui::widgets::{Block, Borders, Paragraph};
+
+        let mut lines: Vec<TextLine> = vec![
+            TextLine::from(Span::styled(
+                "  a condition is an operator and a value (> 5, = done, <> 0, like a%),",
+                Style::default().fg(t.dim),
+            )),
+            TextLine::from(Span::styled(
+                "  null / not null, or bare text meaning \"contains\". The first match wins.",
+                Style::default().fg(t.dim),
+            )),
+            TextLine::from(""),
+        ];
+        if self.rules.is_empty() {
+            lines.push(TextLine::from(Span::styled(
+                "  no rules — a adds one",
+                Style::default().fg(t.dim),
+            )));
+        }
+        for (i, rule) in self.rules.iter().enumerate() {
+            let selected = i == self.sel;
+            let shown = match &self.edit {
+                Some(l) if selected => format!("{}_", l.buf),
+                _ => rule.condition.clone(),
+            };
+            let mut style = Style::default().fg(rule.color.color());
+            if rule.bold {
+                style = style.add_modifier(Modifier::BOLD);
+            }
+            lines.push(TextLine::from(vec![
+                Span::styled(
+                    format!("{} {:>2}. ", if selected { "▸" } else { " " }, i + 1),
+                    Style::default().fg(t.dim),
+                ),
+                Span::styled(
+                    format!("{:<32} ", clip(&shown, 32)),
+                    if selected {
+                        style.add_modifier(Modifier::REVERSED)
+                    } else {
+                        style
+                    },
+                ),
+                Span::styled(
+                    format!(
+                        "{:<8} {}",
+                        rule.color.label(),
+                        if rule.bold { "bold" } else { "" }
+                    ),
+                    Style::default().fg(t.dim),
+                ),
+            ]));
+        }
+        f.render_widget(
+            Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(format!(
+                " conditional formats — {} · a add · Enter edit · c colour · b bold · \
+                 d drop · J/K order · Esc back ",
+                self.column
+            ))),
+            area,
+        );
+    }
 }
 
 /// What a key asked of the insert form.
@@ -520,6 +917,64 @@ mod tests {
         let (drawn, scroll) = layout(&visible, 2, 0, 5, 4);
         assert_eq!(drawn, vec![0, 1, 7, 8]);
         assert_eq!(scroll, 5);
+    }
+
+    #[test]
+    fn a_rule_compares_numerically_when_both_sides_are_numbers() {
+        let r = Rule::new("> 9");
+        assert!(r.matches("10"), "10 > 9 numerically");
+        assert!(!r.matches("8"));
+        // The pair decides: a cell that is not a number falls back to comparing
+        // as text, where "apple" does sort after "9".
+        assert!(
+            Rule::new("> apple").matches("banana"),
+            "text still compares"
+        );
+        assert!(!Rule::new("> banana").matches("apple"));
+    }
+
+    #[test]
+    fn a_rule_understands_the_filter_vocabulary() {
+        assert!(Rule::new(">= 5").matches("5"));
+        assert!(Rule::new("<= 5").matches("5"));
+        assert!(Rule::new("<> 5").matches("6"));
+        assert!(Rule::new("!= 5").matches("6"));
+        assert!(
+            Rule::new("= done").matches("DONE"),
+            "text compares without case"
+        );
+        assert!(Rule::new("null").matches(""));
+        assert!(Rule::new("not null").matches("x"));
+        assert!(Rule::new("like a%").matches("Abc"));
+        assert!(!Rule::new("like a%").matches("bac"));
+        assert!(Rule::new("like a_c").matches("abc"));
+        // A bare value means "contains", as it does in DB4S's own filters.
+        assert!(Rule::new("err").matches("an error"));
+        assert!(!Rule::new("err").matches("fine"));
+    }
+
+    #[test]
+    fn the_first_matching_rule_paints_the_cell() {
+        let mut v = TableView::default();
+        let mut first = Rule::new("> 100");
+        first.color = RuleColor::Red;
+        let mut second = Rule::new("> 10");
+        second.color = RuleColor::Yellow;
+        v.rules.insert("n".into(), vec![first, second]);
+        assert_eq!(v.rule_for("n", "500").unwrap().color, RuleColor::Red);
+        assert_eq!(v.rule_for("n", "50").unwrap().color, RuleColor::Yellow);
+        assert!(v.rule_for("n", "5").is_none());
+        assert!(v.rule_for("other", "500").is_none());
+    }
+
+    #[test]
+    fn the_colours_cycle_and_name_themselves() {
+        let mut c = RuleColor::default();
+        for _ in 0..RuleColor::ALL.len() {
+            assert!(!c.label().is_empty());
+            c = c.next();
+        }
+        assert_eq!(c, RuleColor::default(), "the cycle wraps");
     }
 
     #[test]

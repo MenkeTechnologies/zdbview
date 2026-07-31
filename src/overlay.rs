@@ -1052,6 +1052,7 @@ fn help_sections(ctx: HelpCtx) -> Vec<HelpSection> {
                 ("#", "Show the rowid column"),
                 ("m / M", "Column display format"),
                 ("%", "Custom display format"),
+                ("!", "Conditional formats"),
                 ("r", "Find and replace"),
                 ("i", "Insert values"),
                 ("V", "Save filter as view"),

@@ -570,6 +570,10 @@ all of them, freeze the columns up to the cursor, show the rowid column, and
 step the column's display format. A display format is a SQL expression applied
 in the SELECT, so sorting and filtering still address the raw value.
 .TP
+.B !
+Conditional formats for the cursor column: rules that paint a cell when its
+value matches, the first match winning.
+.TP
 .BR r ", " i ", " V ", " z ", " Z ", " L
 Find and replace in the cursor column, insert a row value by value, save the
 filter as a view, clear the sorting or the filter, and unlock a view for editing.

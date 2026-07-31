@@ -341,6 +341,7 @@ is published on crates.io); disable with `--no-default-features`.
 | `#` | show the `rowid` as its own column (SQLite) |
 | `m` / `M` | next / previous display format for the cursor column (SQLite) |
 | `%` | custom display format for the cursor column (SQLite) |
+| `!` | conditional formats for the cursor column (SQLite) |
 | `r` | find and replace in the cursor column (SQLite) |
 | `i` | insert a row value by value (SQLite) |
 | `V` | save the current filter as a view (SQLite) |
@@ -628,6 +629,29 @@ strings would.
 
 DB Browser's *SpatiaLite Geometry to SVG* is the one format not implemented: it
 needs the SpatiaLite extension loaded to mean anything.
+
+## Conditional formats (`!`)
+
+DB Browser's Conditional Formats, for the column under the cursor: rules that
+paint a cell when its value matches. `a` adds a rule, `Enter` edits its
+condition, `c` cycles the colour, `b` toggles bold, `d` drops it, and `J`/`K`
+reorder — **the first rule that matches wins**, so the order is part of the
+meaning.
+
+```
+▸  1. > 100                          red      bold
+   2. > 10                           yellow
+   3. null                           gray
+```
+
+A condition is DB Browser's filter vocabulary: an operator and a value (`> 5`,
+`= done`, `<> 0`, `like a%`), `null` / `not null`, or bare text meaning
+"contains". A comparison is numeric when both sides read as numbers and textual
+otherwise — so `> 9` matches `10`, which comparing the strings would not.
+
+The rules are evaluated on what the grid is showing, so a column with a display
+format is matched on the formatted value. DB Browser's font and alignment
+settings have no meaning in a terminal grid; colour and bold do.
 
 ## Working on the data
 
