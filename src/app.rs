@@ -61,6 +61,8 @@ const DOT_HELP: &str = "\
 .import FILE TABLE      load a CSV or TSV
 .read FILE              run the statements in a file
 .backup FILE            copy the database with VACUUM INTO
+.load FILE              load a SQLite extension
+.project save|open FILE the session's settings (DB Browser's project file)
 .expert                 index advice for the statement just run
 .recover [FILE]         salvage rows page by page into a script
 .vacuum .analyze .reindex   maintenance
@@ -1418,6 +1420,7 @@ impl App {
                 KeyCode::Char('b') => self.page_sqlite(false),
                 KeyCode::Char('s') => self.write_changes(),
                 KeyCode::Char('y') => self.copy_column_name(),
+                KeyCode::Char('p') => self.print_table(),
                 _ => {}
             }
             return;
@@ -2352,6 +2355,131 @@ impl App {
         }
     }
 
+    /// `Ctrl-p`: send the table to the printer — DB Browser's "Print". The text
+    /// goes to `lpr`, which is what a terminal program has instead of a print
+    /// dialog; the printer is whichever one `lpr` would use.
+    fn print_table(&mut self) {
+        let table = match self.current_table() {
+            Some(t) => t,
+            None => return,
+        };
+        let filter = self.filter.clone();
+        let view = match self.sqlite().map(|s| {
+            s.rows(&crate::sqlite::PageQuery {
+                table: &table,
+                limit: PRINT_ROWS,
+                offset: 0,
+                sort: self.sort.as_ref(),
+                filter: &filter,
+                hint: None,
+                known_total: None,
+                formats: &crate::sqlite::NO_FORMATS,
+            })
+        }) {
+            Some(Ok(v)) => v,
+            Some(Err(e)) => return self.notify(format!("cannot read {table}: {e}")),
+            None => return,
+        };
+        let mut text = format!("{table}\n\n");
+        text.push_str(&crate::export::rows_to_csv(&view.columns, &view.rows));
+        let rows = view.rows.len();
+        match print_via_lpr(&text) {
+            Ok(()) => self.notify(format!("sent {rows} row(s) of {table} to lpr")),
+            Err(e) => self.notify(format!("cannot print: {e}")),
+        }
+    }
+
+    /// `.project save FILE`: everything about the session that is not in the
+    /// database — what each grid is set to show, what is filtered and sorted, and
+    /// the statements left in the editor.
+    fn save_project(&mut self, file: &str) -> Vec<String> {
+        let (path, tables) = match self.sqlite() {
+            Some(s) => (s.path.clone(), s.tables.clone()),
+            None => return vec!["projects are for SQLite databases".into()],
+        };
+        let current = self.current_table();
+        let sort = self.sort.as_ref().map(|s| (s.column.as_str(), s.desc));
+        let statements = self
+            .sql
+            .as_ref()
+            .map(|e| e.all_statements())
+            .unwrap_or_default();
+        let project = crate::project::Project::capture(
+            &path,
+            &self.browse,
+            &tables,
+            current.as_deref().map(|t| (t, self.filter.as_str(), sort)),
+            statements,
+        );
+        match std::fs::write(file, project.to_text()) {
+            Ok(()) => vec![format!("wrote the project to {file}")],
+            Err(e) => vec![format!("cannot write {file}: {e}")],
+        }
+    }
+
+    /// `.project open FILE`: put the settings back.
+    fn load_project(&mut self, file: &str) -> Vec<String> {
+        let text = match std::fs::read_to_string(file) {
+            Ok(t) => t,
+            Err(e) => return vec![format!("cannot read {file}: {e}")],
+        };
+        let project = match crate::project::Project::parse(&text) {
+            Some(p) => p,
+            None => return vec![format!("{file} is not a zdbview project")],
+        };
+        let mine = self.sqlite().map(|s| s.path.clone());
+        let mut out = Vec::new();
+        if mine.as_deref() != Some(project.database.as_path()) {
+            out.push(format!(
+                "note: the project is for {} — applying its settings anyway",
+                project.database.display()
+            ));
+        }
+        self.apply_project(&project);
+        out.push(format!(
+            "applied {} table setting{}",
+            project.tables.len(),
+            if project.tables.len() == 1 { "" } else { "s" }
+        ));
+        out
+    }
+
+    /// Put a project's settings on the grids, and its statements in the editor.
+    pub fn apply_project(&mut self, project: &crate::project::Project) {
+        for t in &project.tables {
+            let view = self.browse.view_mut(&t.name);
+            view.hidden = t.hidden.clone();
+            view.frozen = t.frozen;
+            view.show_rowid = t.show_rowid;
+            view.formats = t.formats.iter().cloned().collect();
+            view.rules.clear();
+            for (column, rule) in &t.rules {
+                view.rules
+                    .entry(column.clone())
+                    .or_default()
+                    .push(rule.clone());
+            }
+        }
+        // The table in front takes its filter and sort as well.
+        if let Some(current) = self.current_table() {
+            if let Some(t) = project.table(&current) {
+                self.set_filter(t.filter.clone());
+                self.sort = t.sort.as_ref().map(|(column, desc)| Sort {
+                    column: column.clone(),
+                    desc: *desc,
+                });
+            }
+        }
+        if !project.statements.is_empty() {
+            let schema = self.sqlite().map(|s| s.schema_names()).unwrap_or_default();
+            let editor = self
+                .sql
+                .get_or_insert_with(|| crate::sqledit::SqlEdit::new(schema));
+            editor.set_statements(&project.statements);
+        }
+        self.load_table();
+    }
+
     /// `Ctrl-y`: the column's name on the clipboard — DB Browser's "Copy column
     /// name".
     fn copy_column_name(&mut self) {
@@ -2409,6 +2537,10 @@ impl App {
             Some(t) => t,
             None => return false,
         };
+        if self.sqlite().is_some_and(|s| s.is_readonly()) {
+            self.notify("this database was opened read-only (--readonly)");
+            return false;
+        }
         let is_view = self.sqlite().is_some_and(|s| s.is_view(&table));
         if !is_view {
             return true;
@@ -4223,6 +4355,22 @@ impl App {
                     self.quit = true;
                 }
             }
+            // `O` is DB Browser's "Optimize": PRAGMA optimize, which runs
+            // whatever SQLite thinks is worth doing and says what that was.
+            KeyCode::Char('O') => {
+                self.dbinfo_checks = match self.sqlite().map(|s| s.optimize()) {
+                    Some(Ok(done)) if done.is_empty() => {
+                        vec!["PRAGMA optimize: nothing needed doing".into()]
+                    }
+                    Some(Ok(done)) => {
+                        let mut out = vec!["PRAGMA optimize ran:".to_string()];
+                        out.extend(done);
+                        out
+                    }
+                    Some(Err(e)) => vec![format!("optimize failed: {e}")],
+                    None => return,
+                };
+            }
             // `i` and `Q` are the shell's two checks; `f` is `.lint fkey-indexes`.
             KeyCode::Char('i') | KeyCode::Char('Q') => {
                 let quick = code == KeyCode::Char('Q');
@@ -4851,6 +4999,23 @@ impl App {
                     }
                 }
             }
+            // `.load FILE` is the shell's own extension loader, and DB
+            // Browser's "Load Extension".
+            // `.project` is DB Browser's Save Project / Open Project: the
+            // session's settings, not the data.
+            ".project" => match (args.first().map(|s| s.to_lowercase()), args.get(1)) {
+                (Some(verb), Some(file)) if verb == "save" => self.save_project(file),
+                (Some(verb), Some(file)) if verb == "open" => self.load_project(file),
+                _ => vec!["usage: .project save|open FILE".into()],
+            },
+            ".load" => match args.first() {
+                Some(path) => match self.sqlite().map(|s| s.load_extension(Path::new(path))) {
+                    Some(Ok(())) => vec![format!("loaded {path}")],
+                    Some(Err(e)) => vec![format!("{e:#}")],
+                    None => Vec::new(),
+                },
+                None => vec!["usage: .load FILE".into()],
+            },
             ".vacuum" | ".analyze" | ".reindex" => {
                 let op = match cmd.as_str() {
                     ".vacuum" => crate::sqlite::Maintenance::Vacuum,
@@ -6584,9 +6749,34 @@ fn arrow(desc: bool) -> &'static str {
 /// enough that the check costs nothing on a statement that returns at once.
 const SQL_STOP_CHECK_OPS: i32 = 5_000;
 
+/// Rows a print takes. A printout is read by a person, so it is bounded — a
+/// million-row table is an export, not a printout.
+const PRINT_ROWS: i64 = 10_000;
+
 /// Width of one grid cell, including the space between columns. The grid draws
 /// as many as fit and scrolls the rest, so this decides how many that is.
 const CELL_W: usize = 21;
+
+/// Pipe `text` to `lpr`, which is the print dialog a terminal program has.
+fn print_via_lpr(text: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    let mut child = Command::new("lpr")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    if let Some(stdin) = child.stdin.as_mut() {
+        stdin.write_all(text.as_bytes())?;
+    }
+    // Wait, or a failing `lpr` would look like a successful print.
+    let status = child.wait()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(std::io::Error::other(format!("lpr exited with {status}")))
+    }
+}
 
 /// A centered rect `w` cols wide and `h` rows tall inside `area`.
 fn centered(area: Rect, w: u16, h: u16) -> Rect {

@@ -36,6 +36,35 @@ background scan for databases and rkyv shards \(em see
 below.
 .SH OPTIONS
 .TP
+.BI \-\-new " FILE"
+Create an empty database and open it. Refuses to overwrite an existing file, and
+forces a page out so what it leaves behind is a database rather than an empty
+file.
+.TP
+.B \-\-memory
+Open a database that lives only in this process, and never reaches a disk.
+.TP
+.B \-\-readonly
+Open a read-only connection: every edit is refused. This is a different
+connection, not a flag checked at the edit, so nothing can write through it.
+.TP
+.BI \-\-import\-sql " FILE"
+Run a file of SQL into the database and exit, DB Browser's "Import from SQL
+file". The whole script runs inside one savepoint, so a script that fails half
+way leaves the database exactly as it was.
+.TP
+.BI \-\-load\-extension " FILE"
+Load a SQLite extension before opening the database. Repeatable. Extension
+loading is off in the C library by default and is enabled only for the duration
+of the call.
+.TP
+.BI \-\-project " FILE"
+Open the database a project names, with the project's settings already applied:
+what each grid shows, what is filtered and sorted, and the statements in the SQL
+editor's tabs. Written by
+.B .project save
+in the editor.
+.TP
 .B \-\-sqlite
 Force treating the file as a SQLite database, skipping detection.
 .TP
@@ -577,6 +606,9 @@ value matches, the first match winning.
 .BR r ", " i ", " V ", " z ", " Z ", " L
 Find and replace in the cursor column, insert a row value by value, save the
 filter as a view, clear the sorting or the filter, and unlock a view for editing.
+.TP
+.B Ctrl\-p
+Print the table, under its filter and sort, by piping it to lpr.
 .TP
 .B P
 Edit the pragmas that decide how the database is written — the eighteen DB

@@ -348,6 +348,7 @@ is published on crates.io); disable with `--no-default-features`.
 | `z` / `Z` | clear the sorting / the filter (SQLite) |
 | `L` | unlock a view for editing (SQLite) |
 | `Ctrl-y` | copy the column's name (SQLite) |
+| `Ctrl-p` | print the table through `lpr` (SQLite) |
 | `A` | column statistics for the table, with a per-column frequency table (SQLite) |
 | `F` | follow the foreign key under the cursor to the row it references (SQLite) |
 | `Y` | copy the row as an `INSERT` (SQLite) |
@@ -663,6 +664,63 @@ strings would.
 
 DB Browser's *SpatiaLite Geometry to SVG* is the one format not implemented: it
 needs the SpatiaLite extension loaded to mean anything.
+
+## Files, extensions and projects
+
+The File menu, on the command line:
+
+```sh
+zdbview --new fresh.db          # create an empty database and open it
+zdbview --memory                # a database that never reaches a disk
+zdbview data.db --readonly      # a read-only connection: every edit is refused
+zdbview data.db --import-sql schema.sql   # run a script in, and exit
+zdbview data.db --load-extension ./ext.dylib   # load an extension first
+zdbview --project session.zdbp  # open the database a project names, as it was left
+```
+
+`--readonly` opens a different connection rather than checking a flag at the
+edit, so no key handler can write through it by accident. `--import-sql` runs the
+whole script inside one savepoint: a script that fails half way leaves the
+database exactly as it was. `--new` refuses to overwrite an existing file, and
+forces a page out so the file it made is a database rather than an empty file.
+
+In the editor, `.load FILE` loads an extension — the shell's own command, and DB
+Browser's "Load Extension". Extension loading is off in the C library by default
+and is enabled only for the duration of the call.
+
+`O` on the database report runs `PRAGMA optimize` — DB Browser's "Optimize" — and
+lists what SQLite decided was worth doing, which is usually `ANALYZE` on the
+indexes that have changed enough to matter.
+
+`Ctrl-p` prints the table (under its filter and sort) by piping it to `lpr`,
+which is what a terminal program has instead of a print dialog.
+
+### Projects
+
+`.project save FILE` and `.project open FILE` in the editor write and read a
+project: everything about a session that is not in the database — what each
+grid is set to show, what is filtered and sorted, and the statements left in the
+editor's tabs. `--project FILE` opens the database it names with those settings
+already applied.
+
+DB Browser writes XML; zdbview writes one directive per line, tab-separated, so
+a project can be read and edited by a person:
+
+```
+zdbview-project	1
+db	/path/to/file.db
+table	orders
+hidden	orders	note
+frozen	orders	1
+format	orders	total	hex-number
+rule	orders	total	> 100	red	bold
+filter	orders	tag:keep
+sort	orders	total	desc
+sql	SELECT * FROM orders WHERE total > 100
+```
+
+A directive this version does not know is skipped rather than refused, so a
+project written by a later one still opens.
 
 ## Conditional formats (`!`)
 

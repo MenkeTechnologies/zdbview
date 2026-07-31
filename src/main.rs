@@ -28,6 +28,7 @@ mod mru;
 mod overlay;
 mod pragmas;
 mod prefs;
+mod project;
 mod query;
 mod recover;
 mod rkyv_inspect;
@@ -199,6 +200,47 @@ struct Cli {
     recover: bool,
     #[arg(
         long,
+        value_name = "FILE",
+        help_heading = H_BACKEND,
+        help = "\x1b[32m//\x1b[0m Create an empty database and open it"
+    )]
+    new: Option<PathBuf>,
+    #[arg(
+        long,
+        conflicts_with = "new",
+        help_heading = H_BACKEND,
+        help = "\x1b[32m//\x1b[0m Open a database that lives only in memory"
+    )]
+    memory: bool,
+    #[arg(
+        long,
+        help_heading = H_BACKEND,
+        help = "\x1b[32m//\x1b[0m Open read-only: every edit is refused"
+    )]
+    readonly: bool,
+    #[arg(
+        long,
+        value_name = "FILE",
+        help_heading = H_OUTPUT,
+        help = "\x1b[32m//\x1b[0m Run a file of SQL into the database and exit"
+    )]
+    import_sql: Option<PathBuf>,
+    #[arg(
+        long,
+        value_name = "FILE",
+        help_heading = H_BACKEND,
+        help = "\x1b[32m//\x1b[0m Load a SQLite extension before opening (repeatable)"
+    )]
+    load_extension: Vec<PathBuf>,
+    #[arg(
+        long,
+        value_name = "FILE",
+        help_heading = H_BACKEND,
+        help = "\x1b[32m//\x1b[0m Open the database a project names, with its settings"
+    )]
+    project: Option<PathBuf>,
+    #[arg(
+        long,
         value_name = "NAME",
         help_heading = H_APPEARANCE,
         help = "\x1b[32m//\x1b[0m Colour scheme for this run (see --list-themes)"
@@ -269,10 +311,20 @@ fn main() -> Result<()> {
     if let Some(src) = &cli.import {
         return run_import(&cli, src);
     }
+    // `--import-sql` replays a script, the other half of `--export sql`.
+    if let Some(src) = &cli.import_sql {
+        return run_import_sql(&cli, src);
+    }
     // `--recover` reads pages, never opening the database, so it works on a file
     // SQLite itself refuses.
     if cli.recover {
         return run_recover(&cli);
+    }
+
+    // `--new` makes the file before anything tries to detect its type.
+    if let Some(path) = &cli.new {
+        sqlite::SqliteStore::create(path)?;
+        println!("created {}", path.display());
     }
 
     // Resolve --theme before touching the terminal so a typo prints plainly
@@ -574,6 +626,8 @@ trait Session {
 struct TerminalSession<'a> {
     cli: &'a Cli,
     terminal: &'a mut DefaultTerminal,
+    /// A project to apply to the first database opened, from `--project`.
+    project: Option<project::Project>,
 }
 
 impl Session for TerminalSession<'_> {
@@ -586,7 +640,9 @@ impl Session for TerminalSession<'_> {
         scheme: theme::Theme,
         file: PathBuf,
     ) -> Result<(app::Outcome, theme::Theme, Option<PathBuf>)> {
-        open_and_run(self.cli, self.terminal, scheme, file)
+        // The project applies to the database it named, which is the first one
+        // opened; after that the session is the user's.
+        open_and_run(self.cli, self.terminal, scheme, file, self.project.take())
     }
 }
 
@@ -595,8 +651,41 @@ fn run(cli: &Cli, terminal: &mut DefaultTerminal, theme: Option<theme::ThemeName
     // prefs at every hop: another instance writing prefs must not change what
     // this one is showing.
     let scheme = app::resolve_theme(theme);
-    let first = cli.file.clone();
-    let mut session = TerminalSession { cli, terminal };
+    // `--new` opens the database it just made; `--memory` opens one that never
+    // reaches a disk, so it has no path to hand the loop and runs on its own.
+    if cli.memory {
+        let store = store::Store::Sqlite(sqlite::SqliteStore::open_memory()?);
+        for ext in &cli.load_extension {
+            if let store::Store::Sqlite(s) = &store {
+                s.load_extension(ext)?;
+            }
+        }
+        let mut app = app::App::with_theme(store, scheme);
+        app.run(terminal)?;
+        return Ok(());
+    }
+    // `--project` says which database to open and how to show it.
+    let project = match &cli.project {
+        Some(path) => {
+            let text = std::fs::read_to_string(path)
+                .with_context(|| format!("cannot read {}", path.display()))?;
+            Some(
+                project::Project::parse(&text)
+                    .ok_or_else(|| anyhow!("{} is not a zdbview project", path.display()))?,
+            )
+        }
+        None => None,
+    };
+    let first = cli
+        .file
+        .clone()
+        .or_else(|| cli.new.clone())
+        .or_else(|| project.as_ref().map(|p| p.database.clone()));
+    let mut session = TerminalSession {
+        cli,
+        terminal,
+        project,
+    };
     drive(&mut session, first, scheme)
 }
 
@@ -709,19 +798,69 @@ fn open_and_run(
     terminal: &mut DefaultTerminal,
     scheme: theme::Theme,
     file: PathBuf,
+    project: Option<project::Project>,
 ) -> Result<(app::Outcome, theme::Theme, Option<PathBuf>)> {
     let kind = store::detect(&file, cli.sqlite, cli.rkyv)?;
-    let (store, actual) = store::Store::open(&file, kind)?;
+    // `--readonly` is a different connection, not a flag checked at the edit: a
+    // reader cannot be made to write by a bug in a key handler.
+    let (store, actual) = if cli.readonly && kind == store::Kind::Sqlite {
+        (
+            store::Store::Sqlite(sqlite::SqliteStore::open_readonly(&file)?),
+            store::Kind::Sqlite,
+        )
+    } else {
+        store::Store::open(&file, kind)?
+    };
+    if let store::Store::Sqlite(s) = &store {
+        for ext in &cli.load_extension {
+            s.load_extension(ext)?;
+        }
+    }
     mru::record(&file, actual);
     let mut app = app::App::with_theme(store, scheme);
+    if let Some(p) = project {
+        app.apply_project(&p);
+    }
     let outcome = app.run(terminal)?;
     Ok((outcome, app.theme(), app.open_next()))
+}
+
+/// `--import-sql`: run a file of SQL into the database, DB Browser's "Import
+/// from SQL file". The whole script is one savepoint, so a script that fails
+/// half way leaves nothing behind.
+fn run_import_sql(cli: &Cli, src: &std::path::Path) -> Result<()> {
+    let file = cli
+        .file
+        .clone()
+        .ok_or_else(|| anyhow!("--import-sql requires a file argument (the database)"))?;
+    let kind = store::detect(&file, cli.sqlite, cli.rkyv)?;
+    if kind != store::Kind::Sqlite {
+        return Err(anyhow!("--import-sql only applies to a SQLite database"));
+    }
+    let script =
+        std::fs::read_to_string(src).with_context(|| format!("cannot read {}", src.display()))?;
+    let (store, _) = store::Store::open(&file, kind)?;
+    match &store {
+        Store::Sqlite(s) => {
+            let n = s.import_sql(&script)?;
+            // A one-shot command has no user to ask, so it writes before exiting.
+            s.write_changes()?;
+            println!(
+                "ran {} into {}, {n} row(s) changed",
+                src.display(),
+                file.display()
+            );
+        }
+        _ => return Err(anyhow!("not a SQLite database")),
+    }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        drive, export_store, run_backup, run_export, run_import, run_recover, store, Cli, Session,
+        drive, export_store, run_backup, run_export, run_import, run_import_sql, run_recover,
+        store, Cli, Session,
     };
     use crate::app::{Outcome, Picked};
     use crate::theme::{Theme, ThemeName};
@@ -898,6 +1037,35 @@ mod tests {
         assert_eq!(n, 1, "the row landed");
         drop(conn);
 
+        // --import-sql: needs a file, refuses what is not a database, and runs
+        // the script into a real one.
+        let script =
+            std::env::temp_dir().join(format!("zdbview_cli_script_{}.sql", std::process::id()));
+        std::fs::write(&script, "INSERT INTO t (a) VALUES ('from the script');\n").unwrap();
+        let script_arg = script.to_str().unwrap();
+        let err = run_import_sql(&cli(&["--import-sql", script_arg]), &script)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("requires a file"), "{err}");
+        let err = run_import_sql(
+            &cli(&[text_arg, "--import-sql", script_arg, "--sqlite"]),
+            &script,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(!err.is_empty(), "a text file is not a database: {err}");
+        run_import_sql(&cli(&[db_arg, "--import-sql", script_arg]), &script).unwrap();
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        let n: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM t WHERE a = 'from the script'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 1, "the script's row landed and was written");
+        drop(conn);
+
         // --recover: needs a file, and refuses what is not a database.
         let err = run_recover(&cli(&["--recover"])).unwrap_err().to_string();
         assert!(err.contains("requires a file"), "{err}");
@@ -908,7 +1076,7 @@ mod tests {
         // And on a real one it succeeds.
         run_recover(&cli(&[db_arg, "--recover"])).unwrap();
 
-        for p in [db, text, dest, csv] {
+        for p in [db, text, dest, csv, script] {
             let _ = std::fs::remove_file(p);
         }
     }

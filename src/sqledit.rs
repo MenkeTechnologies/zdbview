@@ -194,6 +194,8 @@ pub const DOT_COMMANDS: &[&str] = &[
     ".import",
     ".read",
     ".backup",
+    ".load",
+    ".project",
     ".expert",
     ".recover",
     ".vacuum",
@@ -460,6 +462,32 @@ impl SqlEdit {
             Entry::Sql(sql) if !sql.starts_with('.') => Some(sql.clone()),
             _ => None,
         })
+    }
+
+    /// The statement in every tab, front one first — what a project records.
+    pub fn all_statements(&self) -> Vec<String> {
+        let mut out = vec![self.text()];
+        for (i, tab) in self.tabs.iter().enumerate() {
+            if i != self.active {
+                out.push(tab.input.iter().collect());
+            }
+        }
+        out
+    }
+
+    /// Put statements back into tabs, one per tab — the other half of
+    /// [`SqlEdit::all_statements`].
+    pub fn set_statements(&mut self, statements: &[String]) {
+        let mut it = statements.iter();
+        if let Some(first) = it.next() {
+            self.input = first.chars().collect();
+            self.cursor = self.input.len();
+        }
+        for sql in it {
+            self.new_tab();
+            self.input = sql.chars().collect();
+            self.cursor = self.input.len();
+        }
     }
 
     /// The newest result set in the transcript, for exporting it.

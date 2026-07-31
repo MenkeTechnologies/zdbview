@@ -30,7 +30,9 @@ disasm = ["dep:fusevm", "dep:bincode"]
 [dependencies]
 ratatui = "0.30"
 crossterm = "0.29"
-rusqlite = { version = "0.40", features = ["bundled", "hooks"] }
+# `load_extension` is DB Browser's "Load Extension": SQLite's own extension
+# loading, off by default in the C library and behind this feature in rusqlite.
+rusqlite = { version = "0.40", features = ["bundled", "hooks", "load_extension"] }
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 # Pinned to match the rkyv version + features zshrs serializes its shards with,

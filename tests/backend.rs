@@ -21,6 +21,10 @@ mod browse;
 #[allow(dead_code)]
 #[path = "../src/ddl.rs"]
 mod ddl;
+// A project file records what `browse` is holding.
+#[allow(dead_code)]
+#[path = "../src/project.rs"]
+mod project;
 // `browse` holds the insert form, which edits its fields through `input` and
 // fits them with `text`.
 #[allow(dead_code)]
@@ -2204,5 +2208,131 @@ fn a_view_is_writable_only_with_instead_of_triggers() {
     assert!(!store.is_view("t"));
     assert!(!store.view_is_writable("plain").unwrap());
     assert!(store.view_is_writable("writable").unwrap());
+    let _ = std::fs::remove_file(&path);
+}
+
+// ----- database lifecycle (DB Browser's File menu) --------------------------
+
+/// A new database has to be a database: an empty file is not one, so creating it
+/// must leave something SQLite and zdbview's own detection both accept.
+#[test]
+fn a_created_database_is_one_that_can_be_reopened() {
+    let path = tmp("file_new.db");
+    let _ = std::fs::remove_file(&path);
+
+    let store = SqliteStore::create(&path).unwrap();
+    assert!(store.tables.is_empty());
+    drop(store);
+
+    assert_eq!(detect(&path, false, false).unwrap(), Kind::Sqlite);
+    let reopened = SqliteStore::open(&path).unwrap();
+    reopened.exec("CREATE TABLE t (a)").unwrap();
+    reopened.write_changes().unwrap();
+    assert_eq!(
+        reopened.tables.len(),
+        0,
+        "the cache is from before the create"
+    );
+
+    // Creating over an existing file is refused rather than truncating it.
+    let err = match SqliteStore::create(&path) {
+        Ok(_) => panic!("creating over an existing file must be refused"),
+        Err(e) => e.to_string(),
+    };
+    assert!(err.contains("already exists"), "{err}");
+    let _ = std::fs::remove_file(&path);
+}
+
+/// An in-memory database behaves like any other, and never reaches a disk.
+#[test]
+fn an_in_memory_database_works_without_a_file() {
+    let store = SqliteStore::open_memory().unwrap();
+    store.exec("CREATE TABLE t (a TEXT)").unwrap();
+    store.exec("INSERT INTO t VALUES ('x')").unwrap();
+    store.write_changes().unwrap();
+    assert_eq!(store.count_exact("t", "").unwrap(), 1);
+    assert!(!std::path::Path::new(":memory:").exists());
+}
+
+/// A read-only store says so, and refuses to write.
+#[test]
+fn a_read_only_store_reports_itself_and_refuses_writes() {
+    let path = tmp("file_ro.db");
+    let _ = std::fs::remove_file(&path);
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute_batch("CREATE TABLE t (a TEXT); INSERT INTO t VALUES ('x')")
+        .unwrap();
+    drop(conn);
+
+    let writable = SqliteStore::open(&path).unwrap();
+    assert!(!writable.is_readonly());
+    drop(writable);
+
+    let ro = SqliteStore::open_readonly(&path).unwrap();
+    assert!(ro.is_readonly());
+    assert_eq!(ro.count_exact("t", "").unwrap(), 1, "reading still works");
+    assert!(ro.exec("INSERT INTO t VALUES ('y')").is_err());
+    let _ = std::fs::remove_file(&path);
+}
+
+/// A SQL script runs as one savepoint: a script that fails half way leaves the
+/// database as it was, rather than half-applied.
+#[test]
+fn importing_a_sql_script_is_all_or_nothing() {
+    let path = tmp("file_script.db");
+    let _ = std::fs::remove_file(&path);
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute_batch("CREATE TABLE t (a TEXT)").unwrap();
+    drop(conn);
+
+    let store = SqliteStore::open(&path).unwrap();
+    let n = store
+        .import_sql("INSERT INTO t VALUES ('one'); INSERT INTO t VALUES ('two');")
+        .unwrap();
+    assert_eq!(n, 2);
+    store.write_changes().unwrap();
+    assert_eq!(store.count_exact("t", "").unwrap(), 2);
+
+    // The second statement is nonsense, so neither lands.
+    let err = store
+        .import_sql("INSERT INTO t VALUES ('three'); INSERT INTO nosuch VALUES (1);")
+        .unwrap_err();
+    assert!(err.to_string().contains("nosuch"), "{err}");
+    store.write_changes().unwrap();
+    assert_eq!(
+        store.count_exact("t", "").unwrap(),
+        2,
+        "the failed script rolled all the way back"
+    );
+    let _ = std::fs::remove_file(&path);
+}
+
+/// `PRAGMA optimize` reports what it ran, and refuses over unwritten changes
+/// like the other maintenance.
+#[test]
+fn optimize_reports_what_it_did() {
+    let path = tmp("file_optimize.db");
+    let _ = std::fs::remove_file(&path);
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE t (a TEXT); CREATE INDEX t_a ON t (a);
+         INSERT INTO t VALUES ('x'), ('y');",
+    )
+    .unwrap();
+    drop(conn);
+
+    let store = SqliteStore::open(&path).unwrap();
+    // Whatever it decides to do, it must not fail.
+    let done = store.optimize().unwrap();
+    assert!(
+        done.iter().all(|s| !s.is_empty()),
+        "every reported step names a statement: {done:?}"
+    );
+
+    store
+        .update_cell_keyed("t", &sqlite::RowKey::Rowid(1), "a", "z")
+        .unwrap();
+    let err = store.optimize().unwrap_err().to_string();
+    assert!(err.contains("unwritten changes"), "{err}");
     let _ = std::fs::remove_file(&path);
 }

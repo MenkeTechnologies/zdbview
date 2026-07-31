@@ -2010,6 +2010,100 @@ impl SqliteStore {
         }
     }
 
+    // ----- database lifecycle (DB Browser's File menu) ----------------------
+
+    /// Create an empty database and open it — DB Browser's "New Database".
+    ///
+    /// An empty file is not a SQLite database until something is written to it,
+    /// so a page is forced out; otherwise the file zdbview just made would fail
+    /// its own header check on the next open.
+    pub fn create(path: &Path) -> Result<Self> {
+        if path.exists() {
+            return Err(anyhow::anyhow!("{} already exists", path.display()));
+        }
+        let store = Self::open(path)?;
+        store
+            .conn
+            .execute_batch("PRAGMA user_version = 0; VACUUM")
+            .with_context(|| format!("initialise {}", path.display()))?;
+        Ok(store)
+    }
+
+    /// A database that lives only as long as this process — DB Browser's "New
+    /// In-Memory Database". Its `path` is the SQLite URI, so everything that
+    /// prints a path still has something to print.
+    pub fn open_memory() -> Result<Self> {
+        let conn = Connection::open_in_memory().context("open an in-memory database")?;
+        Self::from_conn(conn, Path::new(":memory:"))
+    }
+
+    /// Whether this store can write at all. A read-only connection reports it up
+    /// front rather than failing at the first edit.
+    pub fn is_readonly(&self) -> bool {
+        // SQLite knows: this is `sqlite3_db_readonly`, not a guess from a failed
+        // write.
+        self.conn.is_readonly("main").unwrap_or(false)
+    }
+
+    /// Load a SQLite extension — DB Browser's "Load Extension". Extension
+    /// loading is off in the C library by default and is enabled only for the
+    /// duration of the call, which is what SQLite's own guard does.
+    pub fn load_extension(&self, path: &Path) -> Result<()> {
+        // Safety: the extension's entry point is C code this process cannot vet.
+        // The user asked for this file by name, which is the same trust the
+        // sqlite3 shell's `.load` extends.
+        unsafe {
+            let _guard = rusqlite::LoadExtensionGuard::new(&self.conn)
+                .context("enable extension loading")?;
+            self.conn
+                .load_extension(path, None::<&str>)
+                .with_context(|| format!("load {}", path.display()))?;
+        }
+        Ok(())
+    }
+
+    /// `PRAGMA optimize` — DB Browser's "Optimize". It runs whatever SQLite
+    /// thinks is worth doing (usually `ANALYZE` on the indexes that have changed
+    /// enough to matter), and reports what it ran.
+    pub fn optimize(&self) -> Result<Vec<String>> {
+        if self.pending.get() {
+            return Err(anyhow::anyhow!(
+                "there are unwritten changes — write (W) or revert (R) them first"
+            ));
+        }
+        // `PRAGMA optimize(-1)` lists what it would do without doing it, which is
+        // the only way to say what happened afterwards.
+        let planned: Vec<String> = self
+            .conn
+            .prepare("PRAGMA optimize(-1)")?
+            .query_map([], |r| r.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap_or_default();
+        self.conn.execute_batch("PRAGMA optimize")?;
+        Ok(planned)
+    }
+
+    /// Run a file of SQL into the database — DB Browser's "Import from SQL
+    /// file". The whole script is one savepoint, so a script that fails half way
+    /// leaves nothing behind.
+    pub fn import_sql(&self, script: &str) -> Result<usize> {
+        let before = self.conn.total_changes();
+        self.begin_edit()?;
+        self.conn.execute_batch("SAVEPOINT zdbview_script")?;
+        match self.conn.execute_batch(script) {
+            Ok(()) => {
+                self.conn.execute_batch("RELEASE zdbview_script")?;
+                Ok((self.conn.total_changes() - before) as usize)
+            }
+            Err(e) => {
+                let _ = self
+                    .conn
+                    .execute_batch("ROLLBACK TO zdbview_script; RELEASE zdbview_script");
+                Err(e.into())
+            }
+        }
+    }
+
     // ----- Browse Data operations (DB Browser's data tab) -------------------
 
     /// Replace `find` with `to` in one column, over the rows the grid's filter
