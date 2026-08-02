@@ -39,7 +39,8 @@ clap = { version = "4", features = ["derive"] }
 # so recognized archives validate byte-for-byte.
 rkyv = { version = "0.7", features = ["validation", "archive_le", "size_32"] }
 # disasm feature only: the real fusevm bytecode types (no vendored copy of the
-# 267-variant Op enum, so no drift risk) + bincode to decode the blobs.
+# Op enum, whose variant list grows every release, so no drift risk) + bincode to
+# decode the blobs.
 fusevm = { version = "0.14", default-features = false, optional = true }
 bincode = { version = "1", optional = true }
 

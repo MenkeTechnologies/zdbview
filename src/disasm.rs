@@ -2,10 +2,11 @@
 //!
 //! The script-cache value blobs (Family A + stryke `chunk_blob`) are
 //! `bincode`-encoded `fusevm::Chunk`. Rather than vendor a copy of the
-//! 267-variant `Op` enum — which would silently misdecode the moment fusevm's
-//! variant order drifts — this uses the real `fusevm` types, so the output is
-//! always correct or fails loudly. Blobs that are not a bare `Chunk` (pythonrs
-//! `CProg`, elisprs heap image, …) fail to decode and fall back to hex.
+//! `Op` enum — whose variant list grows every release, and which would silently
+//! misdecode the moment fusevm's variant order drifts — this uses the real
+//! `fusevm` types, so the output is always correct or fails loudly. Blobs that
+//! are not a bare `Chunk` (pythonrs `CProg`, elisprs heap image, …) fail to
+//! decode and fall back to hex.
 
 use fusevm::Chunk;
 

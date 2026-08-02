@@ -310,7 +310,8 @@ no renameable key.
 The script-cache value blobs are `bincode`-encoded `fusevm::Chunk`. The value
 pane's **disasm** render mode (`v` cycles to it) decodes the blob and lists ops,
 constants, and names using the real `fusevm` types — no vendored copy of the
-267-variant opcode enum, so no risk of silently wrong output. bincode is
+opcode enum, whose variant list grows every fusevm release, so no risk of
+silently wrong output. bincode is
 version-sensitive: disassembly is correct only when the linked `fusevm` version
 matches the one that encoded the cache; a mismatch fails loudly (`invalid
 variant` / `unexpected EOF`) and you fall back to hex. On by default (`fusevm`
@@ -640,7 +641,8 @@ formatted one `ƒ`, since neither setting is otherwise visible.
 
 ### Display formats
 
-The eighteen formats DB Browser applies, and the SQL each one runs:
+The nineteen formats DB Browser applies, and the SQL each one runs — plus a
+custom expression, where `%1` stands for the column:
 
 | Format | SQL |
 |--------|-----|

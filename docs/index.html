@@ -331,7 +331,7 @@ zdbview cache.rkyv --export json            # decoded records; each value blob a
       <section class="tutorial-section">
         <h2>What the grid shows</h2>
         <p>The Browse Data settings DB Browser keeps per table, kept the same way: <code>H</code> hides the cursor column and <code>U</code> brings them all back, <code>f</code> freezes the columns up to the cursor at the left edge, <code>#</code> shows the <code>rowid</code> as a leading column, and <code>m</code>/<code>M</code> step the column's display format. A wide table scrolls sideways under the cursor while the frozen columns stay put; a frozen column is marked <code>▏</code> in its header and a formatted one <code>ƒ</code>.</p>
-        <p>The eighteen display formats are DB Browser's: decimal, exponent, hex blob, hex number, octal, round, lower and upper case, dd/mm/yyyy, julian day, unix epoch (UTC and local), Apple NSDate, Java milliseconds, WebKit/Chromium microseconds (UTC and local) and the Windows OLE date — plus a custom expression, where <code>%1</code> stands for the column.</p>
+        <p>The nineteen display formats are DB Browser's: decimal, exponent, hex blob, hex number, octal, round, lower and upper case, dd/mm/yyyy, julian day, unix epoch (UTC and local), Apple NSDate, Java milliseconds, WebKit/Chromium microseconds (UTC and local), the Windows OLE date, and DB Browser's <em>Set encoding</em> pair — text as latin-1 and as windows-1252 — plus a custom expression, where <code>%1</code> stands for the column.</p>
         <p class="doc-note">A format is SQL, not a rendering rule, which is how DB Browser does it and what makes <em>hex blob</em> possible at all: the grid receives cells that are already display strings, so a blob has become <code>&lt;blob 12 bytes&gt;</code> before anything could format it. The column keeps its own name in the result, so sorting, filtering, paging and editing still address the raw value — a hex-formatted integer column sorts <code>1, 2, a</code>, not the <code>1, 10, 2</code> that sorting the displayed strings would give. Two of the formats are DB Browser's <em>Set encoding</em>: they read the stored bytes as ISO-8859-1 or Windows-1252 rather than UTF-8, which SQLite cannot do itself — the value comes back as <code>hex()</code> and is decoded on this side, the only way to read bytes that are not valid UTF-8 at all. <em>SpatiaLite Geometry to SVG</em> is the one DB Browser format not implemented; it needs the SpatiaLite extension loaded to mean anything.</p>
       </section>
 
@@ -427,6 +427,17 @@ zdbview --project session.zdbp  # open the database a project names, as it was l
             <tr><td>&nbsp;&nbsp;&nbsp;&nbsp;--backup FILE</td><td>Copy the database with <code>VACUUM INTO</code> and exit</td></tr>
             <tr><td>&nbsp;&nbsp;&nbsp;&nbsp;--import FILE</td><td>Load a CSV (or TSV, by extension) into <code>--table</code> and exit</td></tr>
             <tr><td>&nbsp;&nbsp;&nbsp;&nbsp;--recover</td><td>Salvage rows page by page to stdout as SQL, without opening the database</td></tr>
+            <tr><td>&nbsp;&nbsp;&nbsp;&nbsp;--import-sql FILE</td><td>Run a file of SQL into the database and exit</td></tr>
+            <tr><td>&nbsp;&nbsp;&nbsp;&nbsp;--new FILE</td><td>Create an empty database and open it</td></tr>
+            <tr><td>&nbsp;&nbsp;&nbsp;&nbsp;--memory</td><td>Open a database that lives only in memory (conflicts with <code>--new</code>)</td></tr>
+            <tr><td>&nbsp;&nbsp;&nbsp;&nbsp;--readonly</td><td>Open read-only: every edit is refused</td></tr>
+            <tr><td>&nbsp;&nbsp;&nbsp;&nbsp;--load-extension FILE</td><td>Load a SQLite extension before opening (repeatable)</td></tr>
+            <tr><td>&nbsp;&nbsp;&nbsp;&nbsp;--project FILE</td><td>Open the database a project names, with its settings</td></tr>
+            <tr><td>&nbsp;&nbsp;&nbsp;&nbsp;--theme NAME</td><td>Colour scheme for this run (see <code>--list-themes</code>)</td></tr>
+            <tr><td>&nbsp;&nbsp;&nbsp;&nbsp;--list-themes</td><td>Preview every scheme with its palette and exit</td></tr>
+            <tr><td>&nbsp;&nbsp;&nbsp;&nbsp;--scan DIR</td><td>Scan <code>DIR</code> instead of the default roots (repeatable)</td></tr>
+            <tr><td>&nbsp;&nbsp;&nbsp;&nbsp;--no-scan</td><td>Skip the scan; list only recent files (conflicts with <code>--scan</code>)</td></tr>
+            <tr><td>&nbsp;&nbsp;&nbsp;&nbsp;--rescan</td><td>Walk again now, ignoring the saved scan (conflicts with <code>--no-scan</code>)</td></tr>
             <tr><td>-h, --help</td><td>Print usage</td></tr>
             <tr><td>-V, --version</td><td>Print the version</td></tr>
           </tbody>
