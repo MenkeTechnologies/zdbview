@@ -1142,7 +1142,9 @@ fn help_sections(ctx: HelpCtx) -> Vec<HelpSection> {
         HelpSection {
             title: "VALUE",
             keys: &[
-                ("v", "Cycle render"),
+                // `v` is handled by the detail screen alone, so say so rather
+                // than list it beside the keys that work on the grid too.
+                ("v", "Cycle render, on detail"),
                 ("y", "Copy (OSC 52)"),
                 ("x", "Export to file"),
                 ("e", "Edit (also on detail)"),
