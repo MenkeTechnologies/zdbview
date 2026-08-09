@@ -419,6 +419,10 @@ pub struct App {
     /// Integrity-check and lint output, filled on demand (both can be slow).
     dbinfo_checks: Vec<String>,
     dbinfo_scroll: usize,
+    /// Furthest the database screen can scroll, measured while rendering it —
+    /// the report's length depends on how many checks have been run and on the
+    /// height it was given, neither of which the key handler can see.
+    dbinfo_max_scroll: usize,
     /// Rect the SQL editor last rendered into, for paging.
     sql_area: Rect,
     /// How the editor renders a result set — the shell's `.mode`.
@@ -545,6 +549,7 @@ impl App {
             dbinfo: Vec::new(),
             dbinfo_checks: Vec::new(),
             dbinfo_scroll: 0,
+            dbinfo_max_scroll: 0,
             sql_area: Rect::ZERO,
             sql_mode: OutputMode::List,
             sql_out: None,
@@ -4566,7 +4571,10 @@ impl App {
             KeyCode::PageUp => {
                 self.dbinfo_scroll = self.dbinfo_scroll.saturating_sub(self.page_step())
             }
-            KeyCode::Char('g') => self.dbinfo_scroll = 0,
+            KeyCode::Char('g') | KeyCode::Home => self.dbinfo_scroll = 0,
+            // `G` is the bottom on every other scrolling screen; the report is
+            // long enough to want it once the checks have printed.
+            KeyCode::Char('G') | KeyCode::End => self.dbinfo_scroll = self.dbinfo_max_scroll,
             _ => {}
         }
     }
@@ -4630,6 +4638,7 @@ impl App {
         }
         let height = area.height.saturating_sub(2) as usize;
         let max_scroll = lines.len().saturating_sub(height);
+        self.dbinfo_max_scroll = max_scroll;
         self.dbinfo_scroll = self.dbinfo_scroll.min(max_scroll);
         let shown: Vec<Line> = lines
             .into_iter()
@@ -7896,6 +7905,58 @@ mod tests {
 
         press(&mut app, 'q');
         assert!(app.quit, "q quits from the database screen too");
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// `O` runs `PRAGMA optimize` and reports what it did, and the report
+    /// scrolls to both ends: `G` reaches the bottom, which is where the check
+    /// output lands, and `g` comes back. The report is longer than a short
+    /// terminal, so without a bottom key the newest lines could only be reached
+    /// one `j` at a time.
+    #[test]
+    fn the_database_report_optimizes_and_scrolls_to_both_ends() {
+        let (mut app, path) = sqlite_app_rows(3);
+        press(&mut app, 'D');
+        press(&mut app, 'O');
+        assert!(
+            app.dbinfo_checks[0].starts_with("PRAGMA optimize"),
+            "got {:?}",
+            app.dbinfo_checks
+        );
+
+        // A terminal shorter than the report, so there is something to scroll.
+        let rows = frame_rows(&mut app, 100, 12);
+        assert!(contains(&rows, "database —"), "{:?}", rows[0]);
+        assert!(
+            app.dbinfo_max_scroll > 0,
+            "the report must overflow 12 rows for this test to mean anything"
+        );
+
+        press(&mut app, 'G');
+        assert_eq!(
+            app.dbinfo_scroll, app.dbinfo_max_scroll,
+            "G goes to the bottom of the report"
+        );
+        let rows = frame_rows(&mut app, 100, 12);
+        assert!(
+            contains(&rows, "PRAGMA optimize"),
+            "the check output sits at the bottom and must be on screen: {rows:?}"
+        );
+
+        press(&mut app, 'g');
+        assert_eq!(app.dbinfo_scroll, 0, "g goes back to the top");
+        let rows = frame_rows(&mut app, 100, 12);
+        assert!(
+            !contains(&rows, "PRAGMA optimize"),
+            "the top of the report is the pragmas, not the checks: {rows:?}"
+        );
+
+        // Scrolling past the end is clamped by the render, not left dangling.
+        for _ in 0..200 {
+            press(&mut app, 'j');
+        }
+        let _ = frame_rows(&mut app, 100, 12);
+        assert_eq!(app.dbinfo_scroll, app.dbinfo_max_scroll);
         let _ = std::fs::remove_file(path);
     }
 

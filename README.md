@@ -399,8 +399,16 @@ zdbview data.db --theme blade_runner   # this run only, prefs untouched
 ## Help overlay and toasts
 
 `h` (or `?`) opens the keyboard-shortcut overlay: a themed box listing every
-binding in three columns, with the section matching what is open — SQLite, rkyv,
-or the recent-files picker. Any key or click closes it.
+binding in up to three columns, with the sections matching what is open — the
+SQLite grid, the rkyv archive, the recent-files picker, the SQL editor, the hex
+editor, the write monitor, the log walker, the schema, the pragmas, the column
+statistics, or the database report. Any key or click closes it.
+
+The box measures itself against what that screen lists: the key field is as wide
+as the longest chord on it, the description field as wide as the longest
+description, and only the columns the sections actually fill are drawn — so the
+pragma screen's two sections get a narrow box while the SQLite grid gets a wide
+one. Nothing is clipped unless the terminal itself is too small for the box.
 
 Action results (copy, export, edit, delete, SQL, scheme saved) appear as a
 transient **toast** centered above the status bar and dismiss themselves after
@@ -858,6 +866,7 @@ in its Database Structure tab — and the cursor selects one:
 | `i` | new index on the selected table |
 | `d` | drop the object (asks first) |
 | `y` | copy its `CREATE` statement — DB Browser's "Copy Create Statement" |
+| `R` | count the rows in every table and view, and press again to drop them — DB Browser's "Row counts" |
 
 Both designers are grids of fields with the SQL they will run shown underneath,
 so the statement is visible before it is applied:
@@ -939,6 +948,11 @@ walk the whole file:
 | `v` | `VACUUM` — rewrite the file, reclaiming free pages (reports the size change) | `.vacuum` / DB4S "Compact Database" |
 | `z` | `ANALYZE` — write `sqlite_stat1` so the planner has statistics | `.analyze` |
 | `r` | `REINDEX` — rebuild every index | — |
+| `O` | `PRAGMA optimize` — whatever SQLite decides is worth doing, listed | DB4S "Optimize" |
+
+Every result is appended below the pragmas, so the screen grows as checks run.
+`j` / `k` and `PgUp` / `PgDn` scroll it, and `g` / `G` jump to the top and the
+bottom — the bottom being where the newest output lands.
 
 The lint reads `foreign_key_list`, `index_list` and `index_info` per table and
 reports a key only when no index *starts* with the child column, which is the

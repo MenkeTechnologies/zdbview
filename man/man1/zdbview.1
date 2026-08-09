@@ -643,9 +643,12 @@ creates a table,
 .B i
 an index,
 .B d
-drops the object after asking, and
+drops the object after asking,
 .B y
-copies its CREATE statement.
+copies its CREATE statement, and
+.B R
+counts the rows in every table and view, a second press dropping the counts
+again.
 .TP
 .B D
 Open the database report: the pragmas the shell's
@@ -669,6 +672,15 @@ run
 reporting the change in file size.
 Those three run on a keypress rather than on open because each walks the whole
 file.
+.B O
+runs
+.B "PRAGMA optimize"
+and lists what SQLite decided was worth doing.
+Every result is appended below the pragmas, so the report grows as checks run:
+.BR j ", " k ", " PgUp " and " PgDn
+scroll it and
+.BR g " and " G
+jump to the top and the bottom.
 .B Esc
 or
 .B D

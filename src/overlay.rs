@@ -25,8 +25,11 @@ use crate::theme::{base_palette, Theme, ThemeName};
 const TOAST_SECS: u64 = 3;
 /// Columns of key bindings in the help overlay.
 const HELP_COLS: usize = 3;
-/// Width reserved for the key name in a help row.
+/// Narrowest the key field in a help row is allowed to get. It widens to the
+/// longest key the screen actually lists, so no binding is painted half-cut.
 const HELP_KEY_W: u16 = 9;
+/// Blank columns between one help column and the next.
+const HELP_GUTTER: u16 = 2;
 
 /// A transient confirmation message — port of iftoprs's `StatusMsg`. It paints
 /// over the UI and dismisses itself after [`TOAST_SECS`] seconds.
@@ -382,7 +385,25 @@ impl Overlays {
             .expect("a single column always fits every section");
 
         let area = f.area();
-        let bw = 90u16.min(area.width);
+        let heading = format!(
+            "ZDBVIEW v{} — KEYBOARD SHORTCUTS",
+            env!("CARGO_PKG_VERSION")
+        );
+        let footer = format!("scheme: {} | c=chooser", t.name.display());
+
+        // Size the box from what this screen lists rather than a fixed width:
+        // a key field cut short names a chord the reader cannot type, and a
+        // description cut short reads as a different instruction. Only the
+        // columns the packing actually used are paid for, so a two-section
+        // screen gets a narrow box instead of an empty third column.
+        let (kw, dw) = help_widths(&sections);
+        let used = placed.iter().map(|&(c, _)| c).max().unwrap_or(0) as u16 + 1;
+        // Where the next column starts: the widest row plus a gutter, so a
+        // full-width description keeps a gap from the key beside it. The last
+        // column pays for no gutter.
+        let pitch = kw + 1 + dw + HELP_GUTTER;
+        let chrome = width_of(&heading).max(width_of(&footer)) + 4;
+        let bw = (pitch * used - HELP_GUTTER + 4).max(chrome).min(area.width);
         // 4 header rows (border, title, subtitle, blank) + 3 footer rows.
         let bh = (limit as u16 + 7).min(area.height);
         let bg = t.help_bg;
@@ -402,24 +423,20 @@ impl Overlays {
         let buf = f.buffer_mut();
         let (x0, y0) = draw_box(buf, area, bw, bh, bg, Style::default().fg(t.help_border));
 
-        set_centered(
-            buf,
-            x0,
-            bw,
-            y0 + 1,
-            &format!(
-                "ZDBVIEW v{} — KEYBOARD SHORTCUTS",
-                env!("CARGO_PKG_VERSION")
-            ),
-            title,
-        );
+        set_centered(buf, x0, bw, y0 + 1, &heading, title);
         set_centered(buf, x0, bw, y0 + 2, ctx.label(), hint);
 
-        // Three columns of "KEY  description" rows under their section heading.
-        let cw = (bw.saturating_sub(4) / HELP_COLS as u16).max(HELP_KEY_W + 2);
+        // Columns of "KEY  description" rows under their section heading. On a
+        // terminal too narrow for the full width the columns share what there
+        // is, so the layout degrades by clipping rather than by overlapping.
+        let pitch = ((bw.saturating_sub(4) + HELP_GUTTER) / used)
+            .max(HELP_KEY_W + 2 + HELP_GUTTER)
+            .min(pitch);
+        let cw = pitch - HELP_GUTTER;
+        let kw = kw.min(cw - 2);
         let last_row = y0 + bh.saturating_sub(4);
         for (s, (col, row)) in sections.iter().zip(placed) {
-            let cx = x0 + 2 + col as u16 * cw;
+            let cx = x0 + 2 + col as u16 * pitch;
             let sy = y0 + 4 + row as u16;
             if sy > last_row {
                 continue;
@@ -430,15 +447,8 @@ impl Overlays {
                 if ky > last_row {
                     break;
                 }
-                set_str(buf, cx, ky, k, key, HELP_KEY_W);
-                set_str(
-                    buf,
-                    cx + HELP_KEY_W + 1,
-                    ky,
-                    desc,
-                    text,
-                    cw - HELP_KEY_W - 1,
-                );
+                set_str(buf, cx, ky, k, key, kw);
+                set_str(buf, cx + kw + 1, ky, desc, text, cw - kw - 1);
             }
         }
 
@@ -447,7 +457,7 @@ impl Overlays {
             x0,
             bw,
             y0 + bh.saturating_sub(3),
-            &format!("scheme: {} | c=chooser", t.name.display()),
+            &footer,
             Style::default().fg(t.help_val).bg(bg),
         );
         set_centered(
@@ -900,6 +910,7 @@ fn help_sections(ctx: HelpCtx) -> Vec<HelpSection> {
                     ("i", "New index"),
                     ("d", "Drop object"),
                     ("y", "Copy CREATE statement"),
+                    ("R", "Row counts, and off"),
                     ("S / Esc", "Back to the data"),
                 ],
             },
@@ -933,7 +944,9 @@ fn help_sections(ctx: HelpCtx) -> Vec<HelpSection> {
                     ("v", "VACUUM (compact)"),
                     ("z", "ANALYZE"),
                     ("r", "REINDEX"),
+                    ("O", "PRAGMA optimize"),
                     ("j/k ↑↓", "Scroll"),
+                    ("g / G", "Top / bottom"),
                     ("D / Esc", "Back to the data"),
                 ],
             },
@@ -1122,6 +1135,7 @@ fn help_sections(ctx: HelpCtx) -> Vec<HelpSection> {
                 ("↑ / ↓", "Move while typing"),
                 ("Enter", "Keep the filter"),
                 ("Esc", "Clear it"),
+                ("n / N", "Next / prev match"),
             ],
         },
         store,
@@ -1156,10 +1170,39 @@ fn help_sections(ctx: HelpCtx) -> Vec<HelpSection> {
     ]
 }
 
+/// Width of `s` in terminal cells. Every glyph the overlay paints is one column
+/// wide — pinned by `overlay_glyphs_are_single_width_and_borders_align` — so
+/// counting characters counts columns.
+fn width_of(s: &str) -> u16 {
+    s.chars().count() as u16
+}
+
+/// The key-field and description-field widths these sections need in order to
+/// be painted whole: the longest key (never narrower than [`HELP_KEY_W`]) and
+/// the longest description. A section heading spans the column, so it widens
+/// the description field when it is longer than the two fields together.
+fn help_widths(sections: &[HelpSection]) -> (u16, u16) {
+    let rows = || sections.iter().flat_map(|s| s.keys.iter());
+    let kw = rows()
+        .map(|(k, _)| width_of(k))
+        .max()
+        .unwrap_or(0)
+        .max(HELP_KEY_W);
+    let dw = rows().map(|(_, d)| width_of(d)).max().unwrap_or(0);
+    let tw = sections
+        .iter()
+        .map(|s| width_of(s.title))
+        .max()
+        .unwrap_or(0);
+    (kw, dw.max(tw.saturating_sub(kw + 1)))
+}
+
 /// Assign each help section to a column, greedily filling `limit` rows per
 /// column (iftoprs's packing, with the limit chosen so nothing is dropped).
 /// A section occupies its heading + one row per key + a blank separator.
-/// Returns `None` when the sections do not fit in `cols` columns.
+/// Returns `None` when the sections do not fit in `cols` columns of `limit`
+/// rows — including when one section alone is taller than a column, which the
+/// caller answers by trying a taller budget.
 fn pack_sections(
     sections: &[HelpSection],
     limit: usize,
@@ -1169,6 +1212,13 @@ fn pack_sections(
     let (mut col, mut row) = (0usize, 0usize);
     for s in sections {
         let need = s.keys.len() + 2;
+        // The trailing separator may fall off the bottom of a column, but the
+        // heading and every key must land inside it. Without this a section
+        // wrapped to row 0 kept a budget it did not fit, and the rows past the
+        // box were painted nowhere — bindings vanished with nothing to show it.
+        if need - 1 > limit {
+            return None;
+        }
         if row + need > limit && row > 0 {
             col += 1;
             row = 0;
@@ -1210,6 +1260,64 @@ mod tests {
         rows.iter().any(|r| r.contains(needle))
     }
 
+    /// `needle` is painted somewhere with blank space or the frame after it —
+    /// it reached the screen whole *and* did not run into the column beside it.
+    fn painted_clear(rows: &[String], needle: &str) -> bool {
+        let n: Vec<char> = needle.chars().collect();
+        rows.iter().any(|r| {
+            let cells: Vec<char> = r.chars().collect();
+            cells.windows(n.len()).enumerate().any(|(i, w)| {
+                w == n.as_slice() && matches!(cells.get(i + n.len()), None | Some(' ') | Some('║'))
+            })
+        })
+    }
+
+    /// Every screen the help overlay can be opened from.
+    const HELP_CTXS: [HelpCtx; 11] = [
+        HelpCtx::Sqlite,
+        HelpCtx::Rkyv,
+        HelpCtx::Picker,
+        HelpCtx::HexEdit,
+        HelpCtx::Top,
+        HelpCtx::Sql,
+        HelpCtx::DbInfo,
+        HelpCtx::Stats,
+        HelpCtx::Frames,
+        HelpCtx::Schema,
+        HelpCtx::Pragmas,
+    ];
+
+    /// Position of a context in [`HELP_CTXS`]. Exhaustive on purpose: a new
+    /// `HelpCtx` variant stops this compiling, so it cannot be added without
+    /// being covered by the render checks below.
+    fn ctx_index(c: HelpCtx) -> usize {
+        match c {
+            HelpCtx::Sqlite => 0,
+            HelpCtx::Rkyv => 1,
+            HelpCtx::Picker => 2,
+            HelpCtx::HexEdit => 3,
+            HelpCtx::Top => 4,
+            HelpCtx::Sql => 5,
+            HelpCtx::DbInfo => 6,
+            HelpCtx::Stats => 7,
+            HelpCtx::Frames => 8,
+            HelpCtx::Schema => 9,
+            HelpCtx::Pragmas => 10,
+        }
+    }
+
+    /// The list the render checks iterate must name every context exactly once.
+    #[test]
+    fn help_ctxs_lists_every_context_once() {
+        let mut seen = [false; HELP_CTXS.len()];
+        for c in HELP_CTXS {
+            let i = ctx_index(c);
+            assert!(!seen[i], "{c:?} listed twice");
+            seen[i] = true;
+        }
+        assert!(seen.iter().all(|&s| s), "HELP_CTXS misses a context");
+    }
+
     /// Every key section must land in a column: the packing search must never
     /// silently drop a section, which would hide bindings from the overlay.
     #[test]
@@ -1243,6 +1351,80 @@ mod tests {
     #[test]
     fn pack_sections_rejects_an_impossible_budget() {
         assert!(pack_sections(&help_sections(HelpCtx::Rkyv), 3, HELP_COLS).is_none());
+    }
+
+    /// Every binding the overlay claims must actually reach the screen when
+    /// there is room for it. Two ways it used to not:
+    ///
+    /// * a section wrapped to the top of a column was exempt from the row
+    ///   budget, so its last rows fell past the box and were painted nowhere —
+    ///   the database screen lost `r`, `j/k` and `D / Esc` outright;
+    /// * the key and description fields were fixed at 9 and 18 columns, so
+    ///   `W / Ctrl-s` was painted `W / Ctrl-` — a chord that does not exist.
+    ///
+    /// Both are silent on screen, which is what makes them worth pinning.
+    #[test]
+    fn every_listed_binding_is_painted_in_every_context() {
+        const W: u16 = 130;
+        const H: u16 = 60;
+        for ctx in HELP_CTXS {
+            let mut ov = overlays();
+            ov.help = true;
+            let r = rows(&mut ov, ctx, W, H);
+            for s in help_sections(ctx) {
+                assert!(has(&r, s.title), "{ctx:?}: section {} not painted", s.title);
+                for (k, desc) in s.keys {
+                    assert!(
+                        painted_clear(&r, k),
+                        "{ctx:?}/{}: key {k:?} not painted whole and clear",
+                        s.title
+                    );
+                    assert!(
+                        painted_clear(&r, desc),
+                        "{ctx:?}/{}: description {desc:?} not painted whole and clear",
+                        s.title
+                    );
+                }
+            }
+        }
+    }
+
+    /// The box only claims the width and height its own contents need, so a
+    /// screen with two short sections does not paint an empty third column.
+    #[test]
+    fn the_help_box_is_sized_by_its_contents() {
+        let width = |ctx| {
+            let mut ov = overlays();
+            ov.help = true;
+            rows(&mut ov, ctx, 130, 60)
+                .iter()
+                .map(|r| r.trim_end().chars().count())
+                .max()
+                .unwrap_or(0)
+        };
+        let (small, large) = (width(HelpCtx::Pragmas), width(HelpCtx::Sqlite));
+        assert!(
+            small < large,
+            "the pragma screen lists two short sections and must not be \
+             painted as wide as the SQLite grid: {small} vs {large}"
+        );
+        assert!(large <= 130, "the box overflowed the terminal: {large}");
+    }
+
+    /// A terminal too small for the full box must clip it, not panic and not
+    /// let a column run past the frame.
+    #[test]
+    fn a_narrow_terminal_clips_the_help_box() {
+        for (w, h) in [(40u16, 12u16), (60, 20), (24, 8)] {
+            let mut ov = overlays();
+            ov.help = true;
+            let r = rows(&mut ov, HelpCtx::Sqlite, w, h);
+            assert_eq!(r.len(), h as usize);
+            assert!(
+                r.iter().all(|row| row.chars().count() == w as usize),
+                "{w}x{h}: a row is not the width of the terminal"
+            );
+        }
     }
 
     /// Help must draw its frame, title, footer, and the section matching the
