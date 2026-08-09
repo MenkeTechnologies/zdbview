@@ -833,8 +833,9 @@ database is written rather than what is in it.
   synchronous                full           how hard a commit is flushed — off risks the file on a power loss
 ```
 
-`j`/`k` select, `Space` (or `←`/`→`) cycles a flag or a named set, `Enter` types
-a number, `P` or `Esc` goes back. A value is shown as the word SQLite means by it
+`j`/`k` select and `g`/`G` and `PgUp`/`PgDn` move further, `Space` (or `←`/`→`)
+cycles a flag or a named set, `Enter` (or `e`) types a number, `P` (or `p`) and
+`Esc` go back. A value is shown as the word SQLite means by it
 — `synchronous` reads back as `2` and is displayed `full`.
 
 **Every change is read back.** SQLite accepts a pragma it will not apply rather

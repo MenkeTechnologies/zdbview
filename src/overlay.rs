@@ -887,9 +887,11 @@ fn help_sections(ctx: HelpCtx) -> Vec<HelpSection> {
                 title: "PRAGMAS",
                 keys: &[
                     ("j/k ↑↓", "Select a pragma"),
+                    ("g / G", "First / last"),
+                    ("PgUp/PgDn", "Page"),
                     ("Space / ←→", "Cycle the value"),
-                    ("Enter", "Cycle, or type a number"),
-                    ("P / Esc", "Back to the data"),
+                    ("Enter / e", "Cycle, or type a number"),
+                    ("P / p / Esc", "Back to the data"),
                 ],
             },
             HelpSection {
@@ -961,7 +963,7 @@ fn help_sections(ctx: HelpCtx) -> Vec<HelpSection> {
             HelpSection {
                 title: "WATCH",
                 keys: &[
-                    ("< / >", "Sort column (F6)"),
+                    ("< / > / s", "Sort column (F6)"),
                     ("I", "Invert the sort"),
                     ("t", "Frames / tables pane"),
                     ("F", "Walk the log"),
