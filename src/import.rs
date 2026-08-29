@@ -111,6 +111,39 @@ mod tests {
         assert_eq!(tsv.rows, [["1", "2"]]);
     }
 
+    /// Quoting only opens a field; a quote anywhere else is a character. Real
+    /// exports contain both — a Windows path, an inches mark — and neither may
+    /// swallow the rest of the file as an unterminated field.
+    #[test]
+    fn a_quote_that_does_not_open_a_field_is_just_a_character() {
+        let csv = parse("a,b\n6\" nails,ab\"cd\n", ',').unwrap();
+        assert_eq!(csv.rows[0], ["6\" nails", "ab\"cd"]);
+
+        // Text after a closing quote joins the field it closed, rather than
+        // starting a new one or being dropped.
+        let csv = parse("a\n\"quoted\"tail\n", ',').unwrap();
+        assert_eq!(csv.rows[0], ["quotedtail"]);
+    }
+
+    /// A row need not have the header's width — the parser reports what the file
+    /// says and leaves the decision to the importer, which refuses a mismatch
+    /// rather than guessing which column a missing field belonged to.
+    #[test]
+    fn a_short_or_long_row_is_reported_as_it_is() {
+        let csv = parse("a,b,c\n1,2\n1,2,3,4\n", ',').unwrap();
+        assert_eq!(csv.header.len(), 3);
+        assert_eq!(csv.rows[0], ["1", "2"]);
+        assert_eq!(csv.rows[1], ["1", "2", "3", "4"]);
+    }
+
+    /// A field of only a separator or only whitespace is data, and a quoted
+    /// empty field is an empty field rather than a missing one.
+    #[test]
+    fn whitespace_and_empty_quoted_fields_are_kept() {
+        let csv = parse("a,b,c\n\" \",\"\",  x  \n", ',').unwrap();
+        assert_eq!(csv.rows[0], [" ", "", "  x  "]);
+    }
+
     #[test]
     fn a_file_that_cannot_be_parsed_is_an_error() {
         assert!(parse("a,b\n\"unterminated\n", ',').is_err());

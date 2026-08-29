@@ -3034,6 +3034,139 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
+    /// `--readonly` is a different connection, not a flag someone remembers to
+    /// check: every write path has to be refused by SQLite itself, so no key
+    /// handler can get through by accident.
+    #[test]
+    fn a_read_only_connection_refuses_every_write_path() {
+        let (path, _writer) = fixture("readonly", 5);
+        let store = SqliteStore::open_readonly(&path).unwrap();
+        let key = RowKey::Rowid(1);
+
+        // Reading is unaffected.
+        assert_eq!(store.count("t").unwrap(), 5);
+        assert!(store.rows(&page("t", 5, 0, "", None, None)).is_ok());
+
+        // Every write refuses, at the connection rather than at a check.
+        assert!(store.update_cell_keyed("t", &key, "name", "x").is_err());
+        assert!(store.update_cell_null("t", &key, "name").is_err());
+        assert!(store
+            .update_cell_blob_keyed("t", &key, "name", b"x")
+            .is_err());
+        assert!(store.delete_row_keyed("t", &key).is_err());
+        assert!(store.insert_blank("t").is_err());
+        assert!(store.exec("UPDATE t SET name = 'x'").is_err());
+        assert!(store
+            .import_rows("t", &["name".to_string()], &[vec!["x".to_string()]])
+            .is_err());
+        assert!(store
+            .import_sql("INSERT INTO t (name) VALUES ('x');")
+            .is_err());
+
+        // And nothing reached the file.
+        let check = SqliteStore::open(&path).unwrap();
+        assert_eq!(check.count("t").unwrap(), 5);
+        let first: String = check
+            .conn
+            .query_row("SELECT name FROM t WHERE rowid = 1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(first, "kick-0", "unchanged");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// An import is one savepoint: a file with a bad row half way through leaves
+    /// the table exactly as it was, rather than half loaded with no way to tell
+    /// how far it got.
+    #[test]
+    fn an_import_is_all_or_nothing() {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "zdbview_sqlite_{}_import_rows.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch("CREATE TABLE t (a TEXT, b TEXT); INSERT INTO t VALUES ('old', 'row');")
+            .unwrap();
+        drop(conn);
+        let store = SqliteStore::open(&path).unwrap();
+        let header = vec!["a".to_string(), "b".to_string()];
+        let row = |a: &str, b: &str| vec![a.to_string(), b.to_string()];
+
+        // A row that is not the header's width stops the import.
+        let err = store
+            .import_rows("t", &header, &[row("1", "2"), vec!["short".into()]])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("has 1 fields"), "{err}");
+        store.write_changes().unwrap();
+        assert_eq!(store.count("t").unwrap(), 1, "the good row did not stick");
+
+        // A column the table does not have is refused before anything is written.
+        let err = store
+            .import_rows(
+                "t",
+                &["a".to_string(), "nope".to_string()],
+                &[row("1", "2")],
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no column"), "{err}");
+        assert_eq!(store.count("t").unwrap(), 1);
+
+        // And a good file lands whole.
+        assert_eq!(
+            store
+                .import_rows("t", &header, &[row("1", "2"), row("3", "4")])
+                .unwrap(),
+            2
+        );
+        store.write_changes().unwrap();
+        assert_eq!(store.count("t").unwrap(), 3);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The header names the columns, so a file whose columns are in another
+    /// order — or which fills only some of them — still lands in the right
+    /// places rather than by position.
+    #[test]
+    fn an_import_follows_the_header_not_the_column_order() {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "zdbview_sqlite_{}_import_order.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch("CREATE TABLE t (a TEXT, b TEXT, c TEXT DEFAULT 'unset')")
+            .unwrap();
+        drop(conn);
+        let store = SqliteStore::open(&path).unwrap();
+
+        // Reversed against the table's own order.
+        store
+            .import_rows(
+                "t",
+                &["b".to_string(), "a".to_string()],
+                &[vec!["bee".into(), "ay".into()]],
+            )
+            .unwrap();
+        store.write_changes().unwrap();
+        let (a, b, c): (String, String, String) = store
+            .conn
+            .query_row("SELECT a, b, c FROM t", [], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
+            .unwrap();
+        assert_eq!(
+            (a.as_str(), b.as_str()),
+            ("ay", "bee"),
+            "by name, not by position"
+        );
+        assert_eq!(c, "unset", "a column the file leaves out keeps its default");
+        let _ = std::fs::remove_file(&path);
+    }
+
     /// The grid's filter language, against a real table: a bare word matches any
     /// column, `name:value` restricts to that column, terms are ANDed, and a
     /// token that only looks like a column reference stays a plain term.
