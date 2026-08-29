@@ -3034,6 +3034,43 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
+    /// A file the filesystem will not let anyone write — a database on a
+    /// read-only mount, or one owned by someone else — is still openable and
+    /// readable. The refusal comes when a write is attempted, and it has to
+    /// arrive as an error rather than as a silent no-op.
+    #[cfg(unix)]
+    #[test]
+    fn a_file_that_cannot_be_written_reports_the_refusal() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (path, store) = fixture("unwritable", 3);
+        drop(store);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444)).unwrap();
+
+        let store = SqliteStore::open(&path).unwrap();
+        assert_eq!(store.count("t").unwrap(), 3, "reading is unaffected");
+
+        let err = store
+            .update_cell_keyed("t", &RowKey::Rowid(1), "name", "changed")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.to_lowercase().contains("readonly") || err.to_lowercase().contains("read-only"),
+            "the refusal names the reason: {err}"
+        );
+
+        // Nothing was written, and the session is not left claiming it has an
+        // edit waiting to be saved.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let check = SqliteStore::open(&path).unwrap();
+        let first: String = check
+            .conn
+            .query_row("SELECT name FROM t WHERE rowid = 1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(first, "kick-0", "the row is as it was");
+        let _ = std::fs::remove_file(&path);
+    }
+
     /// `--readonly` is a different connection, not a flag someone remembers to
     /// check: every write path has to be refused by SQLite itself, so no key
     /// handler can get through by accident.

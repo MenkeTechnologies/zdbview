@@ -871,6 +871,72 @@ mod tests {
         rkyv::to_bytes::<_, 1024>(&shard).unwrap().to_vec()
     }
 
+    /// The saved scan stores a format by name, so restoring it goes back through
+    /// the registry. A tag the user registered survives that round trip; one
+    /// nobody knows any more leaves the file listed but unnamed, rather than
+    /// dropping it or inventing a format for it.
+    #[test]
+    fn a_saved_scan_restores_a_user_registered_format_by_name() {
+        crate::magics::install_test_registry();
+        let root = tmpdir("cache_roundtrip");
+        let foreign = root.join("foreign.rkyv");
+        write(&foreign, &foreign_shard_bytes());
+        let known = root.join("known.db");
+        write(
+            &known,
+            &crate::formats::test_script_shard_bytes("/tmp/x.sh", b"b"),
+        );
+
+        let hits = collect(&root);
+        assert_eq!(hits.len(), 2);
+        let cache = root.join("scan");
+        save_cache_to(
+            &cache,
+            Save {
+                hits: &hits,
+                roots: &[Root::new(root.clone(), DEEP)],
+                complete: true,
+                unfinished: &[],
+            },
+        );
+
+        let restored = load_cache_from(&cache).expect("the index reads back");
+        let format_of = |name: &str| -> Option<&'static str> {
+            restored
+                .hits
+                .iter()
+                .find(|h| h.path.ends_with(name))
+                .expect("listed")
+                .format
+        };
+        assert_eq!(
+            format_of("foreign.rkyv"),
+            Some(crate::magics::TEST_TAG_NAME),
+            "a registered tag comes back named"
+        );
+        assert_eq!(format_of("known.db"), Some("zshrs script cache (ZRSC)"));
+
+        // A row naming a format nothing registers is still a file worth
+        // offering; it just has no name to show.
+        let text = std::fs::read_to_string(&cache).unwrap();
+        let rewritten = text.replace(crate::magics::TEST_TAG_NAME, "gone away cache (GONE)");
+        std::fs::write(&cache, rewritten).unwrap();
+        let restored = load_cache_from(&cache).expect("still reads back");
+        assert_eq!(restored.hits.len(), 2, "the file is still listed");
+        assert_eq!(format_of_in(&restored, "foreign.rkyv"), None);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn format_of_in(cached: &Cached, name: &str) -> Option<&'static str> {
+        cached
+            .hits
+            .iter()
+            .find(|h| h.path.ends_with(name))
+            .expect("listed")
+            .format
+    }
+
     /// The walk offers a foreign producer's shard, by name, on the strength of a
     /// registry entry alone — no copied archive type, no code that knows `LUAR`.
     #[test]

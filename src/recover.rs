@@ -979,6 +979,66 @@ mod tests {
         assert!(create_columns("CREATE VIEW v AS SELECT 1").is_empty());
     }
 
+    /// In WAL mode the database file holds the *pre-write* version of every page
+    /// the log has since rewritten, so a table created but never checkpointed is
+    /// not in the file at all. Recovery has to read the log on top, or it
+    /// recovers the past.
+    #[test]
+    fn recovery_reads_what_only_the_log_holds() {
+        let mut path = std::env::temp_dir();
+        path.push(format!("zdbview_recover_{}_wal.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(crate::wal::wal_path(&path));
+
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.pragma_update(None, "journal_mode", "WAL").unwrap();
+        conn.pragma_update(None, "wal_autocheckpoint", 0).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE only_in_log (name TEXT);
+             INSERT INTO only_in_log VALUES ('written'), ('but not checkpointed');",
+        )
+        .unwrap();
+
+        // The premise: the database file on its own does not have this table. A
+        // copy without the sidecar is what another reader of the file would see.
+        let orphan = path.with_extension("nolog.db");
+        std::fs::copy(&path, &orphan).unwrap();
+        let alone = rusqlite::Connection::open(&orphan).unwrap();
+        let table_count: i64 = alone
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE name = 'only_in_log'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            table_count, 0,
+            "the file alone must not have it, or this proves nothing"
+        );
+        drop(alone);
+
+        // Recovery reads the log on top and finds both the schema and the rows.
+        let recovered = super::recover(&path).expect("recovery");
+        assert!(
+            recovered.tables.iter().any(|t| t.name == "only_in_log"),
+            "the uncheckpointed schema is recovered: {:?}",
+            recovered.tables
+        );
+        let names: Vec<String> = recovered
+            .rows_for("only_in_log")
+            .filter_map(|r| match r.values.first() {
+                Some(Value::Text(t)) => Some(t.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(names, vec!["written", "but not checkpointed"]);
+
+        drop(conn);
+        let _ = std::fs::remove_file(&orphan);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(crate::wal::wal_path(&path));
+    }
+
     /// A database SQLite refuses to read is exactly what recovery is for: the
     /// pass reads rows out of the pages that are still there, without opening it.
     #[test]
