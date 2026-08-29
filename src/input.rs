@@ -182,4 +182,135 @@ mod tests {
             Edit::Pass
         );
     }
+
+    /// Ctrl-W stops at the start of the word before the cursor, having first
+    /// skipped whatever whitespace sits between — the behaviour the shell has,
+    /// and the one both prompts share because they run this code.
+    #[test]
+    fn ctrl_w_eats_one_word_and_the_space_before_the_cursor() {
+        let mut line = Line::at_end("select name from t");
+        assert_eq!(line.on_key(ctrl('w')), Edit::Took);
+        assert_eq!(line.buf, "select name from ");
+        assert_eq!(line.cur, line.buf.len());
+
+        // Trailing whitespace goes with the word, not instead of it.
+        let mut line = Line::at_end("select name    ");
+        line.on_key(ctrl('w'));
+        assert_eq!(line.buf, "select ");
+
+        // From the middle, only what is behind the cursor is touched.
+        let mut line = Line {
+            buf: "alpha beta gamma".into(),
+            cur: "alpha beta".len(),
+        };
+        line.on_key(ctrl('w'));
+        assert_eq!(line.buf, "alpha  gamma");
+        assert_eq!(line.cur, "alpha ".len());
+
+        // Nothing behind the cursor is nothing to delete.
+        let mut line = Line {
+            buf: "word".into(),
+            cur: 0,
+        };
+        line.on_key(ctrl('w'));
+        assert_eq!(line.buf, "word");
+        assert_eq!(line.cur, 0);
+
+        // A line of only spaces empties rather than looping.
+        let mut line = Line::at_end("    ");
+        line.on_key(ctrl('w'));
+        assert_eq!(line.buf, "");
+    }
+
+    /// Ctrl-U cuts back to the start, Ctrl-K forward to the end, and Home/End
+    /// (and their Ctrl-A/Ctrl-E spellings) put the cursor at either edge.
+    #[test]
+    fn the_line_kills_in_both_directions_from_where_the_cursor_is() {
+        let mut line = Line {
+            buf: "keep this half".into(),
+            cur: "keep ".len(),
+        };
+        line.on_key(ctrl('u'));
+        assert_eq!((line.buf.as_str(), line.cur), ("this half", 0));
+
+        let mut line = Line {
+            buf: "keep this half".into(),
+            cur: "keep ".len(),
+        };
+        line.on_key(ctrl('k'));
+        assert_eq!((line.buf.as_str(), line.cur), ("keep ", 5));
+
+        let mut line = Line::at_end("abc");
+        line.on_key(ctrl('a'));
+        assert_eq!(line.cur, 0);
+        line.on_key(ctrl('e'));
+        assert_eq!(line.cur, 3);
+        line.on_key(KeyEvent::from(KeyCode::Home));
+        assert_eq!(line.cur, 0);
+        line.on_key(KeyEvent::from(KeyCode::End));
+        assert_eq!(line.cur, 3);
+    }
+
+    /// Delete takes the character in front of the cursor, Backspace the one
+    /// behind it, and neither runs off the end of the line.
+    #[test]
+    fn delete_and_backspace_stop_at_the_edges() {
+        let mut line = Line {
+            buf: "abc".into(),
+            cur: 1,
+        };
+        line.on_key(KeyEvent::from(KeyCode::Delete));
+        assert_eq!((line.buf.as_str(), line.cur), ("ac", 1), "forward");
+        line.on_key(KeyEvent::from(KeyCode::Backspace));
+        assert_eq!((line.buf.as_str(), line.cur), ("c", 0), "backward");
+
+        // At either edge the key is taken and nothing happens.
+        line.cur = 0;
+        line.on_key(KeyEvent::from(KeyCode::Backspace));
+        assert_eq!(line.buf, "c");
+        line.cur = line.buf.len();
+        line.on_key(KeyEvent::from(KeyCode::Delete));
+        assert_eq!(line.buf, "c");
+    }
+
+    /// Multi-byte text is edited by characters. A cursor left inside one would
+    /// panic on the next insert, so every motion has to land on a boundary.
+    #[test]
+    fn multi_byte_text_is_never_split_by_a_motion() {
+        let mut line = Line::at_end("héllo→");
+        // The arrow is three bytes; one Left steps over all of it.
+        line.on_key(KeyEvent::from(KeyCode::Left));
+        assert_eq!(line.cur, "héllo".len());
+        line.on_key(KeyEvent::from(KeyCode::Left));
+        assert_eq!(line.cur, "héll".len());
+
+        // Inserting there keeps the string valid, which is the point.
+        line.on_key(key('x'));
+        assert_eq!(line.buf, "héllxo→");
+
+        // Backspace over a two-byte character removes the whole character.
+        let mut line = Line::at_end("é");
+        line.on_key(KeyEvent::from(KeyCode::Backspace));
+        assert_eq!(line.buf, "");
+        assert_eq!(line.cur, 0);
+
+        // And a cursor past the end is clamped rather than panicking.
+        let mut line = Line {
+            buf: "ab".into(),
+            cur: 99,
+        };
+        assert_eq!(line.on_key(key('c')), Edit::Took);
+        assert_eq!(line.buf, "abc");
+    }
+
+    /// A key the line has no use for is handed back, so the caller can act on it
+    /// rather than having it silently swallowed.
+    #[test]
+    fn an_unhandled_key_is_passed_back_to_the_caller() {
+        let mut line = Line::at_end("x");
+        assert_eq!(line.on_key(KeyEvent::from(KeyCode::Tab)), Edit::Pass);
+        assert_eq!(line.on_key(KeyEvent::from(KeyCode::F(5))), Edit::Pass);
+        assert_eq!(line.on_key(KeyEvent::from(KeyCode::Up)), Edit::Pass);
+        assert_eq!(line.buf, "x", "and the line is untouched");
+    }
 }
