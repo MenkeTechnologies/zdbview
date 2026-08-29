@@ -891,6 +891,22 @@ pub fn rename_record(
     }
 }
 
+/// Serialize a header-less hash-keyed shard holding `entries`. Test-only
+/// fixture, for the formats whose key is a content hash rather than a name.
+#[cfg(test)]
+pub(crate) fn test_hash_shard_bytes(entries: &[(u64, &[u8])]) -> Vec<u8> {
+    let shard = HashShard {
+        entries: entries
+            .iter()
+            .map(|(key, blob)| HashEntry {
+                key: *key,
+                blob: blob.to_vec(),
+            })
+            .collect(),
+    };
+    rkyv::to_bytes::<_, 4096>(&shard).unwrap().to_vec()
+}
+
 /// Serialize a zshrs script shard holding `entries`. Test-only fixture.
 #[cfg(test)]
 pub(crate) fn test_script_shard_bytes_many(entries: &[(String, Vec<u8>)]) -> Vec<u8> {
@@ -1134,6 +1150,99 @@ mod tests {
         let new_bytes = delete_record(&bytes, FormatKind::Hash, &key).expect("delete");
         let d = try_decode(&new_bytes).expect("valid");
         assert_eq!(d.records.len(), 1);
+    }
+
+    /// The README's promise, in its strongest form: an edited shard is not
+    /// merely readable by the producing host, it is byte for byte the shard that
+    /// host would have written itself. Anything less and a cache the shell
+    /// mmaps could differ from one it built.
+    #[test]
+    fn an_edit_writes_exactly_what_the_producer_would_have_written() {
+        let entry = |k: &str, v: &[u8]| (k.to_string(), v.to_vec());
+
+        // set_value: the same shard with one blob replaced.
+        let before =
+            test_script_shard_bytes_many(&[entry("/tmp/a.sh", b"one"), entry("/tmp/b.sh", b"two")]);
+        let expected =
+            test_script_shard_bytes_many(&[entry("/tmp/a.sh", b"ONE"), entry("/tmp/b.sh", b"two")]);
+        let edited = set_value(&before, FormatKind::Script, "/tmp/a.sh", b"ONE".to_vec()).unwrap();
+        assert_eq!(
+            edited, expected,
+            "an edited shard is the shard, not a copy of it"
+        );
+
+        // A no-op edit is a no-op on the bytes too, so writing back a record
+        // nobody changed cannot invalidate a cache.
+        let same = set_value(&before, FormatKind::Script, "/tmp/a.sh", b"one".to_vec()).unwrap();
+        assert_eq!(same, before);
+
+        // delete: the shard as if the record had never been written.
+        let three = test_script_shard_bytes_many(&[
+            entry("/tmp/a.sh", b"one"),
+            entry("/tmp/b.sh", b"two"),
+            entry("/tmp/c.sh", b"three"),
+        ]);
+        let without_b = test_script_shard_bytes_many(&[
+            entry("/tmp/a.sh", b"one"),
+            entry("/tmp/c.sh", b"three"),
+        ]);
+        assert_eq!(
+            delete_record(&three, FormatKind::Script, "/tmp/b.sh").unwrap(),
+            without_b
+        );
+
+        // rename: the same entry under a different key.
+        let renamed =
+            test_script_shard_bytes_many(&[entry("/tmp/z.sh", b"one"), entry("/tmp/b.sh", b"two")]);
+        assert_eq!(
+            rename_record(&before, FormatKind::Script, "/tmp/a.sh", "/tmp/z.sh").unwrap(),
+            renamed
+        );
+    }
+
+    /// Editing is a decode-mutate-encode round trip, so it has to survive being
+    /// repeated: a shard edited ten times must still be one the decoder reads,
+    /// with only the last value in it.
+    #[test]
+    fn repeated_edits_do_not_accumulate_anything() {
+        let mut bytes = test_script_shard_bytes_many(&[
+            ("/tmp/a.sh".to_string(), b"v0".to_vec()),
+            ("/tmp/b.sh".to_string(), b"keep".to_vec()),
+        ]);
+        for i in 1..=10 {
+            bytes = set_value(
+                &bytes,
+                FormatKind::Script,
+                "/tmp/a.sh",
+                format!("v{i}").into_bytes(),
+            )
+            .unwrap();
+        }
+        // The shard is rebuilt each time, never appended to, so ten edits leave
+        // exactly the shard a single write of the last value would have.
+        assert_eq!(
+            bytes,
+            test_script_shard_bytes_many(&[
+                ("/tmp/a.sh".to_string(), b"v10".to_vec()),
+                ("/tmp/b.sh".to_string(), b"keep".to_vec()),
+            ]),
+            "ten edits leave no residue"
+        );
+
+        let decoded = try_decode(&bytes).expect("still a shard");
+        assert_eq!(decoded.records.len(), 2);
+        let a = decoded
+            .records
+            .iter()
+            .find(|r| r.key == "/tmp/a.sh")
+            .expect("the edited record");
+        assert_eq!(a.value, b"v10", "only the last write survives");
+        let b = decoded
+            .records
+            .iter()
+            .find(|r| r.key == "/tmp/b.sh")
+            .expect("the untouched record");
+        assert_eq!(b.value, b"keep", "and the one nobody touched is untouched");
     }
 
     #[test]

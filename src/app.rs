@@ -8428,6 +8428,117 @@ mod tests {
         assert!(contains(&rows, "key"), "under its own label: {rows:#?}");
     }
 
+    /// The record keys `a`, `r` and `d` write to the file, not to a buffer — an
+    /// rkyv shard has no Write step. Each one is driven through the keyboard and
+    /// then checked by re-reading the file from disk, which is what the shell
+    /// that owns the cache would see.
+    #[test]
+    fn adding_renaming_and_deleting_a_record_reaches_the_file() {
+        let path = scratch("rkyv");
+        let recs: Vec<(String, Vec<u8>)> = ["one", "two"]
+            .iter()
+            .map(|n| (format!("/tmp/{n}.sh"), n.as_bytes().to_vec()))
+            .collect();
+        std::fs::write(&path, crate::formats::test_script_shard_bytes_many(&recs)).unwrap();
+        let store = Store::Rkyv(RkyvStore::open(&path).unwrap());
+        let mut app = App::with_theme(store, Theme::from_name(ThemeName::NeonSprawl));
+
+        let file = path.clone();
+        let on_disk = move || -> Vec<String> {
+            let bytes = std::fs::read(&file).unwrap();
+            let mut keys: Vec<String> = crate::formats::try_decode(&bytes)
+                .expect("still a shard")
+                .records
+                .iter()
+                .map(|r| r.key.clone())
+                .collect();
+            keys.sort();
+            keys
+        };
+        assert_eq!(on_disk(), vec!["/tmp/one.sh", "/tmp/two.sh"]);
+
+        // `a` asks for a key and adds the record it is given.
+        press(&mut app, 'a');
+        for c in "/tmp/three.sh".chars() {
+            press(&mut app, c);
+        }
+        app.on_key(KeyEvent::from(KeyCode::Enter));
+        assert_eq!(
+            on_disk(),
+            vec!["/tmp/one.sh", "/tmp/three.sh", "/tmp/two.sh"],
+            "the new key is in the file"
+        );
+
+        // `r` opens with the current key already in the prompt, so a rename is an
+        // edit of it rather than retyping.
+        app.record_idx = app
+            .decoded
+            .as_ref()
+            .unwrap()
+            .records
+            .iter()
+            .position(|r| r.key == "/tmp/three.sh")
+            .unwrap();
+        press(&mut app, 'r');
+        for _ in 0.."three.sh".len() {
+            app.on_key(KeyEvent::from(KeyCode::Backspace));
+        }
+        for c in "renamed.sh".chars() {
+            press(&mut app, c);
+        }
+        app.on_key(KeyEvent::from(KeyCode::Enter));
+        assert_eq!(
+            on_disk(),
+            vec!["/tmp/one.sh", "/tmp/renamed.sh", "/tmp/two.sh"],
+            "renamed in place, not duplicated"
+        );
+
+        // `d` asks first: anything but `y` leaves the record alone.
+        app.record_idx = app
+            .decoded
+            .as_ref()
+            .unwrap()
+            .records
+            .iter()
+            .position(|r| r.key == "/tmp/renamed.sh")
+            .unwrap();
+        press(&mut app, 'd');
+        press(&mut app, 'n');
+        assert_eq!(on_disk().len(), 3, "a refused delete deletes nothing");
+
+        press(&mut app, 'd');
+        press(&mut app, 'y');
+        assert_eq!(
+            on_disk(),
+            vec!["/tmp/one.sh", "/tmp/two.sh"],
+            "and a confirmed one removes exactly that record"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Rename is offered only where a key is a name. The header-less formats key
+    /// by a content hash, which is not something a user can rename, so the key
+    /// has to do nothing there rather than open a prompt that cannot be honoured.
+    #[test]
+    fn rename_is_refused_for_a_format_whose_key_is_a_hash() {
+        let path = scratch("rkyv");
+        std::fs::write(
+            &path,
+            crate::formats::test_hash_shard_bytes(&[(7, b"blob")]),
+        )
+        .unwrap();
+        let store = Store::Rkyv(RkyvStore::open(&path).unwrap());
+        let mut app = App::with_theme(store, Theme::from_name(ThemeName::NeonSprawl));
+        assert!(app.decoded.is_some(), "the shard decodes");
+
+        press(&mut app, 'r');
+        assert!(
+            !matches!(app.mode, super::Mode::RenameRecord(_)),
+            "no rename prompt for a hash-keyed record"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
     /// A shard from a producer nothing in this build knows, written the way
     /// `spec/rkyv-shard-header.md` says to write one.
     #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
@@ -9309,10 +9420,14 @@ mod tests {
             app.status
         );
 
-        // Wait for the thread, then install the result the way the loop does.
-        let rx = app.decoding.as_ref().unwrap();
-        let _ = rx.recv_timeout(std::time::Duration::from_secs(30));
-        app.poll_decode();
+        // Install the result the way the loop does: poll until it lands. Taking
+        // the message off the channel here instead would leave `poll_decode`
+        // waiting on the sender being dropped, which is the worker's own race.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while app.decoding.is_some() && std::time::Instant::now() < deadline {
+            app.poll_decode();
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
         assert!(
             app.decoding.is_none(),
             "the receiver is dropped once it lands"
