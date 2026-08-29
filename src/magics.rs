@@ -30,9 +30,48 @@ use std::sync::OnceLock;
 /// registry became extensible; the set is small and read once per process.
 static REGISTRY: OnceLock<Vec<(u32, &'static str)>> = OnceLock::new();
 
+/// A registry a test installed, which wins over the resolved one.
+static OVERRIDE: OnceLock<Vec<(u32, &'static str)>> = OnceLock::new();
+
 /// Every known tag with its display name, user entries included.
+///
+/// Under `cfg(test)` the user's own file is skipped and only the built-ins are
+/// resolved, so a developer who registered a tag on their machine cannot change
+/// what the suite asserts. Tests that want a registry install one explicitly
+/// with [`install`].
 pub fn all() -> &'static [(u32, &'static str)] {
-    REGISTRY.get_or_init(|| merge(crate::formats::BUILTIN_MAGICS, &user_entries()))
+    if let Some(installed) = OVERRIDE.get() {
+        return installed;
+    }
+    REGISTRY.get_or_init(|| {
+        if cfg!(test) {
+            crate::formats::BUILTIN_MAGICS.to_vec()
+        } else {
+            registry_for_entries(&user_entries())
+        }
+    })
+}
+
+/// The built-ins overlaid with the registry file at `path` — what the running
+/// binary resolves, addressable by path so a test can point it at a file it
+/// wrote instead of the user's.
+// Used by tests/magics.rs, which re-includes this module rather than linking it.
+#[allow(dead_code)]
+pub(crate) fn registry_for(path: &Path) -> Vec<(u32, &'static str)> {
+    registry_for_entries(&parse_file(path))
+}
+
+fn registry_for_entries(user: &[(u32, String)]) -> Vec<(u32, &'static str)> {
+    merge(crate::formats::BUILTIN_MAGICS, user)
+}
+
+/// Install `entries` as the registry [`all`] returns, for a test that needs
+/// everything reading through it to see a registry it controls. Takes precedence
+/// over the resolved one, so it holds whether or not something already read the
+/// registry. `false` if a registry was already installed.
+#[allow(dead_code)]
+pub(crate) fn install(entries: Vec<(u32, &'static str)>) -> bool {
+    OVERRIDE.set(entries).is_ok()
 }
 
 /// Display name for `magic`, or `None` when nothing has registered that tag.
@@ -46,7 +85,7 @@ pub fn by_name(name: &str) -> Option<&'static str> {
     all().iter().find(|(_, n)| *n == name).map(|(_, n)| *n)
 }
 
-fn registry_path() -> Option<PathBuf> {
+pub(crate) fn registry_path() -> Option<PathBuf> {
     let base = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))?;
