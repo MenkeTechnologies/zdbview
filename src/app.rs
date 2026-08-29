@@ -8451,6 +8451,173 @@ mod tests {
         assert!(contains(&rows, "key"), "under its own label: {rows:#?}");
     }
 
+    /// An archive edit writes a temp file and renames it, so a write that cannot
+    /// happen leaves the shard exactly as it was — no half-written file, no
+    /// leftover temp, and the session still holding what is on disk.
+    #[cfg(unix)]
+    #[test]
+    fn an_archive_write_that_fails_changes_nothing() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("zdbview_ro_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("shard.rkyv");
+        let recs = vec![
+            ("/tmp/one.sh".to_string(), b"one".to_vec()),
+            ("/tmp/two.sh".to_string(), b"two".to_vec()),
+        ];
+        let original = crate::formats::test_script_shard_bytes_many(&recs);
+        std::fs::write(&path, &original).unwrap();
+
+        let store = Store::Rkyv(RkyvStore::open(&path).unwrap());
+        let mut app = App::with_theme(store, Theme::from_name(ThemeName::NeonSprawl));
+        assert_eq!(app.decoded.as_ref().unwrap().records.len(), 2);
+
+        // Nothing can be created in the directory any more, so the temp file the
+        // write needs cannot be made.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+        press(&mut app, 'd');
+        press(&mut app, 'y');
+
+        assert!(
+            app.status.contains("write failed"),
+            "the failure is reported: {:?}",
+            app.status
+        );
+        assert_eq!(
+            app.decoded.as_ref().unwrap().records.len(),
+            2,
+            "and the session still shows what the file holds"
+        );
+
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            original,
+            "the shard on disk is untouched, not truncated"
+        );
+        let leftovers: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains("tmp"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "no temp file left behind: {leftovers:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A project is how a session is put down and picked up: the grid's hidden
+    /// columns, filter and sort, and the editor's statements, written by
+    /// `.project save` and restored by `.project open` into a session that knows
+    /// none of it.
+    #[test]
+    fn a_project_saves_a_session_and_puts_it_back() {
+        use crate::sqledit::Entry;
+        let path = scratch("db");
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE t (a TEXT, b TEXT, c TEXT);
+             INSERT INTO t VALUES ('keep1', 'x', 'p'), ('keep2', 'y', 'q'), ('other', 'z', 'r');",
+        )
+        .unwrap();
+        drop(conn);
+        let file = scratch("zdbp");
+
+        // Set a session up: a hidden column, a filter, a sort, a statement.
+        let mut app = App::with_theme(
+            Store::Sqlite(SqliteStore::open(&path).unwrap()),
+            Theme::from_name(ThemeName::NeonSprawl),
+        );
+        await_queries(&mut app);
+        app.on_key(KeyEvent::from(KeyCode::Tab));
+        app.on_key(KeyEvent::from(KeyCode::Right)); // the cursor on `b`
+        press(&mut app, 'H');
+        assert!(app.browse.view("t").is_hidden("b"), "the column is hidden");
+        press(&mut app, '/');
+        for ch in "keep".chars() {
+            press(&mut app, ch);
+        }
+        app.on_key(KeyEvent::from(KeyCode::Enter));
+        await_queries(&mut app);
+        press(&mut app, 's'); // sort on the cursor column
+        await_queries(&mut app);
+        let sort = app.sort.clone().expect("a sort is set");
+
+        // What a project records is the statement each tab is holding, not what
+        // has been run — so it is typed and left there.
+        press(&mut app, ':');
+        for ch in "SELECT a FROM t".chars() {
+            press(&mut app, ch);
+        }
+        app.execute_sql(&format!(".project save {}", file.display()));
+        let note = |app: &App| -> Vec<String> {
+            app.sql
+                .as_ref()
+                .unwrap()
+                .transcript()
+                .iter()
+                .rev()
+                .find_map(|e| match e {
+                    Entry::Note(lines) => Some(lines.clone()),
+                    _ => None,
+                })
+                .expect("a note")
+        };
+        assert!(
+            note(&app)[0].contains("wrote the project"),
+            "{:?}",
+            note(&app)
+        );
+        assert!(file.exists(), "the project file is written");
+
+        // A fresh session knows none of it until the project is opened.
+        let mut next = App::with_theme(
+            Store::Sqlite(SqliteStore::open(&path).unwrap()),
+            Theme::from_name(ThemeName::NeonSprawl),
+        );
+        await_queries(&mut next);
+        assert!(!next.browse.view("t").is_hidden("b"));
+        assert!(next.filter.is_empty() && next.sort.is_none());
+
+        press(&mut next, ':');
+        next.execute_sql(&format!(".project open {}", file.display()));
+        await_queries(&mut next);
+        assert!(
+            next.browse.view("t").is_hidden("b"),
+            "the hidden column comes back"
+        );
+        assert_eq!(next.filter, "keep", "and the filter");
+        assert_eq!(next.sort, Some(sort), "and the sort, in the same direction");
+        assert!(
+            next.sql
+                .as_ref()
+                .unwrap()
+                .all_statements()
+                .iter()
+                .any(|s| s.contains("SELECT a FROM t")),
+            "the editor's statement is put back in its tab"
+        );
+
+        // A file that is not a project says so rather than applying nothing.
+        let junk = scratch("zdbp");
+        std::fs::write(&junk, "just some text\n").unwrap();
+        next.execute_sql(&format!(".project open {}", junk.display()));
+        assert!(
+            note(&next)[0].contains("not a zdbview project"),
+            "{:?}",
+            note(&next)
+        );
+
+        for p in [path, file, junk] {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+
     /// The detail screen's value pane renders the same bytes four ways, and `v`
     /// cycles them. Auto is the one that has to decide: text that reads as text,
     /// bytes that do not as hex.
