@@ -464,6 +464,53 @@ mod tests {
         );
     }
 
+    /// Frames after the last commit are a transaction still being written: the
+    /// pages are in the log but nothing may read them yet, and the monitor says
+    /// so rather than counting them as landed.
+    #[test]
+    fn frames_past_the_last_commit_are_counted_as_uncommitted() {
+        let (path, conn) = wal_db("uncommitted", 3);
+        let settled = read_tail(&path, 64).expect("a log");
+        assert!(
+            settled.frames.last().unwrap().commit,
+            "a finished write ends on a commit"
+        );
+        assert_eq!(settled.uncommitted(), 0, "so nothing is in flight");
+
+        // Hold a transaction open past a page write: its frames reach the log
+        // with no commit frame behind them. SQLite only spills to the log when
+        // its page cache fills, so the cache is made tiny first.
+        conn.pragma_update(None, "cache_size", 1).unwrap();
+        let tx = conn.unchecked_transaction().unwrap();
+        for i in 0..2_000 {
+            tx.execute(
+                "INSERT INTO t (v) VALUES (?1)",
+                [format!("padding row {i}")],
+            )
+            .unwrap();
+        }
+        let open = read_tail(&path, 512).expect("a log");
+        assert!(
+            open.frames.len() > settled.frames.len(),
+            "the open transaction has already written pages"
+        );
+        assert!(
+            open.uncommitted() > 0,
+            "and they are reported as not yet committed"
+        );
+        assert!(
+            !open.frames.last().unwrap().commit,
+            "the newest frame is mid-transaction"
+        );
+
+        // Committing settles them.
+        tx.commit().unwrap();
+        let done = read_tail(&path, 512).expect("a log");
+        assert_eq!(done.uncommitted(), 0);
+        assert!(done.frames.last().unwrap().commit);
+        drop(conn);
+    }
+
     /// The monitor polls: it asks only for what arrived since its mark, and it
     /// has to notice a checkpoint, which resets the log and renumbers frames.
     #[test]

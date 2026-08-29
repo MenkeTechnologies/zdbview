@@ -8511,6 +8511,24 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Sizes are shown beside every file in the picker, so the units and the
+    /// rounding have to hold at the boundaries rather than roughly.
+    #[test]
+    fn sizes_read_in_the_unit_that_fits() {
+        use super::human_size;
+        assert_eq!(human_size(0), "0 B");
+        assert_eq!(human_size(1023), "1023 B", "bytes are exact, never rounded");
+        assert_eq!(human_size(1024), "1.0 K");
+        assert_eq!(human_size(1536), "1.5 K", "a decimal below ten");
+        assert_eq!(human_size(10 * 1024), "10 K", "and none above it");
+        assert_eq!(human_size(1024 * 1024), "1.0 M");
+        assert_eq!(human_size(1024 * 1024 * 1024), "1.0 G");
+        assert_eq!(human_size(1024u64.pow(4)), "1.0 T");
+        // Past the last unit it keeps counting in it rather than inventing one.
+        assert_eq!(human_size(1024u64.pow(5)), "1024 T");
+        assert_eq!(human_size(u64::MAX), "16777216 T");
+    }
+
     /// A project is how a session is put down and picked up: the grid's hidden
     /// columns, filter and sort, and the editor's statements, written by
     /// `.project save` and restored by `.project open` into a session that knows

@@ -979,6 +979,68 @@ mod tests {
         assert!(create_columns("CREATE VIEW v AS SELECT 1").is_empty());
     }
 
+    /// One page image, decoded without the file it came from — what the frame
+    /// browser does with a WAL payload. Page 1 is the case that bites: its
+    /// b-tree header sits 100 bytes in, behind the file header, so decoding it
+    /// as any other page reads the wrong byte for the page kind.
+    #[test]
+    fn a_page_image_decodes_on_its_own_and_page_one_is_offset() {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "zdbview_recover_{}_pageimage.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE t (a TEXT, b INTEGER);
+             INSERT INTO t VALUES ('first', 1), ('second', 2);",
+        )
+        .unwrap();
+        drop(conn);
+
+        let bytes = std::fs::read(&path).unwrap();
+        let page_size = u16::from_be_bytes([bytes[16], bytes[17]]) as usize;
+        let page = |n: usize| &bytes[(n - 1) * page_size..n * page_size];
+
+        // Page 1 holds the schema, and only reads as a leaf when the 100-byte
+        // file header is skipped.
+        let schema = super::decode_page_image(page(1), 1);
+        assert_eq!(schema.kind, PageKind::TableLeaf);
+        assert!(
+            !schema.rows.is_empty(),
+            "the schema row is a row like any other"
+        );
+        let misread = super::decode_page_image(page(1), 2);
+        assert_ne!(
+            misread.kind,
+            PageKind::TableLeaf,
+            "read as any other page, page 1 does not decode"
+        );
+
+        // The table's own page decodes to its rows, with rowids.
+        let leaf = (2..=(bytes.len() / page_size))
+            .map(|n| (n, super::decode_page_image(page(n), n as u32)))
+            .find(|(_, d)| d.rows.len() == 2)
+            .map(|(_, d)| d)
+            .expect("a page holding both rows");
+        assert_eq!(leaf.kind, PageKind::TableLeaf);
+        assert_eq!(leaf.rows[0].0, Some(1), "a table leaf carries the rowid");
+        assert_eq!(leaf.rows[0].1[0], Value::Text("first".into()));
+        assert_eq!(leaf.rows[1].1[1], Value::Int(2));
+        assert!(!leaf.overflowed, "nothing here spills onto another page");
+
+        // Anything that is not a b-tree page is reported as such rather than
+        // decoded into nonsense.
+        let junk = super::decode_page_image(&[0u8; 64], 7);
+        assert_eq!(junk.kind, PageKind::Other);
+        assert!(junk.rows.is_empty());
+        assert_eq!(PageKind::Other.label(), "overflow / freelist");
+        assert!(super::decode_page_image(&[], 1).rows.is_empty());
+
+        let _ = std::fs::remove_file(&path);
+    }
+
     /// Write attribution rests on this: a WAL frame carries a page number, and
     /// the page map says whose page that is. Read from the file, without asking
     /// SQLite, since the point is to attribute a write to a database nobody has

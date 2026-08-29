@@ -3034,6 +3034,61 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
+    /// The editor completes on table and column names, and this is where they
+    /// come from: every table with its columns, refreshed when the schema
+    /// changes so completion cannot offer a column that has been dropped.
+    #[test]
+    fn the_completion_source_lists_every_table_with_its_columns() {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "zdbview_sqlite_{}_schema_names.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE alpha (a TEXT, b INTEGER);
+             CREATE TABLE beta (\"odd name\" TEXT);
+             CREATE VIEW v AS SELECT a FROM alpha;",
+        )
+        .unwrap();
+        drop(conn);
+        let mut store = SqliteStore::open(&path).unwrap();
+
+        let names = store.schema_names();
+        let of = |t: &str| -> Vec<String> {
+            names
+                .iter()
+                .find(|(n, _)| n == t)
+                .map(|(_, c)| c.clone())
+                .unwrap_or_else(|| panic!("{t} is not listed: {names:?}"))
+        };
+        assert_eq!(of("alpha"), vec!["a", "b"]);
+        assert_eq!(
+            of("beta"),
+            vec!["odd name"],
+            "a quoted name comes back bare"
+        );
+        assert_eq!(of("v"), vec!["a"], "a view is completable too");
+
+        // A schema change is picked up once the store is told to forget what it
+        // knew — otherwise completion offers a column that no longer exists.
+        store.exec("ALTER TABLE alpha ADD COLUMN c TEXT").unwrap();
+        store.write_changes().unwrap();
+        store.invalidate();
+        assert_eq!(of2(&store, "alpha"), vec!["a", "b", "c"]);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    fn of2(store: &SqliteStore, table: &str) -> Vec<String> {
+        store
+            .schema_names()
+            .into_iter()
+            .find(|(n, _)| n == table)
+            .map(|(_, c)| c)
+            .unwrap_or_default()
+    }
+
     /// Cancellation is what makes a burst of keystrokes cost one query rather
     /// than one per key: a running statement is aborted from another thread by a
     /// flag the progress handler reads. Without it a 4-second scan would run to

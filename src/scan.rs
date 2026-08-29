@@ -871,6 +871,44 @@ mod tests {
         rkyv::to_bytes::<_, 1024>(&shard).unwrap().to_vec()
     }
 
+    /// `--rescan` throws the saved index away, so the next start walks the disk
+    /// instead of reading a file that says what it found last time.
+    #[test]
+    fn clearing_the_cache_removes_the_saved_index() {
+        let root = tmpdir("clear_cache");
+        let cache = root.join("scan");
+        write(&root.join("one.rkyv"), b"not a magic but named rkyv");
+        let hits = collect(&root);
+        save_cache_to(
+            &cache,
+            Save {
+                hits: &hits,
+                roots: &[Root::new(root.clone(), DEEP)],
+                complete: true,
+                unfinished: &[],
+            },
+        );
+        assert!(
+            load_cache_from(&cache).is_some(),
+            "there is an index to clear"
+        );
+
+        std::fs::remove_file(&cache).unwrap();
+        assert!(
+            load_cache_from(&cache).is_none(),
+            "and once it is gone the next start has nothing to read"
+        );
+        // A missing index is not an error, and neither is a damaged one.
+        write(&cache, b"# zdbview scan 999 0 1\nnonsense\n");
+        assert!(
+            load_cache_from(&cache).is_none(),
+            "an index from another version is not read"
+        );
+        write(&cache, b"not even a header");
+        assert!(load_cache_from(&cache).is_none());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// The saved scan stores a format by name, so restoring it goes back through
     /// the registry. A tag the user registered survives that round trip; one
     /// nobody knows any more leaves the file listed but unnamed, rather than
