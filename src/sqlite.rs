@@ -2962,4 +2962,165 @@ mod tests {
         assert_eq!(store.columns("t").unwrap(), vec!["name", "n", "extra"]);
         let _ = std::fs::remove_file(path);
     }
+
+    /// A table with no rowid keys its rows by primary key instead, and an edit
+    /// has to reach exactly the row it was aimed at even when every other column
+    /// looks the same.
+    #[test]
+    fn an_edit_on_a_rowid_less_table_hits_one_row() {
+        let mut path = std::env::temp_dir();
+        path.push(format!("zdbview_sqlite_{}_norowid.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE k (id TEXT PRIMARY KEY, note TEXT) WITHOUT ROWID;
+             INSERT INTO k VALUES ('a', 'same'), ('b', 'same'), ('c', 'same');",
+        )
+        .unwrap();
+        drop(conn);
+        let store = SqliteStore::open(&path).unwrap();
+
+        let view = store.rows(&page("k", 10, 0, "", None, None)).unwrap();
+        assert_eq!(view.primary_key, vec!["id"], "the key is the handle here");
+        assert!(
+            view.rowids.iter().all(Option::is_none),
+            "and there is no rowid to fall back on"
+        );
+
+        let key = RowKey::Primary(vec![("id".into(), "b".into())]);
+        assert_eq!(store.update_cell_keyed("k", &key, "note", "edited").unwrap(), 1);
+        store.write_changes().unwrap();
+
+        let after = store.rows(&page("k", 10, 0, "", None, None)).unwrap();
+        assert_eq!(
+            after.rows,
+            vec![
+                vec!["a".to_string(), "same".to_string()],
+                vec!["b".to_string(), "edited".to_string()],
+                vec!["c".to_string(), "same".to_string()],
+            ],
+            "one row changed, the identical-looking ones untouched"
+        );
+
+        assert_eq!(store.delete_row_keyed("k", &key).unwrap(), 1);
+        store.write_changes().unwrap();
+        assert_eq!(store.count("k").unwrap(), 2);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Nothing an edit does reaches the file until it is written, and reverting
+    /// puts the database back where it was — the Write/Revert model the grid is
+    /// built on.
+    #[test]
+    fn unwritten_edits_are_invisible_to_another_connection_and_revert_cleanly() {
+        let (path, mut store) = fixture("pending", 20);
+        assert!(!store.has_pending(), "a fresh store owes nothing");
+
+        let key = RowKey::Rowid(1);
+        store.update_cell_keyed("t", &key, "name", "changed").unwrap();
+        assert!(store.has_pending(), "the edit is held, not written");
+
+        // A second connection sees the database as it was.
+        let other = Connection::open(&path).unwrap();
+        let seen: String = other
+            .query_row("SELECT name FROM t WHERE rowid = 1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(seen, "kick-0", "unwritten edits stay on their own connection");
+
+        assert!(store.revert_changes().unwrap(), "there was something to revert");
+        assert!(!store.has_pending());
+        assert!(!store.revert_changes().unwrap(), "and nothing left after that");
+        let restored: String = other
+            .query_row("SELECT name FROM t WHERE rowid = 1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(restored, "kick-0");
+
+        // Write, and the other connection sees it.
+        store.update_cell_keyed("t", &key, "name", "written").unwrap();
+        assert!(store.write_changes().unwrap());
+        assert!(!store.write_changes().unwrap(), "nothing to write twice");
+        let seen: String = other
+            .query_row("SELECT name FROM t WHERE rowid = 1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(seen, "written");
+        drop(other);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Bytes are not text: a blob has to survive the round trip through the hex
+    /// editor without being decoded, re-encoded, or truncated at its first NUL.
+    #[test]
+    fn a_blob_round_trips_through_the_keyed_edit() {
+        let (path, store) = fixture("blobs", 5);
+        let key = RowKey::Rowid(1);
+        // Every byte value, so nothing about it is valid UTF-8 or NUL-free.
+        let bytes: Vec<u8> = (0..=255u8).collect();
+        assert_eq!(
+            store.update_cell_blob_keyed("t", &key, "name", &bytes).unwrap(),
+            1
+        );
+        store.write_changes().unwrap();
+
+        assert!(store.cell_is_blob_keyed("t", &key, "name").unwrap());
+        assert_eq!(store.cell_bytes_keyed("t", &key, "name").unwrap(), bytes);
+
+        // The grid cannot show raw bytes, so it says what they are rather than
+        // pretending they are text.
+        let view = store.rows(&page("t", 1, 0, "", None, None)).unwrap();
+        assert_eq!(view.rows[0][0], "<blob 256 bytes>");
+        // The export path cannot do that: a dump has to carry the bytes, so
+        // there the same cell is the SQL literal for them.
+        let literal = &store.literal_rows("t").unwrap()[0][0];
+        assert!(literal.starts_with("x'000102"), "{literal}");
+        assert!(literal.ends_with("fdfeff'"), "{literal}");
+
+        // Text in the same column is not a blob, and reads back as its bytes.
+        store.update_cell_keyed("t", &key, "name", "plain").unwrap();
+        store.write_changes().unwrap();
+        assert!(!store.cell_is_blob_keyed("t", &key, "name").unwrap());
+        assert_eq!(store.cell_bytes_keyed("t", &key, "name").unwrap(), b"plain");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// NULL is not the empty string, and the two must not be confused by a path
+    /// that binds every value as text.
+    #[test]
+    fn setting_a_cell_to_null_is_not_setting_it_to_empty() {
+        let (path, store) = fixture("nulls", 5);
+        let key = RowKey::Rowid(1);
+        store.update_cell_keyed("t", &key, "name", "").unwrap();
+        store.write_changes().unwrap();
+        let is_null: bool = store
+            .conn
+            .query_row("SELECT name IS NULL FROM t WHERE rowid = 1", [], |r| r.get(0))
+            .unwrap();
+        assert!(!is_null, "an empty string is a value");
+
+        store.update_cell_null("t", &key, "name").unwrap();
+        store.write_changes().unwrap();
+        let is_null: bool = store
+            .conn
+            .query_row("SELECT name IS NULL FROM t WHERE rowid = 1", [], |r| r.get(0))
+            .unwrap();
+        assert!(is_null, "and NULL is the absence of one");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A quote or a newline in the data is data, not syntax — the whole reason
+    /// values bind as parameters.
+    #[test]
+    fn punctuation_in_a_value_is_data_not_syntax() {
+        let (path, store) = fixture("quoting", 5);
+        let nasty = "o'brien\n\"quoted\"; DROP TABLE t; --";
+        let key = RowKey::Rowid(1);
+        assert_eq!(store.update_cell_keyed("t", &key, "name", nasty).unwrap(), 1);
+        store.write_changes().unwrap();
+        assert_eq!(store.count("t").unwrap(), 5, "the table is still there");
+        let back: String = store
+            .conn
+            .query_row("SELECT name FROM t WHERE rowid = 1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(back, nasty, "stored exactly as typed");
+        let _ = std::fs::remove_file(&path);
+    }
 }
