@@ -5820,6 +5820,19 @@ impl App {
                 )));
             }
             None => {
+                // A registered tag still names the file even with no decoder for
+                // it: knowing whose archive this is is most of what the tag is
+                // for, and the scan already offers it under that name.
+                if let Some(name) = formats::magic_in(&r.bytes) {
+                    lines.push(Line::from(vec![
+                        Span::styled("format:  ", Style::default().fg(self.ov.theme.dim)),
+                        Span::styled(name.to_string(), Style::default().fg(self.ov.theme.label)),
+                    ]));
+                    lines.push(Line::from(Span::styled(
+                        "registered magic, no decoder in this build.",
+                        Style::default().fg(self.ov.theme.dim),
+                    )));
+                }
                 lines.push(Line::from(""));
                 lines.push(Line::from(Span::styled(
                     "unrecognized rkyv archive: no matching format decoder.",
@@ -8323,6 +8336,60 @@ mod tests {
         // While still scanning, it says so instead.
         let rows = render(&[], Some(0));
         assert!(contains(&rows, "Scanning for databases"));
+    }
+
+    /// A shard from a producer nothing in this build knows, written the way
+    /// `spec/rkyv-shard-header.md` says to write one.
+    #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+    #[archive(check_bytes)]
+    struct ForeignHeader {
+        magic: u32,
+        format_version: u32,
+        producer_version: String,
+        pointer_width: u32,
+        built_at_secs: u64,
+    }
+
+    #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+    #[archive(check_bytes)]
+    struct ForeignShard {
+        header: ForeignHeader,
+        entries: std::collections::HashMap<String, Vec<u8>>,
+    }
+
+    /// The screen a user lands on for a registered tag this build cannot decode:
+    /// it says whose archive it is rather than only that it is unknown, which is
+    /// the whole return on registering a tag with no decoder behind it.
+    #[test]
+    fn the_info_screen_names_a_tag_only_the_user_registered() {
+        crate::magics::install_test_registry();
+        let mut entries = std::collections::HashMap::new();
+        entries.insert("/tmp/init.lua".to_string(), b"compiled".to_vec());
+        let shard = ForeignShard {
+            header: ForeignHeader {
+                magic: crate::magics::TEST_TAG,
+                format_version: 1,
+                producer_version: "0.1.0".into(),
+                pointer_width: 8,
+                built_at_secs: 7,
+            },
+            entries,
+        };
+        let bytes = rkyv::to_bytes::<_, 1024>(&shard).unwrap().to_vec();
+
+        let mut app = rkyv_app_with(&bytes);
+        app.rkyv_view = super::RkyvView::Info;
+        let rows = frame_rows(&mut app, 100, 24);
+        assert!(
+            contains(&rows, crate::magics::TEST_TAG_NAME),
+            "the Info screen names the registered producer: {rows:#?}"
+        );
+        assert!(
+            contains(&rows, "registered magic, no decoder in this build"),
+            "and says why there are no records: {rows:#?}"
+        );
+        // No decoder exists, so the structural views are still what it offers.
+        assert!(contains(&rows, "unrecognized rkyv archive"));
     }
 
     /// `/` filters the list as the pattern is typed — the iftoprs model — instead

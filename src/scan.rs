@@ -853,7 +853,7 @@ mod tests {
     }
 
     /// `LUAR`, a tag this build has never heard of.
-    const FOREIGN_MAGIC: u32 = 0x4C55_4152;
+    const FOREIGN_MAGIC: u32 = crate::magics::TEST_TAG;
 
     fn foreign_shard_bytes() -> Vec<u8> {
         let mut entries = std::collections::HashMap::new();
@@ -882,9 +882,7 @@ mod tests {
             "LUAR must not be a built-in, or this proves nothing"
         );
         // Register it the way a user's config file does, then walk.
-        let mut registry = crate::formats::BUILTIN_MAGICS.to_vec();
-        registry.push((FOREIGN_MAGIC, "luars bytecode cache (LUAR)"));
-        crate::magics::install(registry);
+        crate::magics::install_test_registry();
 
         let root = tmpdir("foreign");
         write(&root.join("init.rkyv"), &foreign_shard_bytes());
@@ -894,7 +892,7 @@ mod tests {
         assert_eq!(hits[0].kind, Kind::Rkyv);
         assert_eq!(
             hits[0].format,
-            Some("luars bytecode cache (LUAR)"),
+            Some(crate::magics::TEST_TAG_NAME),
             "named by the registry, not by a decoder"
         );
         assert_eq!(hits[0].rank, 0, "ranked as a recognized shard, not as noise");

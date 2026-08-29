@@ -74,6 +74,24 @@ pub(crate) fn install(entries: Vec<(u32, &'static str)>) -> bool {
     OVERRIDE.set(entries).is_ok()
 }
 
+/// The tag the in-crate tests register: `LUAR`, which no zdbview build ships.
+#[cfg(test)]
+pub(crate) const TEST_TAG: u32 = 0x4C55_4152;
+#[cfg(test)]
+pub(crate) const TEST_TAG_NAME: &str = "luars bytecode cache (LUAR)";
+
+/// Register [`TEST_TAG`] the way a user's file would, and return the registry.
+/// Idempotent, because the tests that need a foreign tag live in several modules
+/// of one test binary and the registry resolves exactly once.
+#[cfg(test)]
+pub(crate) fn install_test_registry() -> &'static [(u32, &'static str)] {
+    OVERRIDE.get_or_init(|| {
+        let mut v = crate::formats::BUILTIN_MAGICS.to_vec();
+        v.push((TEST_TAG, TEST_TAG_NAME));
+        v
+    })
+}
+
 /// Display name for `magic`, or `None` when nothing has registered that tag.
 pub fn name_of(magic: u32) -> Option<&'static str> {
     all().iter().find(|(m, _)| *m == magic).map(|(_, n)| *n)

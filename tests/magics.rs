@@ -178,8 +178,13 @@ fn registering_a_tag_does_not_disturb_the_built_ins() {
     assert_eq!(reg.len(), formats::BUILTIN_MAGICS.len() + 2);
 }
 
+/// The two tests below rewrite the process environment, which every thread in
+/// this binary shares, so they take turns.
+static ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[test]
 fn the_registry_file_is_the_documented_path() {
+    let _guard = ENV.lock().unwrap_or_else(|e| e.into_inner());
     // Where a user is told to put the file, in README and the man page.
     let prior = std::env::var_os("XDG_CONFIG_HOME");
     let home = std::env::temp_dir().join("zdbview_home_probe");
@@ -190,6 +195,30 @@ fn the_registry_file_is_the_documented_path() {
         None => std::env::remove_var("XDG_CONFIG_HOME"),
     }
     assert_eq!(got, Some(home.join("zdbview").join("magics")));
+}
+
+#[test]
+fn without_xdg_the_registry_falls_back_under_home() {
+    let _guard = ENV.lock().unwrap_or_else(|e| e.into_inner());
+    let prior_xdg = std::env::var_os("XDG_CONFIG_HOME");
+    let prior_home = std::env::var_os("HOME");
+    let home = std::env::temp_dir().join("zdbview_home_fallback");
+    std::env::remove_var("XDG_CONFIG_HOME");
+    std::env::set_var("HOME", &home);
+    let got = magics::registry_path();
+    match prior_xdg {
+        Some(p) => std::env::set_var("XDG_CONFIG_HOME", p),
+        None => std::env::remove_var("XDG_CONFIG_HOME"),
+    }
+    match prior_home {
+        Some(p) => std::env::set_var("HOME", p),
+        None => std::env::remove_var("HOME"),
+    }
+    assert_eq!(
+        got,
+        Some(home.join(".config").join("zdbview").join("magics")),
+        "the path README and the man page name when XDG_CONFIG_HOME is unset"
+    );
 }
 
 /// The proof that owes nothing to a test seam: the shipped binary, a config file
