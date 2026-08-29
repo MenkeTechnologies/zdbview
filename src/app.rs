@@ -8428,6 +8428,105 @@ mod tests {
         assert!(contains(&rows, "key"), "under its own label: {rows:#?}");
     }
 
+    /// `x` on the grid writes what the grid is showing — under its filter, not
+    /// the whole table — as CSV named after the table.
+    #[test]
+    fn x_exports_the_filtered_grid_as_csv() {
+        let path = scratch("db");
+        // A table name of its own, since the file lands in the working directory
+        // and the tests run at once.
+        let table = format!("export_{}", std::process::id());
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(&format!("CREATE TABLE {table} (a TEXT, b TEXT)"))
+            .unwrap();
+        for i in 0..6 {
+            conn.execute(
+                &format!("INSERT INTO {table} VALUES (?1, 'same')"),
+                [format!("row{i}")],
+            )
+            .unwrap();
+        }
+        drop(conn);
+        let store = Store::Sqlite(SqliteStore::open(&path).unwrap());
+        let mut app = App::with_theme(store, Theme::from_name(ThemeName::NeonSprawl));
+        await_queries(&mut app);
+
+        // Narrow the grid, then export it.
+        press(&mut app, '/');
+        for c in "row3".chars() {
+            press(&mut app, c);
+        }
+        app.on_key(KeyEvent::from(KeyCode::Enter));
+        await_queries(&mut app);
+        press(&mut app, 'x');
+
+        let out = std::path::PathBuf::from(format!("{table}.csv"));
+        assert!(out.exists(), "named after the table: {out:?}");
+        let csv = std::fs::read_to_string(&out).unwrap();
+        assert!(csv.starts_with("a,b\n"), "the header comes first: {csv}");
+        assert!(csv.contains("row3,same"), "{csv}");
+        assert!(
+            !csv.contains("row4"),
+            "only what the filter leaves is exported: {csv}"
+        );
+        assert!(
+            app.status.contains("exported 1 rows"),
+            "got {:?}",
+            app.status
+        );
+
+        let _ = std::fs::remove_file(&out);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// `x` on an archive writes every record as JSON into a file named after the
+    /// shard, in the working directory — what the README promises. The value is
+    /// bytes, so it goes as hex rather than as a lossy string.
+    #[test]
+    fn x_exports_every_record_as_json_next_to_the_working_directory() {
+        let path = scratch("rkyv");
+        let recs: Vec<(String, Vec<u8>)> = vec![
+            ("/tmp/one.sh".to_string(), vec![0x00, 0xff]),
+            ("/tmp/two.sh".to_string(), b"text".to_vec()),
+        ];
+        std::fs::write(&path, crate::formats::test_script_shard_bytes_many(&recs)).unwrap();
+        let store = Store::Rkyv(RkyvStore::open(&path).unwrap());
+        let mut app = App::with_theme(store, Theme::from_name(ThemeName::NeonSprawl));
+
+        press(&mut app, 'x');
+        let stem = path.file_stem().unwrap().to_str().unwrap();
+        let out = std::path::PathBuf::from(format!("{stem}.records.json"));
+        assert!(out.exists(), "the file is named after the shard: {out:?}");
+        assert!(
+            app.status.contains("exported 2 records"),
+            "and the status says so: {:?}",
+            app.status
+        );
+
+        let json = std::fs::read_to_string(&out).unwrap();
+        assert!(json.contains("\"/tmp/one.sh\""), "{json}");
+        assert!(
+            json.contains("00ff"),
+            "a blob value goes as hex, not as lossy text: {json}"
+        );
+        let _ = std::fs::remove_file(&out);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// There is nothing to export from an archive with no decoder, and saying so
+    /// beats writing an empty file the user would have to notice was empty.
+    #[test]
+    fn x_on_an_unrecognized_archive_writes_nothing() {
+        let mut app = rkyv_app_with(b"not a shard, just bytes with no magic at all");
+        assert!(app.decoded.is_none());
+        press(&mut app, 'x');
+        assert!(
+            app.status.contains("nothing to export"),
+            "got {:?}",
+            app.status
+        );
+    }
+
     /// The record keys `a`, `r` and `d` write to the file, not to a buffer — an
     /// rkyv shard has no Write step. Each one is driven through the keyboard and
     /// then checked by re-reading the file from disk, which is what the shell

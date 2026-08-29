@@ -3034,6 +3034,96 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
+    /// The grid's filter language, against a real table: a bare word matches any
+    /// column, `name:value` restricts to that column, terms are ANDed, and a
+    /// token that only looks like a column reference stays a plain term.
+    #[test]
+    fn the_filter_language_means_what_it_says() {
+        let mut path = std::env::temp_dir();
+        path.push(format!("zdbview_sqlite_{}_filters.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE t (cwd TEXT, cmd TEXT, at TEXT);
+             INSERT INTO t VALUES
+               ('/home/zshrs',  'echo hi',    '12:30'),
+               ('/home/zshrs',  'grep it',    '13:00'),
+               ('/home/other',  'echo there', '12:30'),
+               ('/home/other',  'http://x',   '14:00');",
+        )
+        .unwrap();
+        drop(conn);
+        let store = SqliteStore::open(&path).unwrap();
+        let count = |filter: &str| store.count_exact("t", filter).unwrap();
+
+        // A bare word matches any column.
+        assert_eq!(count("zshrs"), 2);
+        assert_eq!(count("echo"), 2);
+        // `column:value` restricts to that one, case-insensitively named.
+        assert_eq!(count("cwd:zshrs"), 2);
+        assert_eq!(
+            count("CWD:zshrs"),
+            2,
+            "the column name is not case-sensitive"
+        );
+        assert_eq!(
+            count("cmd:zshrs"),
+            0,
+            "the value is looked for in that column only"
+        );
+        // Terms are ANDed.
+        assert_eq!(count("cwd:zshrs echo"), 1);
+        assert_eq!(count("zshrs there"), 0);
+        // A token whose left side is not a column stays a plain term, so a time
+        // and a URL are searchable as themselves.
+        assert_eq!(count("12:30"), 2);
+        assert_eq!(count("http://x"), 1);
+        // An empty filter is every row, and a trailing colon is not a column
+        // reference.
+        assert_eq!(count(""), 4);
+        assert_eq!(count("   "), 4);
+        assert_eq!(count("cwd:"), 0, "'cwd:' matches nothing as a literal");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A filter is text the user typed, not a pattern language: `%` and `_` are
+    /// LIKE wildcards and have to be escaped, or filtering for a literal `%`
+    /// silently matches everything.
+    #[test]
+    fn wildcards_in_a_filter_are_literal_text() {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "zdbview_sqlite_{}_wildcards.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE t (v TEXT);
+             INSERT INTO t VALUES ('100%'), ('a_b'), ('axb'), ('plain'), ('back\\slash');",
+        )
+        .unwrap();
+        drop(conn);
+        let store = SqliteStore::open(&path).unwrap();
+        let count = |filter: &str| store.count_exact("t", filter).unwrap();
+
+        assert_eq!(
+            count("%"),
+            1,
+            "'%' is the row holding a percent, not every row"
+        );
+        assert_eq!(count("100%"), 1);
+        assert_eq!(
+            count("a_b"),
+            1,
+            "'_' matches an underscore, not any character"
+        );
+        assert_eq!(count("axb"), 1);
+        // The escape character itself is data too.
+        assert_eq!(count("back\\slash"), 1);
+        let _ = std::fs::remove_file(&path);
+    }
+
     /// A table with no rowid keys its rows by primary key instead, and an edit
     /// has to reach exactly the row it was aimed at even when every other column
     /// looks the same.
