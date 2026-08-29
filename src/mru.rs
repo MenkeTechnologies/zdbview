@@ -138,3 +138,104 @@ pub fn rel_age(t: SystemTime) -> String {
         format!("{}d ago", secs / 86400)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{load_path, record_path, rel_age, CAP};
+    use crate::store::Kind;
+    use std::path::PathBuf;
+    use std::time::{Duration, SystemTime};
+
+    fn scratch(name: &str) -> PathBuf {
+        let mut p = std::env::temp_dir();
+        p.push(format!("zdbview_mru_{}_{}", std::process::id(), name));
+        let _ = std::fs::remove_file(&p);
+        p
+    }
+
+    #[test]
+    fn the_list_stops_at_the_cap_and_drops_the_oldest() {
+        let store = scratch("cap");
+        let dir = scratch("cap_dir");
+        std::fs::create_dir_all(&dir).unwrap();
+        // One more file than the list holds, recorded oldest-first.
+        let files: Vec<PathBuf> = (0..CAP + 5)
+            .map(|i| {
+                let p = dir.join(format!("f{i}.db"));
+                std::fs::write(&p, b"x").unwrap();
+                record_path(&store, &p, Kind::Sqlite);
+                p
+            })
+            .collect();
+
+        let entries = load_path(&store);
+        assert_eq!(entries.len(), CAP, "the cap is the cap");
+        // Most-recent-first, so the newest is at the front and the first five
+        // recorded are gone.
+        let newest = std::fs::canonicalize(files.last().unwrap()).unwrap();
+        assert_eq!(entries[0].path, newest);
+        let oldest_kept = std::fs::canonicalize(&files[5]).unwrap();
+        assert_eq!(entries[CAP - 1].path, oldest_kept);
+        assert!(
+            !entries
+                .iter()
+                .any(|e| e.path == std::fs::canonicalize(&files[4]).unwrap()),
+            "what fell off the end is gone"
+        );
+
+        let _ = std::fs::remove_file(&store);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_damaged_line_costs_only_itself() {
+        let store = scratch("damaged");
+        std::fs::write(
+            &store,
+            "not a record\n\
+             xyz\tsqlite\t/tmp/bad-timestamp.db\n\
+             12\tmysql\t/tmp/unknown-kind.db\n\
+             34\tsqlite\n\
+             56\trkyv\t/tmp/good.rkyv\n",
+        )
+        .unwrap();
+
+        let entries = load_path(&store);
+        assert_eq!(entries.len(), 1, "only the well-formed line survives");
+        assert_eq!(entries[0].path, PathBuf::from("/tmp/good.rkyv"));
+        assert_eq!(entries[0].kind, Kind::Rkyv);
+        let _ = std::fs::remove_file(&store);
+    }
+
+    #[test]
+    fn a_path_holding_a_tab_is_read_back_whole() {
+        // The line is three tab-separated fields, so a tab in the path — legal
+        // on every platform zdbview runs on — must not split it further.
+        let store = scratch("tabbed");
+        std::fs::write(&store, "7\tsqlite\t/tmp/od\td\tname.db\n").unwrap();
+        let entries = load_path(&store);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].path, PathBuf::from("/tmp/od\td\tname.db"));
+        let _ = std::fs::remove_file(&store);
+    }
+
+    #[test]
+    fn a_missing_list_is_empty_rather_than_an_error() {
+        let store = scratch("absent");
+        assert!(load_path(&store).is_empty());
+    }
+
+    #[test]
+    fn ages_read_in_the_largest_unit_that_fits() {
+        let ago = |secs: u64| rel_age(SystemTime::now() - Duration::from_secs(secs));
+        assert_eq!(ago(0), "0s ago");
+        assert_eq!(ago(59), "59s ago");
+        assert_eq!(ago(60), "1m ago");
+        assert_eq!(ago(3599), "59m ago");
+        assert_eq!(ago(3600), "1h ago");
+        assert_eq!(ago(86_399), "23h ago");
+        assert_eq!(ago(86_400), "1d ago");
+        // A timestamp in the future is not a negative age.
+        assert_eq!(rel_age(SystemTime::now() + Duration::from_secs(600)), "0s ago");
+    }
+}

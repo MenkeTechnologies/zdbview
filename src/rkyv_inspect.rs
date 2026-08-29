@@ -107,3 +107,81 @@ impl RkyvStore {
         crate::hexedit::hex_dump_line(offset, chunk)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{RkyvStore, MAX_STRING_HITS};
+    use std::sync::Arc;
+
+    fn store(bytes: &[u8]) -> RkyvStore {
+        RkyvStore {
+            path: std::path::PathBuf::from("/tmp/in-memory"),
+            bytes: Arc::from(bytes.to_vec()),
+        }
+    }
+
+    #[test]
+    fn runs_shorter_than_the_minimum_are_not_hits() {
+        // "ab" (2) then "hello" (5), separated by bytes that are not printable.
+        let s = store(b"\x00ab\x00hello\x00");
+        let hits = s.strings(3).hits;
+        assert_eq!(hits.len(), 1, "only the run that is long enough");
+        assert_eq!(hits[0].text, "hello");
+        assert_eq!(hits[0].offset, 4, "the offset is where the run starts");
+        // Lower the bar and both runs count.
+        assert_eq!(s.strings(2).hits.len(), 2);
+    }
+
+    #[test]
+    fn a_run_that_reaches_the_end_of_the_file_is_still_a_hit() {
+        // The scan closes a run when it meets a non-printable byte; a file that
+        // ends mid-run has to be closed by the end of the file instead.
+        let s = store(b"\x00trailing");
+        let hits = s.strings(4).hits;
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].text, "trailing");
+        assert_eq!(hits[0].offset, 1);
+    }
+
+    #[test]
+    fn printable_is_space_through_tilde() {
+        // The boundaries either side: 0x1f and 0x7f are not text, 0x20 and 0x7e
+        // are. A tab and a newline are separators here, not characters.
+        let s = store(b"\x1f\x20\x7e\x7f\x00a\tb\nc");
+        let hits = s.strings(1).hits;
+        let texts: Vec<&str> = hits.iter().map(|h| h.text.as_str()).collect();
+        assert_eq!(texts, vec![" ~", "a", "b", "c"]);
+    }
+
+    #[test]
+    fn too_many_runs_stops_the_scan_and_says_so() {
+        // One more run than the list holds, each two bytes with a separator.
+        let mut bytes = Vec::new();
+        for _ in 0..MAX_STRING_HITS + 1 {
+            bytes.extend_from_slice(b"ab\x00");
+        }
+        let s = store(&bytes);
+        let got = s.strings(2);
+        assert_eq!(got.hits.len(), MAX_STRING_HITS, "capped");
+        assert!(got.truncated, "and the view is told the list is partial");
+
+        // A file whose runs all fit is not reported as truncated.
+        let small = store(b"\x00hello\x00world\x00");
+        let got = small.strings(3);
+        assert_eq!(got.hits.len(), 2);
+        assert!(!got.truncated);
+        assert_eq!(got.scanned, small.len());
+    }
+
+    #[test]
+    fn a_hex_row_stops_at_the_end_of_the_file() {
+        let s = store(b"0123456789");
+        // A full row's worth is asked for; only what exists is rendered.
+        let row = s.hex_row(0);
+        assert!(row.contains("30 31 32 33"), "{row}");
+        assert!(row.contains("0123456789"), "{row}");
+        // Past the end: no panic, and nothing invented.
+        let past = s.hex_row(64);
+        assert!(!past.contains("30"), "{past}");
+    }
+}

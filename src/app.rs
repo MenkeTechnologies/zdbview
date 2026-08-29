@@ -7442,6 +7442,7 @@ mod tests {
     #[test]
     fn y_copies_the_row_as_an_insert_statement() {
         let (mut app, path) = sqlite_app();
+        await_queries(&mut app);
         app.on_key(KeyEvent::from(KeyCode::Tab)); // focus the row grid
         press(&mut app, 'Y');
         assert!(
@@ -8022,6 +8023,10 @@ mod tests {
     #[test]
     fn columns_move_with_arrows_and_h_opens_help() {
         let (mut app, path) = sqlite_app();
+        // The columns are known only once the first page lands, and column
+        // motion is clamped to them — so wait, as the event loop does. Without
+        // this the test passes or fails depending on how busy the machine is.
+        await_queries(&mut app);
         app.on_key(KeyEvent::from(KeyCode::Tab)); // focus the row grid
         app.on_key(KeyEvent::from(KeyCode::Right));
         assert_eq!(app.col_idx, 1, "Right must move a column");
@@ -8600,10 +8605,12 @@ mod tests {
     #[test]
     fn slash_filters_sqlite_rows_across_the_whole_table() {
         let (mut app, path) = sqlite_app_rows(60);
+        await_queries(&mut app);
         app.on_key(KeyEvent::from(KeyCode::Tab)); // focus the grid
         assert_eq!(app.rows.as_ref().unwrap().total, 60);
         press(&mut app, '/');
         press(&mut app, '4');
+        await_queries(&mut app);
         let view = app.rows.as_ref().unwrap();
         // Rows 4, 14, 24, 34, 40..49, 54 contain a '4'.
         assert_eq!(view.total, 15, "total must count matches, not all rows");
@@ -8658,6 +8665,7 @@ mod tests {
     #[test]
     fn paging_moves_by_a_screenful() {
         let (mut app, path) = sqlite_app_rows(120);
+        await_queries(&mut app);
         app.on_key(KeyEvent::from(KeyCode::Tab)); // focus the grid
                                                   // A 24-row terminal keeps 23 rows for the body (one is the status bar),
                                                   // of which the grid shows 20 (two borders and a header row).

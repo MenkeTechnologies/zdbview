@@ -79,3 +79,71 @@ impl Store {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{detect, is_sqlite_header, Kind};
+    use std::path::PathBuf;
+
+    fn scratch(name: &str, bytes: &[u8]) -> PathBuf {
+        let mut p = std::env::temp_dir();
+        p.push(format!("zdbview_store_{}_{}", std::process::id(), name));
+        std::fs::write(&p, bytes).unwrap();
+        p
+    }
+
+    #[test]
+    fn the_header_outranks_the_file_name() {
+        // zshrs writes rkyv shards under `.db`, and SQLite databases turn up
+        // under every extension there is; only the first 16 bytes decide.
+        let shard = scratch("shard.db", b"not sqlite, but long enough for a header");
+        assert_eq!(detect(&shard, false, false).unwrap(), Kind::Rkyv);
+
+        let mut db = b"SQLite format 3\0".to_vec();
+        db.extend(std::iter::repeat_n(0u8, 64));
+        let db = scratch("db.rkyv", &db);
+        assert_eq!(detect(&db, false, false).unwrap(), Kind::Sqlite);
+
+        for p in [&shard, &db] {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+
+    #[test]
+    fn a_forced_backend_is_not_second_guessed() {
+        // --sqlite and --rkyv exist for files the header cannot speak for, so
+        // they win without the file even being read: this path does not exist.
+        let missing = std::env::temp_dir().join("zdbview_store_no_such_file");
+        let _ = std::fs::remove_file(&missing);
+        assert_eq!(detect(&missing, true, false).unwrap(), Kind::Sqlite);
+        assert_eq!(detect(&missing, false, true).unwrap(), Kind::Rkyv);
+        // Without a force, the same path is an error naming what failed.
+        let err = detect(&missing, false, false).unwrap_err().to_string();
+        assert!(err.contains("open"), "{err}");
+        assert!(err.contains("zdbview_store_no_such_file"), "{err}");
+    }
+
+    #[test]
+    fn a_file_too_short_for_a_header_falls_back_to_the_extension() {
+        let short_db = scratch("tiny.db", b"x");
+        let short_other = scratch("tiny.rkyv", b"x");
+        assert_eq!(detect(&short_db, false, false).unwrap(), Kind::Sqlite);
+        assert_eq!(detect(&short_other, false, false).unwrap(), Kind::Rkyv);
+        // An empty file has no header either, and the same rule applies.
+        let empty = scratch("empty.sqlite3", b"");
+        assert_eq!(detect(&empty, false, false).unwrap(), Kind::Sqlite);
+
+        for p in [&short_db, &short_other, &empty] {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+
+    #[test]
+    fn the_magic_is_matched_whole() {
+        assert!(is_sqlite_header(b"SQLite format 3\0trailing bytes"));
+        // The NUL is part of it, and a truncated magic is not a match.
+        assert!(!is_sqlite_header(b"SQLite format 3 "));
+        assert!(!is_sqlite_header(b"SQLite format 3"));
+        assert!(!is_sqlite_header(b""));
+    }
+}
