@@ -1079,4 +1079,110 @@ mod tests {
         // No columns at all is not a panic.
         assert_eq!(layout(&[], 0, 0, 0, 4), (vec![], 0));
     }
+
+    /// The epoch formats are arithmetic against constants — 978307200 for
+    /// NSDate, 11644473600 for Chromium, 25569 for the OLE date — and a wrong
+    /// constant is a plausible-looking date that is years out. SQLite itself is
+    /// the arbiter, so the expressions are run rather than read.
+    #[test]
+    fn every_time_format_converts_to_the_date_it_claims() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        let render = |f: &Format, value: &str| -> String {
+            // Cast so a numeric format's result reads back as the text the grid
+            // would show.
+            let sql = format!("SELECT CAST({} AS TEXT)", f.expression(value));
+            conn.query_row(&sql, [], |r| r.get::<_, String>(0))
+                .unwrap_or_else(|e| panic!("{sql}: {e}"))
+        };
+
+        assert_eq!(render(&Format::UnixEpoch, "0"), "1970-01-01 00:00:00");
+        // NSDate counts from 2001-01-01.
+        assert_eq!(render(&Format::AppleNsDate, "0"), "2001-01-01 00:00:00");
+        assert_eq!(
+            render(&Format::JavaEpochMs, "1000000000000"),
+            "2001-09-09 01:46:40",
+            "milliseconds, not seconds"
+        );
+        assert_eq!(
+            render(&Format::WebkitEpoch, "13350000000000000"),
+            "2024-01-17 21:20:00",
+            "microseconds since 1601"
+        );
+        assert_eq!(
+            render(&Format::WindowsDate, "45000"),
+            "2023-03-15 00:00:00",
+            "days since 1899-12-30"
+        );
+        // A Julian day needs no conversion: SQLite reads a bare number as one.
+        assert_eq!(
+            render(&Format::JulianDay, "2451545.0"),
+            "2000-01-01 12:00:00"
+        );
+        assert_eq!(render(&Format::DateDmy, "'2024-03-05'"), "05/03/2024");
+
+        // The numeric formats, which are printf under the hood.
+        assert_eq!(render(&Format::HexNumber, "255"), "ff");
+        assert_eq!(render(&Format::Octal, "8"), "10");
+        assert_eq!(render(&Format::Decimal, "3.9"), "3");
+        assert_eq!(render(&Format::Round, "3.6"), "4.0");
+        assert_eq!(render(&Format::Upper, "'ab'"), "AB");
+        assert_eq!(render(&Format::HexBlob, "'ab'"), "6162");
+    }
+
+    /// An encoding says how stored bytes are *read*. The two differ only in
+    /// 0x80–0x9F, which is exactly the range text pasted out of a word processor
+    /// lands in — the reason the second one is offered at all.
+    #[test]
+    fn latin1_and_windows_1252_differ_where_they_should() {
+        // 0x93 and 0x94 are curly quotes in Windows-1252 and controls in Latin-1.
+        let hex = "9348656C6C6F94";
+        assert_eq!(Format::Cp1252.decode(hex), "\u{201c}Hello\u{201d}");
+        assert_eq!(Format::Latin1.decode(hex), "\u{93}Hello\u{94}");
+
+        // Outside that range they agree, and a byte is its own code point.
+        for hex in ["41", "7f", "a9", "ff"] {
+            assert_eq!(
+                Format::Cp1252.decode(hex),
+                Format::Latin1.decode(hex),
+                "{hex} is the same in both"
+            );
+        }
+        assert_eq!(Format::Latin1.decode("e9"), "\u{e9}");
+
+        // Only these two need decoding on this side; everything else is SQL.
+        assert!(Format::Latin1.decodes_bytes() && Format::Cp1252.decodes_bytes());
+        assert!(Format::CYCLE
+            .iter()
+            .filter(|f| !matches!(f, Format::Latin1 | Format::Cp1252))
+            .all(|f| !f.decodes_bytes()));
+
+        // Hex that is not hex decodes to what could be read, not a panic.
+        assert_eq!(Format::Latin1.decode(""), "");
+        // `hex()` never emits an odd length, so a trailing nibble is only ever a
+        // hand-typed value; it reads as the byte it spells.
+        assert_eq!(Format::Latin1.decode("4"), "\u{4}");
+        assert_eq!(
+            Format::Latin1.decode("41zz42"),
+            "AB",
+            "the pair that is not hex is skipped"
+        );
+    }
+
+    /// A custom format that does not mention the column would paint every row
+    /// the same value, so it is refused before it can be saved.
+    #[test]
+    fn a_custom_format_must_use_the_column() {
+        assert!(Format::validate_custom("upper(%1)").is_ok());
+        assert!(Format::validate_custom("printf('%08x', %1)").is_ok());
+
+        let err = Format::validate_custom("  ").unwrap_err();
+        assert!(err.contains("needs an expression"), "{err}");
+        let err = Format::validate_custom("upper(name)").unwrap_err();
+        assert!(err.contains("%1"), "{err}");
+
+        // And the placeholder is what the column is substituted for, everywhere
+        // it appears.
+        let f = Format::Custom("coalesce(%1, %1, 'none')".into());
+        assert_eq!(f.expression("\"a\""), "coalesce(\"a\", \"a\", 'none')");
+    }
 }

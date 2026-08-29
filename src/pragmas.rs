@@ -579,4 +579,82 @@ mod tests {
             .unwrap();
         assert_eq!(e.display(i), "—");
     }
+
+    /// Every listed pragma has to be a pragma SQLite actually has, and every
+    /// choice a value it actually accepts — a typo here is a row in the editor
+    /// that silently does nothing. SQLite is the arbiter, so each one is set.
+    #[test]
+    fn every_pragma_and_every_choice_is_one_sqlite_accepts() {
+        let path =
+            std::env::temp_dir().join(format!("zdbview_pragmas_{}_specs.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        // A file rather than :memory:, since journal_mode and page_size mean
+        // nothing to a database with no file behind it.
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute("CREATE TABLE t (a TEXT)", []).unwrap();
+
+        for spec in EDITABLE {
+            if !spec.write_only {
+                conn.query_row(&format!("PRAGMA {}", spec.name), [], |r| {
+                    r.get::<_, rusqlite::types::Value>(0)
+                })
+                .unwrap_or_else(|e| panic!("PRAGMA {} is not readable: {e}", spec.name));
+            }
+            let values: Vec<String> = match spec.kind {
+                Kind::Flag => vec!["0".into(), "1".into()],
+                Kind::Choice(pairs) => pairs.iter().map(|(v, _)| (*v).to_string()).collect(),
+                // A number pragma takes any; one that is plainly in range says
+                // the statement parses.
+                Kind::Int => vec!["1000".into()],
+            };
+            for value in values {
+                let sql = format!("PRAGMA {} = {}", spec.name, value);
+                conn.execute_batch(&sql)
+                    .unwrap_or_else(|e| panic!("{sql} rejected: {e}"));
+            }
+        }
+        drop(conn);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The editor writes one value and shows another: half of these read back as
+    /// integers that mean nothing on screen. Every choice must map both ways.
+    #[test]
+    fn a_choice_shows_a_word_and_writes_what_sqlite_wants() {
+        for spec in EDITABLE {
+            let Kind::Choice(pairs) = spec.kind else {
+                continue;
+            };
+            assert!(!pairs.is_empty(), "{} has no choices", spec.name);
+            for (written, shown) in pairs {
+                assert!(!written.is_empty() && !shown.is_empty(), "{}", spec.name);
+            }
+            // The written values are what identifies a choice, so they cannot
+            // repeat — cycling would stall on the duplicate.
+            let mut seen: Vec<&str> = pairs.iter().map(|(w, _)| *w).collect();
+            seen.sort_unstable();
+            let before = seen.len();
+            seen.dedup();
+            assert_eq!(before, seen.len(), "{} repeats a value", spec.name);
+        }
+    }
+
+    /// A pragma whose value cannot be read back is the one case where the editor
+    /// is the only record of what was set, so it has to be marked.
+    #[test]
+    fn the_unreadable_pragma_is_the_one_that_is_marked_write_only() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        for spec in EDITABLE {
+            let readable = conn
+                .query_row(&format!("PRAGMA {}", spec.name), [], |r| {
+                    r.get::<_, rusqlite::types::Value>(0)
+                })
+                .is_ok();
+            assert_eq!(
+                readable, !spec.write_only,
+                "{} is marked write_only = {} but reads back = {readable}",
+                spec.name, spec.write_only
+            );
+        }
+    }
 }
