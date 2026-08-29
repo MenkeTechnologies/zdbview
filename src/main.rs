@@ -408,6 +408,11 @@ fn list_themes() {
     println!("  {B_YELLOW}In TUI:{RST} press {B_GREEN}t{RST} for the chooser, {B_GREEN}e{RST} for the palette editor\n");
 }
 
+/// What `--export` accepts: the sqlite3 shell's output modes, plus `sql` for
+/// `.dump`. Named here rather than inside the function because the completion,
+/// the man page and the tests all have to agree with it.
+const EXPORT_FORMATS: &[&str] = &["json", "csv", "tsv", "markdown", "insert", "line", "sql"];
+
 /// `--formats`: every rkyv magic the registry resolves — the tags this build
 /// ships and whatever the user registered on top of them — so "does zdbview know
 /// my producer" is answerable without opening a file. A tag is printed as its
@@ -456,12 +461,10 @@ fn parse_theme(token: &str) -> Result<theme::ThemeName> {
 
 fn run_export(cli: &Cli, fmt: &str) -> Result<()> {
     let fmt = fmt.to_lowercase();
-    // The names are the sqlite3 shell's output modes, plus `sql` for `.dump`.
-    const FORMATS: &[&str] = &["json", "csv", "tsv", "markdown", "insert", "line", "sql"];
-    if !FORMATS.contains(&fmt.as_str()) {
+    if !EXPORT_FORMATS.contains(&fmt.as_str()) {
         return Err(anyhow!(
             "--export expects one of {}, got '{}'",
-            FORMATS.join(" "),
+            EXPORT_FORMATS.join(" "),
             fmt
         ));
     }
@@ -909,7 +912,7 @@ fn run_import_sql(cli: &Cli, src: &std::path::Path) -> Result<()> {
 mod tests {
     use super::{
         drive, export_store, run_backup, run_export, run_import, run_import_sql, run_recover,
-        store, Cli, Session,
+        store, Cli, Session, EXPORT_FORMATS,
     };
     use crate::app::{Outcome, Picked};
     use crate::theme::{Theme, ThemeName};
@@ -1022,6 +1025,65 @@ mod tests {
             .to_string()
             .contains("no such table"));
         let _ = std::fs::remove_file(path);
+    }
+
+    /// Every accepted format has to render, or a name in the list is a promise
+    /// the binary does not keep. Looping over the list rather than naming them
+    /// means a format added later is exercised without anyone remembering to.
+    #[test]
+    fn every_accepted_export_format_produces_output() {
+        let path = fixture("all_formats.db");
+        let kind = store::detect(&path, false, false).unwrap();
+        let (st, _) = store::Store::open(&path, kind).unwrap();
+        for fmt in EXPORT_FORMATS {
+            let out = export_store(&st, fmt, None)
+                .unwrap_or_else(|e| panic!("--export {fmt} failed: {e}"));
+            assert!(!out.trim().is_empty(), "--export {fmt} wrote nothing");
+            // Every mode carries the row's text; only the shape differs.
+            assert!(
+                out.contains("it's here") || out.contains("it''s here"),
+                "--export {fmt} lost the data: {out}"
+            );
+        }
+        drop(st);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The list lives in three places a user meets it: the flag itself, the zsh
+    /// completion and the man page. They drift silently, so they are compared.
+    #[test]
+    fn the_completion_and_the_man_page_list_the_same_formats() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+
+        let completion = std::fs::read_to_string(root.join("completions/_zdbview")).unwrap();
+        let line = completion
+            .lines()
+            .find(|l| l.contains("--export["))
+            .expect("the completion offers --export");
+        let offered = line
+            .rsplit_once(":format:(")
+            .and_then(|(_, rest)| rest.split_once(')'))
+            .map(|(list, _)| list)
+            .expect("with a value list");
+        assert_eq!(
+            offered.split_whitespace().collect::<Vec<_>>(),
+            EXPORT_FORMATS.to_vec(),
+            "the completion offers exactly what the flag accepts, in the same order"
+        );
+
+        // The man page's own --export paragraph, not the page at large: every
+        // format has to be named where a reader looks for it.
+        let man = std::fs::read_to_string(root.join("man/man1/zdbview.1")).unwrap();
+        let para = man
+            .split_once(".BI \\-\\-export")
+            .map(|(_, rest)| rest.split("\n.TP\n").next().unwrap_or(rest))
+            .expect("the man page documents --export");
+        for fmt in EXPORT_FORMATS {
+            assert!(
+                para.contains(fmt),
+                "the man page's --export paragraph does not name {fmt}"
+            );
+        }
     }
 
     /// `--export sql` is advertised as a replayable dump, so it has to replay:

@@ -7162,6 +7162,8 @@ mod tests {
             Store::Sqlite(SqliteStore::open(&path).unwrap()),
             Theme::from_name(ThemeName::NeonSprawl),
         );
+        // The first page has to land before a key can act on a cell.
+        await_queries(&mut app);
         press(&mut app, ':');
         let note = |app: &App| -> Vec<String> {
             app.sql
@@ -7317,6 +7319,8 @@ mod tests {
             Store::Sqlite(SqliteStore::open(&path).unwrap()),
             Theme::from_name(ThemeName::NeonSprawl),
         );
+        // The first page has to land before a key can act on a cell.
+        await_queries(&mut app);
         // The monitor watches every file zdbview knows of, which on a real machine
         // means whatever else is writing right now — this test is about the panes,
         // so it watches only the database it just wrote.
@@ -7388,6 +7392,8 @@ mod tests {
             Store::Sqlite(SqliteStore::open(&path).unwrap()),
             Theme::from_name(ThemeName::NeonSprawl),
         );
+        // The first page has to land before a key can act on a cell.
+        await_queries(&mut app);
         // `book` is the second table; focus its grid and put the cursor on the key.
         let book = app
             .sqlite()
@@ -7476,6 +7482,8 @@ mod tests {
             Store::Sqlite(SqliteStore::open(&path).unwrap()),
             Theme::from_name(ThemeName::NeonSprawl),
         );
+        // The first page has to land before a key can act on a cell.
+        await_queries(&mut app);
         app.on_key(KeyEvent::from(KeyCode::Tab)); // focus the row grid
         app.on_key(KeyEvent::from(KeyCode::Enter)); // detail
         assert_eq!(app.screen, super::Screen::Detail);
@@ -7525,6 +7533,8 @@ mod tests {
             Store::Sqlite(SqliteStore::open(&path).unwrap()),
             Theme::from_name(ThemeName::NeonSprawl),
         );
+        // The first page has to land before a key can act on a cell.
+        await_queries(&mut app);
         app.on_key(KeyEvent::from(KeyCode::Tab)); // the row grid
 
         // `e` on a text cell still edits text.
@@ -7588,6 +7598,8 @@ mod tests {
             Store::Sqlite(SqliteStore::open(&path).unwrap()),
             Theme::from_name(ThemeName::NeonSprawl),
         );
+        // The first page has to land before a key can act on a cell.
+        await_queries(&mut app);
         app.on_key(KeyEvent::from(KeyCode::Tab));
         app.on_key(KeyEvent::from(KeyCode::Enter)); // detail
         press(&mut app, 'e');
@@ -7649,6 +7661,8 @@ mod tests {
             Store::Sqlite(SqliteStore::open(&path).unwrap()),
             Theme::from_name(ThemeName::NeonSprawl),
         );
+        // The first page has to land before a key can act on a cell.
+        await_queries(&mut app);
 
         // Table pane: `/keep` hides drop_b, so searching for a name every table
         // matches must still skip it.
@@ -7761,6 +7775,8 @@ mod tests {
             Store::Sqlite(SqliteStore::open(&path).unwrap()),
             Theme::from_name(ThemeName::NeonSprawl),
         );
+        // The first page has to land before a key can act on a cell.
+        await_queries(&mut app);
         app.on_key(KeyEvent::from(KeyCode::Tab)); // focus the row grid
 
         press(&mut app, 'A');
@@ -7824,6 +7840,8 @@ mod tests {
             Store::Sqlite(SqliteStore::open(&path).unwrap()),
             Theme::from_name(ThemeName::NeonSprawl),
         );
+        // The first page has to land before a key can act on a cell.
+        await_queries(&mut app);
         app.on_key(KeyEvent::from(KeyCode::Tab)); // focus the row grid
 
         press(&mut app, 'e');
@@ -8849,6 +8867,8 @@ mod tests {
         drop(conn);
         let store = Store::Sqlite(SqliteStore::open(&path).unwrap());
         let mut app = App::with_theme(store, Theme::from_name(ThemeName::NeonSprawl));
+        // The first page has to land before a key can act on a cell.
+        await_queries(&mut app);
         assert_eq!(app.visible_tables().len(), 3);
         press(&mut app, '/');
         for c in "user".chars() {
@@ -9926,6 +9946,8 @@ mod tests {
         drop(conn);
         let store = Store::Sqlite(SqliteStore::open(&path).unwrap());
         let mut app = App::with_theme(store, Theme::from_name(ThemeName::NeonSprawl));
+        // The first page has to land before a key can act on a cell.
+        await_queries(&mut app);
         press(&mut app, ':');
         assert_eq!(app.screen, super::Screen::Sql);
 
@@ -9984,6 +10006,8 @@ mod tests {
         drop(conn);
         let store = Store::Sqlite(SqliteStore::open(&path).unwrap());
         let mut app = App::with_theme(store, Theme::from_name(ThemeName::NeonSprawl));
+        // The first page has to land before a key can act on a cell.
+        await_queries(&mut app);
         press(&mut app, ':');
         for c in "SELECT a FROM t WHERE a > 1".chars() {
             press(&mut app, c);
@@ -10576,6 +10600,8 @@ mod tests {
         drop(conn);
         let store = Store::Sqlite(SqliteStore::open(&path).unwrap());
         let mut app = App::with_theme(store, Theme::from_name(ThemeName::NeonSprawl));
+        // The first page has to land before a key can act on a cell.
+        await_queries(&mut app);
         press(&mut app, 'S');
         press(&mut app, 'G');
         assert_eq!(app.schema_idx, 7);

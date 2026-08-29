@@ -1080,6 +1080,96 @@ mod tests {
         assert_eq!(layout(&[], 0, 0, 0, 4), (vec![], 0));
     }
 
+    /// A format that is not in the cycle is a format nobody can reach: the picker
+    /// walks `CYCLE`, and there is no other way to select one. The match below is
+    /// exhaustive on purpose — adding a variant breaks this test's build, which
+    /// is the reminder to list it.
+    #[test]
+    fn every_format_is_reachable_from_the_cycle() {
+        fn representative(f: &Format) -> Format {
+            match f {
+                Format::Default => Format::Default,
+                Format::Decimal => Format::Decimal,
+                Format::Exponent => Format::Exponent,
+                Format::HexBlob => Format::HexBlob,
+                Format::HexNumber => Format::HexNumber,
+                Format::Octal => Format::Octal,
+                Format::Round => Format::Round,
+                Format::Lower => Format::Lower,
+                Format::Upper => Format::Upper,
+                Format::DateDmy => Format::DateDmy,
+                Format::JulianDay => Format::JulianDay,
+                Format::UnixEpoch => Format::UnixEpoch,
+                Format::UnixEpochLocal => Format::UnixEpochLocal,
+                Format::AppleNsDate => Format::AppleNsDate,
+                Format::JavaEpochMs => Format::JavaEpochMs,
+                Format::WebkitEpoch => Format::WebkitEpoch,
+                Format::WebkitEpochLocal => Format::WebkitEpochLocal,
+                Format::WindowsDate => Format::WindowsDate,
+                Format::Latin1 => Format::Latin1,
+                Format::Cp1252 => Format::Cp1252,
+                // Typed, not cycled — the one variant that is not in CYCLE.
+                Format::Custom(e) => Format::Custom(e.clone()),
+            }
+        }
+        // Every variant named above, minus the typed one, is what the cycle
+        // holds, once each and in a stable order.
+        let cycled: Vec<Format> = Format::CYCLE.iter().map(representative).collect();
+        assert_eq!(cycled.len(), 20, "the cycle lists every non-custom format");
+        assert_eq!(cycled, Format::CYCLE.to_vec(), "and nothing is transformed");
+        let mut labels: Vec<String> = Format::CYCLE.iter().map(Format::label).collect();
+        let before = labels.len();
+        labels.sort();
+        labels.dedup();
+        assert_eq!(
+            before,
+            labels.len(),
+            "no two formats read the same in the picker"
+        );
+
+        // Cycling from any of them reaches all of them.
+        let mut seen = vec![Format::CYCLE[0].clone()];
+        let mut at = Format::CYCLE[0].clone();
+        for _ in 1..Format::CYCLE.len() {
+            at = at.next(false);
+            seen.push(at.clone());
+        }
+        assert_eq!(
+            seen,
+            Format::CYCLE.to_vec(),
+            "forward walks the whole cycle"
+        );
+        assert_eq!(at.next(false), Format::CYCLE[0], "and wraps at the end");
+    }
+
+    /// The same for the rule colours: one that is not in `ALL` cannot be picked,
+    /// and two that paint or read the same are indistinguishable on screen.
+    #[test]
+    fn every_rule_colour_is_distinct_and_reachable() {
+        assert_eq!(RuleColor::ALL.len(), 7);
+        let mut labels: Vec<&str> = RuleColor::ALL.iter().map(|c| c.label()).collect();
+        let mut colors: Vec<String> = RuleColor::ALL
+            .iter()
+            .map(|c| format!("{:?}", c.color()))
+            .collect();
+        labels.sort_unstable();
+        labels.dedup();
+        colors.sort();
+        colors.dedup();
+        assert_eq!(labels.len(), 7, "every colour is named differently");
+        assert_eq!(colors.len(), 7, "and painted differently");
+
+        // next() visits each exactly once before coming back.
+        let mut at = RuleColor::default();
+        let mut seen = vec![at];
+        for _ in 1..RuleColor::ALL.len() {
+            at = at.next();
+            assert!(!seen.contains(&at), "{at:?} came round twice");
+            seen.push(at);
+        }
+        assert_eq!(at.next(), RuleColor::default(), "and wraps to the first");
+    }
+
     /// The epoch formats are arithmetic against constants — 978307200 for
     /// NSDate, 11644473600 for Chromium, 25569 for the OLE date — and a wrong
     /// constant is a plausible-looking date that is years out. SQLite itself is

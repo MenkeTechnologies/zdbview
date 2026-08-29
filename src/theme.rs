@@ -381,4 +381,55 @@ mod tests {
             );
         }
     }
+
+    /// A scheme that is not in `ALL` cannot be chosen, previewed or saved — the
+    /// chooser, `--list-themes` and the prefs round trip all walk that list. The
+    /// match is exhaustive on purpose: adding a scheme breaks this test's build,
+    /// which is the reminder to list it.
+    #[test]
+    fn every_scheme_is_in_the_list_the_ui_walks() {
+        match ThemeName::default() {
+            ThemeName::NeonSprawl
+            | ThemeName::AcidRain
+            | ThemeName::IceBreaker
+            | ThemeName::SynthWave
+            | ThemeName::RustBelt
+            | ThemeName::GhostWire
+            | ThemeName::RedSector
+            | ThemeName::SakuraDen
+            | ThemeName::DataStream
+            | ThemeName::SolarFlare
+            | ThemeName::NeonNoir
+            | ThemeName::ChromeHeart
+            | ThemeName::BladeRunner
+            | ThemeName::VoidWalker
+            | ThemeName::ToxicWaste
+            | ThemeName::CyberFrost
+            | ThemeName::PlasmaCore
+            | ThemeName::SteelNerve
+            | ThemeName::DarkSignal
+            | ThemeName::GlitchPop
+            | ThemeName::HoloShift
+            | ThemeName::NightCity
+            | ThemeName::DeepNet
+            | ThemeName::LaserGrid
+            | ThemeName::QuantumFlux
+            | ThemeName::BioHazard
+            | ThemeName::Darkwave
+            | ThemeName::Overlock
+            | ThemeName::Megacorp
+            | ThemeName::Zaibatsu
+            | ThemeName::Iftopcolor => {}
+        }
+        assert_eq!(
+            ThemeName::ALL.len(),
+            31,
+            "every scheme named above is listed, and nothing else is"
+        );
+        let mut seen: Vec<ThemeName> = ThemeName::ALL.to_vec();
+        let before = seen.len();
+        seen.sort_by_key(|t| t.token());
+        seen.dedup();
+        assert_eq!(before, seen.len(), "and none of them is listed twice");
+    }
 }
