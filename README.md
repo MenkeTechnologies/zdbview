@@ -266,6 +266,7 @@ back to a raw structural view.
 | strykelang script cache | `STRY` | magic (native v4 + compat) | script path |
 | awkrs script cache | `AWKR` | magic | script path |
 | vimlrs script cache | `VIML` | magic | script path |
+| texrs bytecode cache | `TEXR` | magic | document path |
 | elisprs heap-image cache | `ELSP` | magic | script path |
 | zshrs canonical shard | `ZSHS` | magic (or validated, unstamped) | `section/key`, `section[i]` |
 | zshrs system shard | `ZSHS` | magic (second layout) | entry key |

@@ -216,7 +216,7 @@ rkyv version (0.7), same features
 same field order and types. Detection is a cheap little-endian scan for the
 format's magic, followed by a full
 .B rkyv::check_archived_root
-validation. Eight formats are recognized \(em the script and heap caches the
+validation. Every format below is recognized \(em the script and heap caches the
 fusevm-hosted languages write:
 .RS 2
 .IP \(bu 2
@@ -237,6 +237,10 @@ keyed by script path.
 .IP \(bu 2
 .B VIML
 \(em the vimlrs script cache, keyed by script path.
+.IP \(bu 2
+.B TEXR
+\(em the texrs bytecode cache: the compiled chunk for a `.tex` document, keyed
+by document path.
 .IP \(bu 2
 .B ELSP
 \(em the elisprs heap-image cache, keyed by script path.

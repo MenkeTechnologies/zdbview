@@ -21,6 +21,7 @@ const ZSHRS_MAGIC: u32 = 0x5A52_5343; // "ZRSC"
 const STRYKE_MAGIC: u32 = 0x5354_5259; // "STRY"
 const AWKRS_MAGIC: u32 = 0x4157_4B52; // "AWKR"
 const VIMLRS_MAGIC: u32 = 0x5649_4D4C; // "VIML"
+const TEXRS_MAGIC: u32 = 0x5445_5852; // "TEXR"
 
 /// zshrs autoload cache magic ("ZRAL" little-endian).
 const AUTOLOAD_MAGIC: u32 = 0x5A52_414C;
@@ -272,6 +273,7 @@ pub const BUILTIN_MAGICS: &[(u32, &str)] = &[
     (ZSHRS_MAGIC, "zshrs script cache (ZRSC)"),
     (AWKRS_MAGIC, "awkrs script cache (AWKR)"),
     (VIMLRS_MAGIC, "vimlrs script cache (VIML)"),
+    (TEXRS_MAGIC, "texrs bytecode cache (TEXR)"),
     (STRYKE_MAGIC, "strykelang script cache (STRY)"),
     (AUTOLOAD_MAGIC, "zshrs autoload cache (ZRAL)"),
     (ELISP_MAGIC, "elisprs heap-image cache (ELSP)"),
@@ -306,7 +308,7 @@ pub fn magic_label(name: &str) -> Option<&'static str> {
 /// are attempted last, gated by rkyv validation. `None` → structural fallback.
 pub fn try_decode(bytes: &[u8]) -> Option<Decoded> {
     // Family A — shared script-cache template, one type, per-host magic + name.
-    for magic in [ZSHRS_MAGIC, AWKRS_MAGIC, VIMLRS_MAGIC] {
+    for magic in [ZSHRS_MAGIC, AWKRS_MAGIC, VIMLRS_MAGIC, TEXRS_MAGIC] {
         if contains_u32_le(bytes, magic) {
             if let Ok(s) = rkyv::check_archived_root::<ScriptShard>(bytes) {
                 if u32::from(s.header.magic) == magic {

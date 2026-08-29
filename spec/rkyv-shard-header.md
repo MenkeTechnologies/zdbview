@@ -101,6 +101,7 @@ Tags known at the time of writing:
 | `AWKR` | awkrs script cache |
 | `VIML` | vimlrs script cache |
 | `ELSP` | elisprs heap image |
+| `TEXR` | texrs bytecode cache |
 
 A reader must not hard-code that list as the closed set. The tag space belongs
 to producers, so a conforming reader lets its user add tags it has never heard
@@ -133,7 +134,7 @@ fields and removes all three costs.
 
 ## Implementations
 
-Producers: zshrs, strykelang, awkrs, vimlrs, elisprs.
+Producers: zshrs, strykelang, awkrs, vimlrs, elisprs, texrs.
 Readers: [zdbview](https://github.com/MenkeTechnologies/zdbview) — detects every
 tag above, decodes the ones it has types for, and names the rest from its user
 registry.
