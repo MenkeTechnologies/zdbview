@@ -277,6 +277,27 @@ aliases, functions, options, bindings, paths — so its records address a sectio
 and a key (`aliases/ll`, `path[0]`, `extras/<sub>/<key>`) rather than one flat
 entry map; renames apply to the map sections, lists being positional.
 
+**Registering a magic yourself.** The header the recognized formats share is a
+published convention, not a zdbview-private one — see
+[`spec/rkyv-shard-header.md`](spec/rkyv-shard-header.md). Any producer can stamp
+its own four-character tag and have zdbview name it without patching the binary:
+list it in `$XDG_CONFIG_HOME/zdbview/magics` (or `~/.config/zdbview/magics`),
+one `tag = display name` per line.
+
+```text
+# tag = display name
+LUAR = luars bytecode cache (LUAR)
+0x5045_524C = perlrs script cache (PERL)
+```
+
+A four-character tag is the little-endian u32 a producer stamping
+`u32::from_be_bytes(*b"LUAR")` writes, so the bytes read in file order; the
+`0x…` form (underscores allowed) sets the u32 directly for anything else. A
+registered tag zdbview has no decoder for is still worth adding: the scan then
+offers the file under its real name and the structural inspector opens it. An
+entry for a tag zdbview already knows renames it in the UI; the decoder keyed on
+that tag is unaffected. Unparseable lines are skipped, not fatal.
+
 Magic-bearing formats are matched by their header; the header-less hash-keyed
 shards (pythonrs, rubylang, arb) are attempted last and gated by rkyv
 validation, so an unrelated archive falls through to the structural view rather

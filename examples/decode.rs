@@ -6,6 +6,10 @@
 #[allow(dead_code)]
 #[path = "../src/formats.rs"]
 mod formats;
+// formats resolves display names through the magic registry, so it comes along.
+#[allow(dead_code)]
+#[path = "../src/magics.rs"]
+mod magics;
 
 fn main() {
     let path = std::env::args().nth(1).expect("usage: decode <file>");

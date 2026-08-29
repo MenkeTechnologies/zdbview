@@ -1053,6 +1053,24 @@ is
 .B sqlite
 or
 .BR rkyv .
+.TP
+.I $XDG_CONFIG_HOME/zdbview/magics
+Extra rkyv magic tags, one
+.RI "\(oq" "tag = display name" "\(cq"
+per line
+.RB ( #
+comments and blank lines ignored). A tag is four printable ASCII characters \(em
+the little-endian u32 a producer stamping
+.B u32::from_be_bytes(*b"LUAR")
+writes \(em or an explicit
+.BR 0x \c
+hex u32 (underscores allowed). Entries add tags zdbview does not ship and rename
+ones it does; unparseable lines are skipped. Falls back to
+.I ~/.config/zdbview/magics
+when
+.B XDG_CONFIG_HOME
+is unset. The header those tags stamp is specified in
+.IR spec/rkyv-shard-header.md .
 .SH EXIT STATUS
 .TP
 .B 0

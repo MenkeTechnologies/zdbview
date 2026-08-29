@@ -24,7 +24,7 @@ use crate::overlay::{HelpCtx, Overlays};
 use crate::rkyv_inspect::RkyvStore;
 use crate::sqlite::{RowsView, Sort, SqliteStore};
 use crate::store::{Kind, Store};
-use crate::text::truncate;
+use crate::text::{truncate, truncate_start};
 use crate::theme::{Theme, ThemeName};
 
 /// How many rows per SQLite page.
@@ -5675,9 +5675,13 @@ impl App {
             .filter(|(_, r)| filter_passes(&self.filter, &r.key))
             .map(|(i, _)| i)
             .collect();
+        // Fit to the pane, not to a fixed 60: a wide terminal was still cutting
+        // keys at 60. Cut from the front, since path-like keys share a long
+        // prefix and are told apart only by their tail.
+        let key_width = cols[0].width.saturating_sub(2) as usize;
         let items: Vec<ListItem> = visible
             .iter()
-            .map(|&i| ListItem::new(truncate(&d.records[i].key, 60)))
+            .map(|&i| ListItem::new(truncate_start(&d.records[i].key, key_width)))
             .collect();
         let mut st = ListState::default();
         st.select(
@@ -5711,6 +5715,19 @@ impl App {
         // Right: selected value — decoded scalar fields, then a hex dump.
         let mut lines: Vec<Line> = Vec::new();
         if let Some(rec) = d.records.get(self.record_idx) {
+            // The list can only show a tail of the key, so the whole thing is
+            // spelled out here, wrapped rather than cut.
+            let body = (cols[1].width as usize).saturating_sub(2 + 22).max(1);
+            let key: Vec<char> = rec.key.chars().collect();
+            for (n, chunk) in key.chunks(body).enumerate() {
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        format!("{:<22}", if n == 0 { "key" } else { "" }),
+                        Style::default().fg(self.ov.theme.dim),
+                    ),
+                    Span::raw(chunk.iter().collect::<String>()),
+                ]));
+            }
             for (name, val) in &rec.fields {
                 lines.push(Line::from(vec![
                     Span::styled(
@@ -5725,7 +5742,9 @@ impl App {
                 format!("value — {} bytes (hex):", rec.value.len()),
                 Style::default().fg(self.ov.theme.primary),
             )));
-            let rows = area.height.saturating_sub(6) as usize;
+            // Whatever height is left once the fields and the wrapped key are on
+            // screen, minus the borders and the "value" caption.
+            let rows = (area.height as usize).saturating_sub(lines.len() + 3);
             for i in 0..rows {
                 let off = i * 16;
                 if off >= rec.value.len() {

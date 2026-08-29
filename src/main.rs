@@ -23,6 +23,7 @@ mod frames;
 mod hexedit;
 mod import;
 mod input;
+mod magics;
 mod monitor;
 mod mru;
 mod overlay;

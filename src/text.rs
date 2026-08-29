@@ -16,9 +16,22 @@ pub fn truncate(s: &str, max: usize) -> String {
     }
 }
 
+/// `s` cut to `max` characters from the *front*, so the end survives. Keys that
+/// share a long prefix — absolute paths in a cache shard, for one — are told
+/// apart by their tail, and cutting the tail makes every row read the same.
+pub fn truncate_start(s: &str, max: usize) -> String {
+    let n = s.chars().count();
+    if n <= max {
+        return s.to_string();
+    }
+    let mut out = String::from("\u{2026}");
+    out.extend(s.chars().skip(n - max.saturating_sub(1)));
+    out
+}
+
 #[cfg(test)]
 mod tests {
-    use super::truncate;
+    use super::{truncate, truncate_start};
 
     #[test]
     fn it_counts_characters_and_marks_what_it_cut() {
@@ -31,5 +44,16 @@ mod tests {
             "\u{e9}\u{e9}\u{2026}"
         );
         assert_eq!(truncate("abc", 0), "\u{2026}");
+    }
+
+    #[test]
+    fn cutting_from_the_front_keeps_the_tail() {
+        assert_eq!(truncate_start("abc", 3), "abc");
+        assert_eq!(truncate_start("abcd", 3), "\u{2026}cd");
+        assert_eq!(
+            truncate_start("\u{e9}\u{e9}\u{e9}\u{e9}", 3),
+            "\u{2026}\u{e9}\u{e9}"
+        );
+        assert_eq!(truncate_start("abc", 0), "\u{2026}");
     }
 }

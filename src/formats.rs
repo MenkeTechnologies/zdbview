@@ -264,9 +264,11 @@ pub struct Decoded {
     pub records: Vec<KvRecord>,
 }
 
-/// Every shard magic with its display name — the one place they are listed, used
-/// both by [`try_decode`] and by the startup scan's cheap header sniff.
-const MAGICS: &[(u32, &str)] = &[
+/// Every magic zdbview ships with its display name — the one place they are
+/// listed, used both by [`try_decode`] and by the startup scan's cheap header
+/// sniff. Producers outside this list register their own tag through
+/// [`crate::magics`]; this table is the built-in half of that registry.
+pub const BUILTIN_MAGICS: &[(u32, &str)] = &[
     (ZSHRS_MAGIC, "zshrs script cache (ZRSC)"),
     (AWKRS_MAGIC, "awkrs script cache (AWKR)"),
     (VIMLRS_MAGIC, "vimlrs script cache (VIML)"),
@@ -276,13 +278,10 @@ const MAGICS: &[(u32, &str)] = &[
     (CANONICAL_MAGIC, "zshrs canonical shard (ZSHS)"),
 ];
 
-/// Display name for a known magic.
+/// Display name for a known magic, from the registry (built-ins plus whatever
+/// the user registered).
 fn magic_name(magic: u32) -> &'static str {
-    MAGICS
-        .iter()
-        .find(|(m, _)| *m == magic)
-        .map(|(_, n)| *n)
-        .unwrap_or("rkyv archive")
+    crate::magics::name_of(magic).unwrap_or("rkyv archive")
 }
 
 /// The format named by whichever known magic appears in `bytes`, if any. This is
@@ -290,7 +289,7 @@ fn magic_name(magic: u32) -> &'static str {
 /// enough for the scan to offer the file. Opening it still validates properly
 /// through [`try_decode`].
 pub fn magic_in(bytes: &[u8]) -> Option<&'static str> {
-    MAGICS
+    crate::magics::all()
         .iter()
         .find(|(m, _)| contains_u32_le(bytes, *m))
         .map(|(_, n)| *n)
@@ -299,7 +298,7 @@ pub fn magic_in(bytes: &[u8]) -> Option<&'static str> {
 /// The known format whose display name is `name`, so a cached scan result can be
 /// restored to the same `&'static str` it was saved from.
 pub fn magic_label(name: &str) -> Option<&'static str> {
-    MAGICS.iter().find(|(_, n)| *n == name).map(|(_, n)| *n)
+    crate::magics::by_name(name)
 }
 
 /// Detect the archive format and decode it to key/value records. Magic-bearing
