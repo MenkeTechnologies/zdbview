@@ -477,6 +477,99 @@ mod attribution_tests {
         p
     }
 
+    /// The per-table rate is what the write pane draws, so it has to be the
+    /// bytes that arrived divided by the interval they arrived in — and a table
+    /// nothing wrote has no rate rather than a stale one.
+    #[test]
+    fn a_tables_rate_is_its_bytes_over_the_interval() {
+        let path = scratch("rate.db");
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.pragma_update(None, "journal_mode", "WAL").unwrap();
+        conn.pragma_update(None, "wal_autocheckpoint", 0).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE busy (id INTEGER PRIMARY KEY, v TEXT);
+             CREATE TABLE quiet (id INTEGER PRIMARY KEY, v TEXT);",
+        )
+        .unwrap();
+
+        let mut w = Watcher::new([(path.clone(), Kind::Sqlite)]);
+        w.interval = Duration::from_millis(0);
+        assert!(w.tick());
+        for i in 0..300 {
+            conn.execute(
+                "INSERT INTO busy (v) VALUES (?1)",
+                [format!("row {i} padded out so pages fill up quickly")],
+            )
+            .unwrap();
+        }
+        assert!(w.tick());
+
+        let t = &w.targets[0];
+        let two = Duration::from_secs(2);
+        let busy = t.table_rate("busy", two);
+        assert!(busy > 0.0, "the table that was written has a rate");
+        let delta: u64 = t
+            .table_delta
+            .iter()
+            .find(|(n, _)| n == "busy")
+            .map(|(_, b)| *b)
+            .unwrap();
+        assert!(
+            (busy - delta as f64 / 2.0).abs() < f64::EPSILON,
+            "which is its bytes over the interval: {busy} vs {delta}/2"
+        );
+        // Half the interval, twice the rate — the same bytes read as faster.
+        assert!(
+            (t.table_rate("busy", Duration::from_secs(1)) - busy * 2.0).abs() < 1.0,
+            "the interval divides"
+        );
+
+        assert_eq!(t.table_rate("quiet", two), 0.0, "a table nobody wrote to");
+        assert_eq!(t.table_rate("no such table", two), 0.0);
+        assert_eq!(
+            t.table_rate("busy", Duration::ZERO),
+            0.0,
+            "and no time is no rate rather than a division by zero"
+        );
+
+        // The page map the frame view labels pages with is a copy, so a later
+        // sample cannot change what a view is already drawing.
+        let snapshot = t.owners_snapshot();
+        assert!(!snapshot.is_empty(), "pages have owners");
+        assert_eq!(
+            snapshot.get(&1).map(String::as_str),
+            Some("sqlite_schema"),
+            "page 1 is the schema"
+        );
+        assert!(snapshot.values().any(|v| v == "busy"), "{snapshot:?}");
+
+        drop(conn);
+        for suffix in ["", "-wal", "-shm"] {
+            let mut n = path.as_os_str().to_os_string();
+            n.push(suffix);
+            let _ = std::fs::remove_file(PathBuf::from(n));
+        }
+    }
+
+    /// Sorting a column picks the direction that is useful first: most bytes,
+    /// most writes, most recent — but names read forwards.
+    #[test]
+    fn a_column_sorts_the_way_it_is_usually_wanted() {
+        assert!(
+            Column::Written.descending_by_default(),
+            "biggest writer first"
+        );
+        assert!(Column::Size.descending_by_default());
+        assert!(Column::Rate.descending_by_default());
+        assert!(Column::Last.descending_by_default(), "most recent first");
+        assert!(!Column::Name.descending_by_default(), "names read a to z");
+        assert!(!Column::Kind.descending_by_default());
+        // Every column has an answer, whichever way it goes.
+        for c in Column::ALL {
+            let _ = c.descending_by_default();
+        }
+    }
+
     /// Writes to one table have to be attributed to that table and not to the
     /// other one — this is the claim the whole per-table view rests on.
     #[test]

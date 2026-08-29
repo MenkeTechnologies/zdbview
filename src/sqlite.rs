@@ -3034,6 +3034,109 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
+    /// A pragma value cannot be a bound parameter in SQLite, so it goes into the
+    /// statement text. Both halves are therefore checked first, and the value
+    /// that comes back is the one SQLite settled on rather than the one asked
+    /// for — a pragma it clamps or ignores must not be reported as applied.
+    #[test]
+    fn a_pragma_is_checked_before_it_is_written_and_read_back_after() {
+        let (path, store) = fixture("pragmas", 3);
+
+        // Applied and read back.
+        assert_eq!(
+            store.set_pragma("user_version", "42").unwrap().as_deref(),
+            Some("42")
+        );
+        assert_eq!(
+            store.set_pragma("cache_size", "-2000").unwrap().as_deref(),
+            Some("-2000"),
+            "a negative value is a value"
+        );
+
+        // What SQLite refuses to take is reported as what it has, not as what
+        // was asked for.
+        let landed = store.set_pragma("page_size", "3").unwrap();
+        assert_ne!(
+            landed.as_deref(),
+            Some("3"),
+            "a page size must be a power of two"
+        );
+
+        // Neither half may carry SQL: the name and the value are both checked.
+        for bad in ["user_version; DROP TABLE t", "User_Version", "user version"] {
+            let err = store.set_pragma(bad, "1").unwrap_err().to_string();
+            assert!(err.contains("not a pragma name"), "{bad}: {err}");
+        }
+        for bad in ["1; DROP TABLE t", "'x'", ""] {
+            let err = store
+                .set_pragma("user_version", bad)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("not a pragma value"), "{bad:?}: {err}");
+        }
+        assert_eq!(store.count("t").unwrap(), 3, "and the table is still there");
+
+        // A file-shape pragma cannot be applied over an open savepoint, and says
+        // which way out there is.
+        store
+            .update_cell_keyed("t", &RowKey::Rowid(1), "name", "edited")
+            .unwrap();
+        let err = store
+            .set_pragma("user_version", "7")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("unwritten changes"), "{err}");
+        store.write_changes().unwrap();
+        assert_eq!(
+            store.set_pragma("user_version", "7").unwrap().as_deref(),
+            Some("7"),
+            "and it applies once they are written"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Following a foreign key means finding the parent row by a value the grid
+    /// is showing, which is text — so the comparison is made on text, and a
+    /// value nothing holds is no row rather than an error.
+    #[test]
+    fn a_row_can_be_found_by_a_value_the_grid_shows() {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "zdbview_sqlite_{}_rowid_where.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE parent (id INTEGER PRIMARY KEY, code TEXT);
+             INSERT INTO parent VALUES (10, 'aa'), (20, 'bb');",
+        )
+        .unwrap();
+        drop(conn);
+        let store = SqliteStore::open(&path).unwrap();
+
+        assert_eq!(store.rowid_where("parent", "code", "bb").unwrap(), Some(20));
+        // An integer key compares as the text the grid drew.
+        assert_eq!(store.rowid_where("parent", "id", "10").unwrap(), Some(10));
+        assert_eq!(
+            store.rowid_where("parent", "code", "no such code").unwrap(),
+            None,
+            "nothing found is None, not an error"
+        );
+        // A column that does not exist finds nothing rather than failing: SQLite
+        // falls back to reading an unknown double-quoted name as a string
+        // literal, so the comparison is 'nope' = 'x'. The caller only ever
+        // passes a column the grid is showing, so this is a quirk to know about
+        // rather than one to work around.
+        assert_eq!(store.rowid_where("parent", "nope", "x").unwrap(), None);
+        assert_eq!(
+            store.rowid_where("parent", "nope", "nope").unwrap(),
+            Some(10),
+            "and comparing it against itself matches every row"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
     /// The editor completes on table and column names, and this is where they
     /// come from: every table with its columns, refreshed when the schema
     /// changes so completion cannot offer a column that has been dropped.
