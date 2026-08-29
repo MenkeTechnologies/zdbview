@@ -3034,6 +3034,40 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
+    /// Cancellation is what makes a burst of keystrokes cost one query rather
+    /// than one per key: a running statement is aborted from another thread by a
+    /// flag the progress handler reads. Without it a 4-second scan would run to
+    /// the end for every keystroke that started one.
+    #[test]
+    fn a_running_statement_is_abandoned_when_it_is_no_longer_wanted() {
+        let (path, _writer) = fixture("cancel", 20_000);
+        let mut store = SqliteStore::open_readonly(&path).unwrap();
+
+        // A scan of the whole table, with the work already unwanted.
+        let wanted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = std::sync::Arc::clone(&wanted);
+        store.set_cancel(
+            64,
+            std::sync::Arc::new(move || !flag.load(std::sync::atomic::Ordering::Relaxed)),
+        );
+        let err = store
+            .count_exact("t", "word")
+            .expect_err("a cancelled scan does not return a total");
+        assert!(
+            err.to_string().to_lowercase().contains("interrupt"),
+            "it stops because it was interrupted: {err}"
+        );
+
+        // The same connection is usable again once the work is wanted.
+        wanted.store(true, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            store.count_exact("t", "word").unwrap(),
+            16_000,
+            "every word- row, the kick- ones aside"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
     /// A file the filesystem will not let anyone write — a database on a
     /// read-only mount, or one owned by someone else — is still openable and
     /// readable. The refusal comes when a write is attempted, and it has to

@@ -540,6 +540,63 @@ mod tests {
         );
     }
 
+    /// A search runs on its own worker so it is never queued behind a count, and
+    /// it comes back through `poll_search` under the generation that asked —
+    /// which is what lets a search the user has moved on from be dropped.
+    #[test]
+    fn a_search_comes_back_through_its_own_worker() {
+        let path = db("search_engine", 60);
+        let mut engine = Engine::new(&path);
+        let req = |term: &str| SearchReq {
+            table: "t".into(),
+            columns: vec!["a".into(), "b".into()],
+            term: term.into(),
+            sort: None,
+            filter: String::new(),
+            from: None,
+            forward: true,
+        };
+
+        assert!(!engine.searching(), "nothing is out yet");
+        engine.request_search(req("42"));
+        assert!(engine.searching(), "and now something is");
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let done = loop {
+            if let Some(d) = engine.poll_search() {
+                break d;
+            }
+            assert!(Instant::now() < deadline, "the search never came back");
+        };
+        let (_rowid, ordinal) = done.result.expect("a result").expect("a match");
+        assert_eq!(ordinal, 43, "row 43 holds '42'");
+        assert!(!engine.searching(), "and the worker is free again");
+
+        // A newer search supersedes an older one: only the newest generation is
+        // handed back, so a keystroke the user has moved past cannot land.
+        engine.request_search(req("no such value"));
+        engine.request_search(req("7"));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let done = loop {
+            if let Some(d) = engine.poll_search() {
+                break d;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the newest search never came back"
+            );
+        };
+        assert!(
+            done.result.expect("a result").is_some(),
+            "the result is the newest search's, not the abandoned one's"
+        );
+        assert!(
+            engine.poll_search().is_none(),
+            "and nothing stale follows it"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
     /// `n` wraps at the end of the table rather than reporting no match, and
     /// reports the match's position in display order so the caller knows which
     /// page to load.

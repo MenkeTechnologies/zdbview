@@ -979,6 +979,66 @@ mod tests {
         assert!(create_columns("CREATE VIEW v AS SELECT 1").is_empty());
     }
 
+    /// Write attribution rests on this: a WAL frame carries a page number, and
+    /// the page map says whose page that is. Read from the file, without asking
+    /// SQLite, since the point is to attribute a write to a database nobody has
+    /// opened.
+    #[test]
+    fn the_page_map_names_the_owner_of_every_page_it_claims() {
+        let mut path = std::env::temp_dir();
+        path.push(format!("zdbview_recover_{}_owners.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE alpha (v TEXT);
+             CREATE TABLE beta (v TEXT);
+             CREATE INDEX alpha_v ON alpha(v);",
+        )
+        .unwrap();
+        // Enough rows that each table owns several pages, not just its root.
+        let tx = conn.unchecked_transaction().unwrap();
+        for i in 0..500 {
+            tx.execute(
+                "INSERT INTO alpha VALUES (?1)",
+                [format!("a{i} padded out")],
+            )
+            .unwrap();
+            tx.execute("INSERT INTO beta VALUES (?1)", [format!("b{i} padded out")])
+                .unwrap();
+        }
+        tx.commit().unwrap();
+        drop(conn);
+
+        let owners = super::page_owners(&path).expect("a page map");
+        assert_eq!(
+            owners.get(&1).map(String::as_str),
+            Some("sqlite_schema"),
+            "page 1 is the schema, whatever else it holds"
+        );
+        let count = |name: &str| owners.values().filter(|v| v.as_str() == name).count();
+        assert!(count("alpha") > 1, "alpha owns more than its root");
+        assert!(count("beta") > 1, "and so does beta");
+        assert!(
+            count("index alpha_v") > 0,
+            "an index is named too, marked as one: {:?}",
+            owners.values().collect::<std::collections::HashSet<_>>()
+        );
+        // No page is claimed twice, since each map entry is one owner.
+        let pages: Vec<u32> = owners.keys().copied().collect();
+        assert_eq!(
+            pages.len(),
+            pages.iter().collect::<std::collections::HashSet<_>>().len()
+        );
+
+        // A file that is not a database has no pages to attribute.
+        let junk = path.with_extension("junk");
+        std::fs::write(&junk, b"not a database at all, just some bytes").unwrap();
+        assert!(super::page_owners(&junk).is_err());
+
+        let _ = std::fs::remove_file(&junk);
+        let _ = std::fs::remove_file(&path);
+    }
+
     /// In WAL mode the database file holds the *pre-write* version of every page
     /// the log has since rewritten, so a table created but never checkpointed is
     /// not in the file at all. Recovery has to read the log on top, or it

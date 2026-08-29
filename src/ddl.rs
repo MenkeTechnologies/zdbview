@@ -1407,4 +1407,90 @@ mod tests {
         assert_eq!(drop_sql("trigger", "g").unwrap(), "DROP TRIGGER \"g\"");
         assert!(drop_sql("nonsense", "x").is_none());
     }
+
+    /// Renaming a table means rewriting every trigger and view that names it, so
+    /// the rewrite has to know an identifier from a word that merely looks like
+    /// one. Getting this wrong rewrites someone's data or leaves a dangling
+    /// reference behind.
+    #[test]
+    fn a_rename_touches_identifiers_and_nothing_else() {
+        let go = |sql: &str| rename_ident(sql, "log", "journal");
+
+        // Bare, quoted every way SQLite allows, and case-insensitively.
+        assert_eq!(go("SELECT * FROM log"), r#"SELECT * FROM "journal""#);
+        assert_eq!(go(r#"SELECT * FROM "log""#), r#"SELECT * FROM "journal""#);
+        assert_eq!(go("SELECT * FROM `log`"), r#"SELECT * FROM "journal""#);
+        assert_eq!(go("SELECT * FROM [log]"), r#"SELECT * FROM "journal""#);
+        assert_eq!(go("SELECT * FROM LOG"), r#"SELECT * FROM "journal""#);
+
+        // A longer word that merely contains it is a different name.
+        assert_eq!(go("SELECT * FROM logs"), "SELECT * FROM logs");
+        assert_eq!(go("SELECT * FROM backlog"), "SELECT * FROM backlog");
+        assert_eq!(go("SELECT log_id FROM t"), "SELECT log_id FROM t");
+
+        // A string literal is data: renaming a table must not edit rows.
+        assert_eq!(
+            go("SELECT 'log' FROM log WHERE note = 'see log'"),
+            r#"SELECT 'log' FROM "journal" WHERE note = 'see log'"#
+        );
+        // Including one holding a doubled quote, which does not end it.
+        assert_eq!(
+            go("SELECT 'it''s log' FROM log"),
+            r#"SELECT 'it''s log' FROM "journal""#
+        );
+
+        // Every occurrence, not just the first, and qualified names too.
+        assert_eq!(
+            go("SELECT * FROM log JOIN log AS l ON l.id = log.id"),
+            r#"SELECT * FROM "journal" JOIN "journal" AS l ON l.id = "journal".id"#
+        );
+        // A name that is not there comes back untouched, byte for byte.
+        let untouched = "CREATE VIEW v AS SELECT * FROM other";
+        assert_eq!(rename_ident(untouched, "log", "journal"), untouched);
+    }
+
+    /// A view depends on a table when it names it — SQLite records no dependency,
+    /// so this scan is how a rebuild knows which views to drop and recreate.
+    #[test]
+    fn a_dependency_is_a_name_used_as_a_name() {
+        assert!(mentions_ident("CREATE VIEW v AS SELECT * FROM log", "log"));
+        assert!(mentions_ident(r#"SELECT * FROM "log""#, "log"));
+        assert!(
+            mentions_ident("SELECT * FROM LOG", "log"),
+            "case-insensitively"
+        );
+
+        assert!(!mentions_ident("SELECT * FROM logs", "log"), "not a prefix");
+        assert!(
+            !mentions_ident("SELECT * FROM backlog", "log"),
+            "not a suffix"
+        );
+        assert!(
+            !mentions_ident("SELECT 'log' FROM t", "log"),
+            "a string literal is not a dependency"
+        );
+        assert!(!mentions_ident("", "log"));
+    }
+
+    /// Quoting is how a name holding a space, a keyword or a quote survives, and
+    /// unquoting has to undo exactly what quoting did.
+    #[test]
+    fn quoting_and_unquoting_are_inverses() {
+        for name in [
+            "plain",
+            "odd name",
+            "select",
+            "with\"quote",
+            "with'apostrophe",
+            "with`tick",
+            "with]bracket",
+        ] {
+            assert_eq!(unquote(&quote(name)), name, "{name:?} did not survive");
+        }
+        // The forms SQLite accepts all unquote to the same name.
+        assert_eq!(unquote("\"log\""), "log");
+        assert_eq!(unquote("`log`"), "log");
+        assert_eq!(unquote("[log]"), "log");
+        assert_eq!(unquote("log"), "log", "a bare name is already unquoted");
+    }
 }
