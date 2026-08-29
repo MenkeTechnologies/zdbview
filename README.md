@@ -307,8 +307,10 @@ $ zdbview --formats
 A four-character tag is the little-endian u32 a producer stamping
 `u32::from_be_bytes(*b"LUAR")` writes, so the bytes read in file order; the
 `0x…` form (underscores allowed) sets the u32 directly for anything else. A
-registered tag zdbview has no decoder for is still worth adding: the scan then
-offers the file under its real name and the structural inspector opens it. An
+registered tag zdbview has no decoder for is still worth adding: the scan offers
+the file under its real name, and the Info view names the producer above
+`registered magic, no decoder in this build` rather than calling the archive
+unknown. An
 entry for a tag zdbview already knows renames it in the UI; the decoder keyed on
 that tag is unaffected. Unparseable lines are skipped, not fatal.
 
