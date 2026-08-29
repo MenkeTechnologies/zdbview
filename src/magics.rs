@@ -157,8 +157,9 @@ pub(crate) fn parse_tag(tag: &str) -> Option<u32> {
 }
 
 /// Builtins first, then user entries: a user name for a builtin tag replaces it,
-/// a new tag is appended. Later duplicates within the file lose to earlier ones,
-/// so the file reads top-down like every other config here.
+/// a new tag is appended. Within the file the last line for a tag wins, the way
+/// a repeated key wins in `prefs`, so a line pasted at the bottom does what it
+/// looks like it does.
 fn merge(builtin: &[(u32, &'static str)], user: &[(u32, String)]) -> Vec<(u32, &'static str)> {
     let mut out: Vec<(u32, &'static str)> = builtin.to_vec();
     for (magic, name) in user {
@@ -200,6 +201,34 @@ mod tests {
                 (0x0000_1234, "raw tag".to_string()),
             ]
         );
+    }
+
+    #[test]
+    fn a_name_may_contain_the_separator_and_surrounding_space() {
+        // Only the first `=` splits, so a name is free to hold one; a Windows
+        // line ending is trimmed off with the rest of the whitespace.
+        let got = parse("  LUAR   =   luars cache = the new one  \r\nPERL=perlrs\r\n");
+        assert_eq!(
+            got,
+            vec![
+                (0x4C55_4152, "luars cache = the new one".to_string()),
+                (0x5045_524C, "perlrs".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn case_is_part_of_a_tag() {
+        // Tags are bytes, not words: `luar` and `LUAR` are different producers.
+        assert_ne!(parse_tag("luar"), parse_tag("LUAR"));
+        assert_eq!(parse_tag("luar"), Some(0x6C75_6172));
+    }
+
+    #[test]
+    fn the_last_line_for_a_tag_wins() {
+        let user = parse("LUAR = first\nLUAR = second\n");
+        let merged = merge(&[], &user);
+        assert_eq!(merged, vec![(0x4C55_4152, "second")]);
     }
 
     #[test]

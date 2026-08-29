@@ -899,6 +899,27 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// rkyv writes its root last, so a big producer's header sits past the head
+    /// window. The tail scan has to find a registered tag there too, or a large
+    /// foreign shard is offered as an anonymous `.rkyv` file.
+    #[test]
+    fn a_registered_tag_past_the_head_window_is_still_named() {
+        crate::magics::install_test_registry();
+        let root = tmpdir("foreign_big");
+        let mut bytes = vec![0u8; (BIG_FILE + 1) as usize];
+        bytes.extend_from_slice(&foreign_shard_bytes());
+        write(&root.join("big.rkyv"), &bytes);
+
+        let hits = collect(&root);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(
+            hits[0].format,
+            Some(crate::magics::TEST_TAG_NAME),
+            "found in the tail window, not given up on"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     fn sqlite_bytes() -> Vec<u8> {
         let mut v = b"SQLite format 3\0".to_vec();
         v.extend(std::iter::repeat_n(0u8, 100));

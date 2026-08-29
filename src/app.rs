@@ -8338,6 +8338,91 @@ mod tests {
         assert!(contains(&rows, "Scanning for databases"));
     }
 
+    /// Keys that share everything but their last few characters — a cache keyed
+    /// by absolute path, which is what the script and bytecode caches are. The
+    /// list has to tell them apart, so it keeps the tail rather than the head.
+    #[test]
+    fn the_record_list_keeps_the_end_of_keys_that_share_a_prefix() {
+        let prefix = "/Users/somebody/projects/deeply/nested/checkout/pkg";
+        let recs: Vec<(String, Vec<u8>)> = ["alpha", "bravo", "charlie"]
+            .iter()
+            .map(|n| (format!("{prefix}/{n}.sh"), vec![b'x']))
+            .collect();
+        let mut app = rkyv_app_with(&crate::formats::test_script_shard_bytes_many(&recs));
+
+        // 60 columns of list: every key is longer than that, so all three are cut.
+        let rows = frame_rows(&mut app, 134, 24);
+        for name in ["alpha", "bravo", "charlie"] {
+            assert!(
+                contains(&rows, &format!("{name}.sh")),
+                "{name} is distinguishable: {rows:#?}"
+            );
+        }
+        assert!(
+            contains(&rows, "\u{2026}"),
+            "and the cut is marked: {rows:#?}"
+        );
+    }
+
+    /// The pane, not a constant, decides how much of a key is shown: a wide
+    /// terminal shows more of it. The old list cut at 60 characters however wide
+    /// the terminal was.
+    #[test]
+    fn a_wider_pane_shows_more_of_a_key() {
+        let key = format!("/{}/end.sh", "x".repeat(200));
+        let recs = vec![(key, vec![b'x'])];
+        let bytes = crate::formats::test_script_shard_bytes_many(&recs);
+
+        let shown = |w: u16| -> usize {
+            let mut app = rkyv_app_with(&bytes);
+            let rows = frame_rows(&mut app, w, 24);
+            // Measure the list pane only — the left 45% of the frame — since the
+            // value pane spells the key out whatever the list did with it. The
+            // longest run of the key's filler character there is what it fit.
+            let list_cols = (w as usize) * 45 / 100;
+            rows.iter()
+                .map(|r| {
+                    let list: String = r.chars().take(list_cols).collect();
+                    list.split(|c| c != 'x')
+                        .map(|run| run.chars().count())
+                        .max()
+                        .unwrap_or(0)
+                })
+                .max()
+                .unwrap_or(0)
+        };
+        // Both panes are wider than the 60 characters the list used to cut at,
+        // so a fixed cap would show the same amount in each.
+        let narrow = shown(160);
+        let wide = shown(300);
+        assert!(
+            wide > narrow,
+            "a wider pane shows more of the key: {wide} vs {narrow}"
+        );
+    }
+
+    /// The list can only ever show a tail, so the value pane carries the whole
+    /// key — wrapped over as many lines as it takes, never cut.
+    #[test]
+    fn the_value_pane_spells_out_the_whole_key() {
+        let key = "/Users/somebody/projects/deeply/nested/checkout/pkg/subdir/module/handler.sh";
+        let recs = vec![(key.to_string(), vec![b'x'])];
+        let mut app = rkyv_app_with(&crate::formats::test_script_shard_bytes_many(&recs));
+        let rows = frame_rows(&mut app, 120, 24);
+
+        // Every character of the key is on screen, in order, across the wrap.
+        let joined: String = rows.join("");
+        let mut cursor = 0usize;
+        for c in key.chars() {
+            let rest = &joined[cursor..];
+            let at = rest.find(c).unwrap_or_else(|| {
+                panic!("the key is cut before {c:?}: {rows:#?}");
+            });
+            cursor += at + c.len_utf8();
+        }
+        assert!(contains(&rows, "key"), "under its own label: {rows:#?}");
+    }
+
     /// A shard from a producer nothing in this build knows, written the way
     /// `spec/rkyv-shard-header.md` says to write one.
     #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
