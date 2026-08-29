@@ -236,6 +236,9 @@ mod tests {
         assert_eq!(ago(86_399), "23h ago");
         assert_eq!(ago(86_400), "1d ago");
         // A timestamp in the future is not a negative age.
-        assert_eq!(rel_age(SystemTime::now() + Duration::from_secs(600)), "0s ago");
+        assert_eq!(
+            rel_age(SystemTime::now() + Duration::from_secs(600)),
+            "0s ago"
+        );
     }
 }

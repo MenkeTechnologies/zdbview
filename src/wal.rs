@@ -477,7 +477,10 @@ mod tests {
         // Nothing written since the mark: nothing to report, and the salts hold.
         let mark = first.total_frames;
         let idle = read_frames_after(&path, mark, Some((first.salt1, first.salt2))).unwrap();
-        assert!(idle.frames.is_empty(), "polling is cheap when nothing wrote");
+        assert!(
+            idle.frames.is_empty(),
+            "polling is cheap when nothing wrote"
+        );
         assert!(!idle.restarted);
 
         conn.execute("INSERT INTO t (v) VALUES ('after the mark')", [])
@@ -494,11 +497,15 @@ mod tests {
 
         // A checkpoint restarts the log: the salts change, so the caller's mark
         // means nothing and everything is offered again.
-        conn.execute_batch("PRAGMA wal_checkpoint(RESTART)").unwrap();
+        conn.execute_batch("PRAGMA wal_checkpoint(RESTART)")
+            .unwrap();
         conn.execute("INSERT INTO t (v) VALUES ('after the checkpoint')", [])
             .unwrap();
         let after = read_frames_after(&path, 99, Some((first.salt1, first.salt2))).unwrap();
-        assert!(after.restarted, "the reset is reported, not silently skipped");
+        assert!(
+            after.restarted,
+            "the reset is reported, not silently skipped"
+        );
         assert!(
             !after.frames.is_empty(),
             "and the walk starts over rather than from a stale mark"
@@ -554,7 +561,10 @@ mod tests {
 
         // Past the end is None, not a panic or a short read.
         assert!(frame_page(&path, tail.frames.len() as u32 + 1_000).is_none());
-        assert!(frame_page(&path, 0).is_none(), "frames are numbered from one");
+        assert!(
+            frame_page(&path, 0).is_none(),
+            "frames are numbered from one"
+        );
         drop(conn);
     }
 

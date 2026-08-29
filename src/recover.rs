@@ -1003,7 +1003,11 @@ mod tests {
         // Cut the file short of the pages its header accounts for — the shape a
         // half-copied or half-written database has.
         let bytes = std::fs::read(&path).unwrap();
-        assert!(bytes.len() > 40_960, "the table has to span pages: {}", bytes.len());
+        assert!(
+            bytes.len() > 40_960,
+            "the table has to span pages: {}",
+            bytes.len()
+        );
         std::fs::write(&path, &bytes[..bytes.len() / 2]).unwrap();
         let refused = rusqlite::Connection::open(&path)
             .and_then(|c| c.query_row("SELECT count(*) FROM people", [], |r| r.get::<_, i64>(0)));
@@ -1025,7 +1029,10 @@ mod tests {
             "the surviving pages give up their rows: {} recovered",
             names.len()
         );
-        assert!(names.contains(&"person0".to_string()), "including the first");
+        assert!(
+            names.contains(&"person0".to_string()),
+            "including the first"
+        );
         assert!(
             recovered
                 .tables

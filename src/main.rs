@@ -1036,16 +1036,12 @@ mod tests {
         let dump = export_store(&st, "sql", None).unwrap();
         drop(st);
 
-        let script = std::env::temp_dir().join(format!(
-            "zdbview_cli_replay_{}.sql",
-            std::process::id()
-        ));
+        let script =
+            std::env::temp_dir().join(format!("zdbview_cli_replay_{}.sql", std::process::id()));
         std::fs::write(&script, &dump).unwrap();
         // An empty database, made the way `--new` makes one.
-        let dest = std::env::temp_dir().join(format!(
-            "zdbview_cli_replay_{}.db",
-            std::process::id()
-        ));
+        let dest =
+            std::env::temp_dir().join(format!("zdbview_cli_replay_{}.db", std::process::id()));
         let _ = std::fs::remove_file(&dest);
         crate::sqlite::SqliteStore::create(&dest).unwrap();
 
@@ -1066,7 +1062,11 @@ mod tests {
             })
             .unwrap();
         assert_eq!(a, "it's here", "the quote survived the round trip");
-        assert_eq!(raw, vec![0x00, 0xff], "and the blob is bytes, not a description");
+        assert_eq!(
+            raw,
+            vec![0x00, 0xff],
+            "and the blob is bytes, not a description"
+        );
         assert_eq!(n, 1.5);
         drop(conn);
 

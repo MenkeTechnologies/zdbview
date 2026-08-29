@@ -2648,7 +2648,6 @@ fn like_escape(term: &str) -> String {
     out
 }
 
-
 /// A script with its outermost `BEGIN …;` and closing `COMMIT;`/`END;` removed.
 ///
 /// Only the first and last statements are considered, which is where a dump puts
@@ -3060,7 +3059,12 @@ mod tests {
         );
 
         let key = RowKey::Primary(vec![("id".into(), "b".into())]);
-        assert_eq!(store.update_cell_keyed("k", &key, "note", "edited").unwrap(), 1);
+        assert_eq!(
+            store
+                .update_cell_keyed("k", &key, "note", "edited")
+                .unwrap(),
+            1
+        );
         store.write_changes().unwrap();
 
         let after = store.rows(&page("k", 10, 0, "", None, None)).unwrap();
@@ -3089,7 +3093,9 @@ mod tests {
         assert!(!store.has_pending(), "a fresh store owes nothing");
 
         let key = RowKey::Rowid(1);
-        store.update_cell_keyed("t", &key, "name", "changed").unwrap();
+        store
+            .update_cell_keyed("t", &key, "name", "changed")
+            .unwrap();
         assert!(store.has_pending(), "the edit is held, not written");
 
         // A second connection sees the database as it was.
@@ -3097,18 +3103,29 @@ mod tests {
         let seen: String = other
             .query_row("SELECT name FROM t WHERE rowid = 1", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(seen, "kick-0", "unwritten edits stay on their own connection");
+        assert_eq!(
+            seen, "kick-0",
+            "unwritten edits stay on their own connection"
+        );
 
-        assert!(store.revert_changes().unwrap(), "there was something to revert");
+        assert!(
+            store.revert_changes().unwrap(),
+            "there was something to revert"
+        );
         assert!(!store.has_pending());
-        assert!(!store.revert_changes().unwrap(), "and nothing left after that");
+        assert!(
+            !store.revert_changes().unwrap(),
+            "and nothing left after that"
+        );
         let restored: String = other
             .query_row("SELECT name FROM t WHERE rowid = 1", [], |r| r.get(0))
             .unwrap();
         assert_eq!(restored, "kick-0");
 
         // Write, and the other connection sees it.
-        store.update_cell_keyed("t", &key, "name", "written").unwrap();
+        store
+            .update_cell_keyed("t", &key, "name", "written")
+            .unwrap();
         assert!(store.write_changes().unwrap());
         assert!(!store.write_changes().unwrap(), "nothing to write twice");
         let seen: String = other
@@ -3128,7 +3145,9 @@ mod tests {
         // Every byte value, so nothing about it is valid UTF-8 or NUL-free.
         let bytes: Vec<u8> = (0..=255u8).collect();
         assert_eq!(
-            store.update_cell_blob_keyed("t", &key, "name", &bytes).unwrap(),
+            store
+                .update_cell_blob_keyed("t", &key, "name", &bytes)
+                .unwrap(),
             1
         );
         store.write_changes().unwrap();
@@ -3164,7 +3183,9 @@ mod tests {
         store.write_changes().unwrap();
         let is_null: bool = store
             .conn
-            .query_row("SELECT name IS NULL FROM t WHERE rowid = 1", [], |r| r.get(0))
+            .query_row("SELECT name IS NULL FROM t WHERE rowid = 1", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         assert!(!is_null, "an empty string is a value");
 
@@ -3172,7 +3193,9 @@ mod tests {
         store.write_changes().unwrap();
         let is_null: bool = store
             .conn
-            .query_row("SELECT name IS NULL FROM t WHERE rowid = 1", [], |r| r.get(0))
+            .query_row("SELECT name IS NULL FROM t WHERE rowid = 1", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         assert!(is_null, "and NULL is the absence of one");
         let _ = std::fs::remove_file(&path);
@@ -3185,7 +3208,10 @@ mod tests {
         let (path, store) = fixture("quoting", 5);
         let nasty = "o'brien\n\"quoted\"; DROP TABLE t; --";
         let key = RowKey::Rowid(1);
-        assert_eq!(store.update_cell_keyed("t", &key, "name", nasty).unwrap(), 1);
+        assert_eq!(
+            store.update_cell_keyed("t", &key, "name", nasty).unwrap(),
+            1
+        );
         store.write_changes().unwrap();
         assert_eq!(store.count("t").unwrap(), 5, "the table is still there");
         let back: String = store
@@ -3214,7 +3240,10 @@ mod tests {
         // Including when a dump wraps it, where both are present at once.
         let wrapped = format!("BEGIN TRANSACTION;\n{trigger}\nCOMMIT;");
         let stripped = strip_outer_transaction(&wrapped);
-        assert!(stripped.contains(trigger), "the trigger survives whole: {stripped}");
+        assert!(
+            stripped.contains(trigger),
+            "the trigger survives whole: {stripped}"
+        );
         assert!(!stripped.contains("BEGIN TRANSACTION"), "{stripped}");
         assert!(!stripped.contains("COMMIT;"), "{stripped}");
 
@@ -3242,10 +3271,16 @@ mod tests {
     fn a_dump_imports_and_a_failed_script_leaves_nothing_behind() {
         let (path, store) = fixture("import_sql", 3);
         let dump = store.dump(Some("t")).unwrap();
-        assert!(dump.contains("BEGIN TRANSACTION"), "the dump has one to strip");
+        assert!(
+            dump.contains("BEGIN TRANSACTION"),
+            "the dump has one to strip"
+        );
 
         let mut dest = std::env::temp_dir();
-        dest.push(format!("zdbview_sqlite_{}_import_dest.db", std::process::id()));
+        dest.push(format!(
+            "zdbview_sqlite_{}_import_dest.db",
+            std::process::id()
+        ));
         let _ = std::fs::remove_file(&dest);
         let fresh = SqliteStore::create(&dest).unwrap();
         assert_eq!(fresh.import_sql(&dump).unwrap(), 3, "three rows replayed");
@@ -3256,7 +3291,11 @@ mod tests {
         let err = fresh.import_sql("INSERT INTO t (name, n) VALUES ('x', 1); NOT SQL;");
         assert!(err.is_err(), "the bad statement is reported");
         fresh.write_changes().unwrap();
-        assert_eq!(fresh.count("t").unwrap(), 3, "and the good one did not stick");
+        assert_eq!(
+            fresh.count("t").unwrap(),
+            3,
+            "and the good one did not stick"
+        );
 
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(&dest);

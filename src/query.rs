@@ -447,7 +447,10 @@ mod tests {
         let done = engine
             .wait_page(Duration::from_secs(5))
             .expect("the newest page arrives");
-        assert_eq!(done.generation, last, "the newest generation, not an older one");
+        assert_eq!(
+            done.generation, last,
+            "the newest generation, not an older one"
+        );
         assert_eq!(engine.page_generation, last);
         let view = done.result.expect("rows");
         assert_eq!(view.rows[0][0], "40", "the page that was asked for last");
@@ -509,7 +512,10 @@ mod tests {
         assert!(engine.wait_page(Duration::from_millis(80)).is_none());
         let waited = start.elapsed();
         assert!(waited >= Duration::from_millis(70), "it waited: {waited:?}");
-        assert!(waited < Duration::from_secs(2), "but not forever: {waited:?}");
+        assert!(
+            waited < Duration::from_secs(2),
+            "but not forever: {waited:?}"
+        );
         let _ = std::fs::remove_file(&path);
     }
 
@@ -517,17 +523,21 @@ mod tests {
     /// and the grid is told there is no page rather than waiting on one.
     #[test]
     fn a_database_that_cannot_be_opened_does_not_hang_the_grid() {
-        let path = std::env::temp_dir().join(format!(
-            "zdbview_query_{}_absent.db",
-            std::process::id()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("zdbview_query_{}_absent.db", std::process::id()));
         let _ = std::fs::remove_file(&path);
         let mut engine = Engine::new(&path);
         engine.request(page(0), None);
         let start = Instant::now();
         assert!(engine.wait_page(Duration::from_secs(2)).is_none());
-        assert!(start.elapsed() < Duration::from_secs(2), "it did not sit out the grace");
-        assert!(!engine.page_inflight(), "and it stopped saying it was working");
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "it did not sit out the grace"
+        );
+        assert!(
+            !engine.page_inflight(),
+            "and it stopped saying it was working"
+        );
     }
 
     /// `n` wraps at the end of the table rather than reporting no match, and
