@@ -954,6 +954,14 @@ fn import_maps_columns_by_header_and_rolls_back_a_bad_file() {
         .to_string()
         .contains("nope"));
 
+    // A column the file does not mention is left to the table rather than being
+    // filled with an empty string. (Read through the store: the import sits in
+    // the unwritten edit savepoint, which another connection cannot see.)
+    assert_eq!(
+        view.rows[0][3], "NULL",
+        "an unmentioned column is untouched"
+    );
+
     // A row with the wrong field count rolls the whole import back.
     let ragged = vec![
         vec!["1".to_string(), "fine".to_string()],

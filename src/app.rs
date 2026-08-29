@@ -7107,6 +7107,11 @@ mod tests {
             .collect()
     }
 
+    /// The text of one rendered line, spans joined.
+    fn line_text(line: &ratatui::text::Line<'_>) -> String {
+        line.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
     fn contains(rows: &[String], needle: &str) -> bool {
         rows.iter().any(|r| r.contains(needle))
     }
@@ -8444,6 +8449,71 @@ mod tests {
             cursor += at + c.len_utf8();
         }
         assert!(contains(&rows, "key"), "under its own label: {rows:#?}");
+    }
+
+    /// The detail screen's value pane renders the same bytes four ways, and `v`
+    /// cycles them. Auto is the one that has to decide: text that reads as text,
+    /// bytes that do not as hex.
+    #[test]
+    fn v_cycles_how_the_value_is_rendered() {
+        let text = b"first line\nsecond line\n".to_vec();
+        let binary = vec![0x00u8, 0x01, 0xff, 0xfe, 0x7f, 0x80];
+
+        // Auto follows the content.
+        let auto_text = super::value_lines(&text, super::ValueRender::Auto, 0, 8);
+        assert_eq!(line_text(&auto_text[0]), "first line", "text reads as text");
+        let auto_bin = super::value_lines(&binary, super::ValueRender::Auto, 0, 8);
+        assert!(
+            line_text(&auto_bin[0]).contains("00 01 ff"),
+            "bytes read as hex: {}",
+            line_text(&auto_bin[0])
+        );
+
+        // The explicit modes override that decision in both directions.
+        let forced_hex = super::value_lines(&text, super::ValueRender::Hex, 0, 8);
+        assert!(
+            line_text(&forced_hex[0]).contains("66 69 72 73 74"),
+            "{}",
+            line_text(&forced_hex[0])
+        );
+        let forced_text = super::value_lines(&binary, super::ValueRender::Text, 0, 8);
+        assert_eq!(forced_text.len(), 1, "one lossy line, not a panic");
+
+        // Scrolling and the pane height bound what is drawn.
+        let scrolled = super::value_lines(&text, super::ValueRender::Text, 1, 8);
+        assert_eq!(line_text(&scrolled[0]), "second line");
+        assert_eq!(
+            super::value_lines(&text, super::ValueRender::Hex, 0, 1).len(),
+            1,
+            "a one-line pane draws one line"
+        );
+        assert!(
+            super::value_lines(&text, super::ValueRender::Hex, 99, 8).is_empty(),
+            "scrolled past the end there is nothing to draw"
+        );
+
+        // `v` walks all four and comes back, and the label names each.
+        let path = scratch("rkyv");
+        let recs = vec![("/tmp/one.sh".to_string(), text.clone())];
+        std::fs::write(&path, crate::formats::test_script_shard_bytes_many(&recs)).unwrap();
+        let store = Store::Rkyv(RkyvStore::open(&path).unwrap());
+        let mut app = App::with_theme(store, Theme::from_name(ThemeName::NeonSprawl));
+        app.on_key(KeyEvent::from(KeyCode::Enter)); // the detail screen
+        assert_eq!(app.screen, super::Screen::Detail);
+
+        let mut labels = vec![app.value_render.label()];
+        for _ in 0..3 {
+            press(&mut app, 'v');
+            labels.push(app.value_render.label());
+        }
+        assert_eq!(labels, ["auto", "hex", "text", "disasm"]);
+        press(&mut app, 'v');
+        assert_eq!(app.value_render.label(), "auto", "and it wraps");
+
+        // The pane's title says which mode is showing, so the cycle is visible.
+        let rows = frame_rows(&mut app, 100, 24);
+        assert!(contains(&rows, "render: auto"), "{rows:#?}");
+        let _ = std::fs::remove_file(&path);
     }
 
     /// `x` on the grid writes what the grid is showing — under its filter, not
