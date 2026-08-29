@@ -2161,4 +2161,56 @@ mod tests {
         // The oldest entries are the ones dropped.
         assert_eq!(e.transcript()[0], Entry::Changed(50));
     }
+
+    /// `last_statement` is what "save the last result as a view" and the export
+    /// build on, so it has to be the last statement that was *run* — a dot
+    /// command is a command to the editor, not SQL the database saw.
+    #[test]
+    fn the_last_statement_skips_the_editors_own_commands() {
+        let mut ed = SqlEdit::new(vec![("t".into(), vec!["a".into()])]);
+        assert_eq!(ed.last_statement(), None, "nothing has run yet");
+
+        ed.push(Entry::Sql("SELECT a FROM t".into()));
+        assert_eq!(ed.last_statement().as_deref(), Some("SELECT a FROM t"));
+
+        ed.push(Entry::Sql(".mode csv".into()));
+        assert_eq!(
+            ed.last_statement().as_deref(),
+            Some("SELECT a FROM t"),
+            "a dot command is not the statement"
+        );
+
+        ed.push(Entry::Sql("SELECT count(*) FROM t".into()));
+        assert_eq!(
+            ed.last_statement().as_deref(),
+            Some("SELECT count(*) FROM t"),
+            "the newest one wins"
+        );
+    }
+
+    /// A project restores one statement per tab, so putting statements back has
+    /// to make the tabs to hold them and leave the front one in front.
+    #[test]
+    fn statements_come_back_one_to_a_tab() {
+        let mut ed = SqlEdit::new(Vec::new());
+        assert_eq!(ed.tab_count(), 1);
+
+        ed.set_statements(&[
+            "SELECT 1".to_string(),
+            "SELECT 2".to_string(),
+            "SELECT 3".to_string(),
+        ]);
+        assert_eq!(ed.tab_count(), 3, "a tab each");
+        let mut back = ed.all_statements();
+        assert_eq!(back.remove(0), "SELECT 3", "the last one made is in front");
+        back.sort();
+        assert_eq!(back, vec!["SELECT 1".to_string(), "SELECT 2".to_string()]);
+
+        // Restoring nothing leaves the editor as it was rather than emptying it.
+        let mut ed = SqlEdit::new(Vec::new());
+        ed.set_statements(&["SELECT 9".to_string()]);
+        ed.set_statements(&[]);
+        assert_eq!(ed.text(), "SELECT 9");
+        assert_eq!(ed.tab_count(), 1);
+    }
 }

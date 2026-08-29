@@ -359,4 +359,29 @@ mod tests {
         let j = records_to_json(&recs);
         assert_eq!(j, "[{\"key\":\"/x\",\"len\":\"2\",\"value_hex\":\"dead\"}]");
     }
+
+    /// The dump and `insert` mode write values that are already SQL literals, so
+    /// nothing here may re-quote them: a blob stays `x'…'`, NULL stays a keyword,
+    /// and only the identifiers are quoted — including one holding a quote.
+    #[test]
+    fn literal_values_are_written_exactly_as_they_arrive() {
+        let cols = vec!["a".to_string(), "od\"d".to_string()];
+        let sql = insert_statement_literals(
+            "t\"able",
+            &cols,
+            &["x'00ff'".to_string(), "NULL".to_string()],
+        );
+        assert_eq!(
+            sql,
+            r#"INSERT INTO "t""able" ("a", "od""d") VALUES (x'00ff', NULL);"#
+        );
+
+        // A quoted string arrives quoted and is not quoted again.
+        let sql = insert_statement_literals("t", &["a".to_string()], &["'it''s here'".to_string()]);
+        assert!(sql.ends_with("VALUES ('it''s here');"), "{sql}");
+
+        // No columns and no values is still a statement SQLite parses as one.
+        let sql = insert_statement_literals("t", &[], &[]);
+        assert_eq!(sql, r#"INSERT INTO "t" () VALUES ();"#);
+    }
 }

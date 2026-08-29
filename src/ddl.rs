@@ -1493,4 +1493,93 @@ mod tests {
         assert_eq!(unquote("[log]"), "log");
         assert_eq!(unquote("log"), "log", "a bare name is already unquoted");
     }
+
+    /// The designer edits one column at a time as text, so a definition has to
+    /// survive being parsed apart and put back together — type, constraints and
+    /// all — or an edit to one column quietly rewrites another's rules.
+    #[test]
+    fn a_column_definition_survives_being_parsed_and_written_again() {
+        for def in [
+            "id INTEGER PRIMARY KEY AUTOINCREMENT",
+            "name TEXT NOT NULL",
+            "score REAL DEFAULT 0.0",
+            "note VARCHAR(255) COLLATE NOCASE",
+            "made_at TEXT DEFAULT CURRENT_TIMESTAMP",
+            "flag INTEGER NOT NULL DEFAULT 1 CHECK (flag IN (0, 1))",
+            "total INTEGER GENERATED ALWAYS AS (a + b) VIRTUAL",
+            "\"odd name\" TEXT UNIQUE",
+        ] {
+            let col = parse_column(def);
+            let round = parse_column(&col.to_sql(false));
+            assert_eq!(round.name, col.name, "{def}");
+            assert_eq!(round.ty, col.ty, "the type survives: {def}");
+            assert_eq!(round.not_null, col.not_null, "{def}");
+            assert_eq!(round.unique, col.unique, "{def}");
+            assert_eq!(round.default, col.default, "{def}");
+            assert_eq!(round.check, col.check, "{def}");
+            assert_eq!(round.collate, col.collate, "{def}");
+            assert_eq!(round.generated, col.generated, "{def}");
+        }
+
+        // The pieces are read, not just carried: each is where it belongs.
+        let col = parse_column("flag INTEGER NOT NULL DEFAULT 1 CHECK (flag IN (0, 1))");
+        assert_eq!(col.name, "flag");
+        assert_eq!(col.ty, "INTEGER");
+        assert!(col.not_null);
+        assert_eq!(col.default, "1");
+        assert_eq!(col.check, "flag IN (0, 1)");
+        // A quoted name is unquoted once, not carried with its quotes.
+        assert_eq!(parse_column("\"odd name\" TEXT").name, "odd name");
+        // Nothing at all is an empty column rather than a panic.
+        assert_eq!(parse_column("").name, "");
+    }
+
+    /// A rebuild creates the new table under a temporary name and copies into
+    /// it, so the statement has to be the definition under *that* name while
+    /// everything else about it stays put — including how the primary key is
+    /// written, which differs for one column and for several.
+    #[test]
+    fn a_definition_can_be_created_under_another_name() {
+        let def = parse_table(
+            "CREATE TABLE people (id INTEGER PRIMARY KEY, name TEXT NOT NULL, city TEXT)",
+        )
+        .expect("parses");
+        assert_eq!(def.pk_columns().len(), 1);
+
+        let temp = def.create_sql_as("people_zdbview_new");
+        assert!(
+            temp.starts_with("CREATE TABLE \"people_zdbview_new\""),
+            "{temp}"
+        );
+        assert!(
+            temp.contains("\"id\" INTEGER PRIMARY KEY"),
+            "one key inlines: {temp}"
+        );
+        assert!(temp.contains("\"name\" TEXT NOT NULL"), "{temp}");
+        assert_eq!(
+            def.create_sql(),
+            def.create_sql_as(&def.name),
+            "the plain form is the same statement under its own name"
+        );
+
+        // Several key columns become a table constraint instead.
+        let composite =
+            parse_table("CREATE TABLE pair (a TEXT, b TEXT, c TEXT, PRIMARY KEY (a, b))")
+                .expect("parses");
+        assert_eq!(composite.pk_columns().len(), 2, "both columns are the key");
+        let sql = composite.create_sql_as("pair_new");
+        assert!(sql.contains("PRIMARY KEY (\"a\", \"b\")"), "{sql}");
+        assert!(
+            !sql.contains("\"a\" TEXT PRIMARY KEY"),
+            "and neither column claims it alone: {sql}"
+        );
+
+        // The table's own tail options travel with it.
+        let opts =
+            parse_table("CREATE TABLE k (id TEXT PRIMARY KEY, v TEXT) WITHOUT ROWID, STRICT")
+                .expect("parses");
+        let sql = opts.create_sql_as("k_new");
+        assert!(sql.contains("WITHOUT ROWID"), "{sql}");
+        assert!(sql.contains("STRICT"), "{sql}");
+    }
 }
