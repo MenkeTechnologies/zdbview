@@ -831,6 +831,76 @@ mod tests {
         out
     }
 
+    /// A shard from a producer that is not zdbview's: the header
+    /// `spec/rkyv-shard-header.md` specifies, written by a type declared here
+    /// rather than copied from `formats`, under a tag no zdbview build ships.
+    /// This is what a third party's cache actually looks like on disk.
+    #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+    #[archive(check_bytes)]
+    struct ForeignHeader {
+        magic: u32,
+        format_version: u32,
+        producer_version: String,
+        pointer_width: u32,
+        built_at_secs: u64,
+    }
+
+    #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+    #[archive(check_bytes)]
+    struct ForeignShard {
+        header: ForeignHeader,
+        entries: std::collections::HashMap<String, Vec<u8>>,
+    }
+
+    /// `LUAR`, a tag this build has never heard of.
+    const FOREIGN_MAGIC: u32 = 0x4C55_4152;
+
+    fn foreign_shard_bytes() -> Vec<u8> {
+        let mut entries = std::collections::HashMap::new();
+        entries.insert("/tmp/init.lua".to_string(), b"compiled".to_vec());
+        let shard = ForeignShard {
+            header: ForeignHeader {
+                magic: FOREIGN_MAGIC,
+                format_version: 1,
+                producer_version: "0.1.0".into(),
+                pointer_width: 8,
+                built_at_secs: 7,
+            },
+            entries,
+        };
+        rkyv::to_bytes::<_, 1024>(&shard).unwrap().to_vec()
+    }
+
+    /// The walk offers a foreign producer's shard, by name, on the strength of a
+    /// registry entry alone — no copied archive type, no code that knows `LUAR`.
+    #[test]
+    fn the_walk_offers_a_shard_whose_tag_only_the_user_registered() {
+        assert!(
+            !crate::formats::BUILTIN_MAGICS
+                .iter()
+                .any(|(m, _)| *m == FOREIGN_MAGIC),
+            "LUAR must not be a built-in, or this proves nothing"
+        );
+        // Register it the way a user's config file does, then walk.
+        let mut registry = crate::formats::BUILTIN_MAGICS.to_vec();
+        registry.push((FOREIGN_MAGIC, "luars bytecode cache (LUAR)"));
+        crate::magics::install(registry);
+
+        let root = tmpdir("foreign");
+        write(&root.join("init.rkyv"), &foreign_shard_bytes());
+        let hits = collect(&root);
+
+        assert_eq!(hits.len(), 1, "the shard is offered");
+        assert_eq!(hits[0].kind, Kind::Rkyv);
+        assert_eq!(
+            hits[0].format,
+            Some("luars bytecode cache (LUAR)"),
+            "named by the registry, not by a decoder"
+        );
+        assert_eq!(hits[0].rank, 0, "ranked as a recognized shard, not as noise");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     fn sqlite_bytes() -> Vec<u8> {
         let mut v = b"SQLite format 3\0".to_vec();
         v.extend(std::iter::repeat_n(0u8, 100));

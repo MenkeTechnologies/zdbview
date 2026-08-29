@@ -84,6 +84,63 @@ fn a_tag_this_build_never_shipped_is_detected_and_named() {
     assert!(formats::try_decode(&stamped(LUAR)).is_none());
 }
 
+/// The header `spec/rkyv-shard-header.md` specifies, declared here as a producer
+/// outside this repo would declare it — the spec's own code block, not a type
+/// copied out of `formats`. What zdbview knows about it is one line of config.
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+#[archive(check_bytes)]
+struct ForeignHeader {
+    magic: u32,
+    format_version: u32,
+    producer_version: String,
+    pointer_width: u32,
+    built_at_secs: u64,
+}
+
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+#[archive(check_bytes)]
+struct ForeignShard {
+    header: ForeignHeader,
+    entries: std::collections::HashMap<String, Vec<u8>>,
+}
+
+fn foreign_shard_bytes() -> Vec<u8> {
+    let mut entries = std::collections::HashMap::new();
+    entries.insert("/tmp/init.lua".to_string(), b"compiled chunk".to_vec());
+    let shard = ForeignShard {
+        header: ForeignHeader {
+            magic: LUAR,
+            format_version: 1,
+            producer_version: "0.1.0".into(),
+            pointer_width: 8,
+            built_at_secs: 7,
+        },
+        entries,
+    };
+    rkyv::to_bytes::<_, 1024>(&shard).unwrap().to_vec()
+}
+
+#[test]
+fn a_conforming_producer_needs_nothing_from_this_repo() {
+    registry();
+    // Bytes a foreign producer wrote, following the spec and nothing else.
+    let bytes = foreign_shard_bytes();
+    assert_eq!(
+        formats::magic_in(&bytes),
+        Some("luars bytecode cache (LUAR)"),
+        "a real archive from an unknown producer, named by the registry"
+    );
+    // No copied archive type exists for it, so it stays an opaque named archive
+    // rather than being cast to some other producer's layout.
+    assert!(formats::try_decode(&bytes).is_none());
+    // The header the spec requires is readable by the producer that wrote it —
+    // the tag zdbview matched is the one in that header, not a coincidence in
+    // the payload.
+    let archived = rkyv::check_archived_root::<ForeignShard>(&bytes).expect("validates");
+    assert_eq!(u32::from(archived.header.magic), LUAR);
+    assert_eq!(u32::from(archived.header.format_version), 1);
+}
+
 #[test]
 fn a_user_tag_survives_the_scan_cache_round_trip() {
     registry();
