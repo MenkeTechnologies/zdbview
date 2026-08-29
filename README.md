@@ -740,7 +740,11 @@ zdbview --project session.zdbp  # open the database a project names, as it was l
 `--readonly` opens a different connection rather than checking a flag at the
 edit, so no key handler can write through it by accident. `--import-sql` runs the
 whole script inside one savepoint: a script that fails half way leaves the
-database exactly as it was. `--new` refuses to overwrite an existing file, and
+database exactly as it was. A script's own outermost `BEGIN`/`COMMIT` — which
+`--export sql` and `sqlite3 .dump` both write — is dropped, since the savepoint
+already provides it; a `BEGIN … END` inside the script, a trigger body above all,
+is left alone. So a dump replays as it stands:
+`zdbview old.db --export sql > d.sql && zdbview --new copy.db --import-sql d.sql`. `--new` refuses to overwrite an existing file, and
 forces a page out so the file it made is a database rather than an empty file.
 
 In the editor, `.load FILE` loads an extension — the shell's own command, and DB

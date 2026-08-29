@@ -51,7 +51,18 @@ connection, not a flag checked at the edit, so nothing can write through it.
 .BI \-\-import\-sql " FILE"
 Run a file of SQL into the database and exit, DB Browser's "Import from SQL
 file". The whole script runs inside one savepoint, so a script that fails half
-way leaves the database exactly as it was.
+way leaves the database exactly as it was. The script's own outermost
+.B BEGIN
+and
+.B COMMIT
+\(em which
+.B \-\-export sql
+and
+.B sqlite3 .dump
+both write \(em are dropped, since the savepoint already provides them; a
+.B "BEGIN ... END"
+inside the script, a trigger body above all, is left alone. A dump therefore
+replays as it stands.
 .TP
 .BI \-\-load\-extension " FILE"
 Load a SQLite extension before opening the database. Repeatable. Extension

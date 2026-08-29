@@ -2107,7 +2107,15 @@ impl SqliteStore {
     /// Run a file of SQL into the database — DB Browser's "Import from SQL
     /// file". The whole script is one savepoint, so a script that fails half way
     /// leaves nothing behind.
+    ///
+    /// A dump's own `BEGIN`/`COMMIT` pair is dropped first: the script runs
+    /// inside this savepoint, where a nested `BEGIN` is an error, and the
+    /// savepoint already gives the script the all-or-nothing the `BEGIN` was
+    /// asking for. Without this, replaying `--export sql` — or any `sqlite3
+    /// .dump`, which always writes that pair — failed on its first line.
     pub fn import_sql(&self, script: &str) -> Result<usize> {
+        let script = strip_outer_transaction(script);
+        let script = script.as_str();
         let before = self.conn.total_changes();
         self.begin_edit()?;
         self.conn.execute_batch("SAVEPOINT zdbview_script")?;
@@ -2640,6 +2648,70 @@ fn like_escape(term: &str) -> String {
     out
 }
 
+
+/// A script with its outermost `BEGIN …;` and closing `COMMIT;`/`END;` removed.
+///
+/// Only the first and last statements are considered, which is where a dump puts
+/// them; a `BEGIN` in the middle of the script — a trigger body's, above all —
+/// is left exactly where it is.
+fn strip_outer_transaction(script: &str) -> String {
+    let mut out = script.trim_end().to_string();
+
+    // Leading: skip whitespace, comments and the PRAGMA lines a dump opens with,
+    // then drop the transaction statement if that is what comes next.
+    let mut at = 0;
+    loop {
+        let rest = &out[at..];
+        let skipped = rest.len() - rest.trim_start().len();
+        at += skipped;
+        let rest = &out[at..];
+        if rest.starts_with("--") {
+            at += rest.find('\n').map(|n| n + 1).unwrap_or(rest.len());
+            continue;
+        }
+        if rest.starts_with("/*") {
+            at += rest.find("*/").map(|n| n + 2).unwrap_or(rest.len());
+            continue;
+        }
+        let word: String = rest
+            .chars()
+            .take_while(|c| c.is_ascii_alphabetic())
+            .collect::<String>()
+            .to_ascii_uppercase();
+        match word.as_str() {
+            // A dump's `PRAGMA foreign_keys=OFF;` sits ahead of the BEGIN.
+            "PRAGMA" => match rest.find(';') {
+                Some(end) => at += end + 1,
+                None => break,
+            },
+            "BEGIN" => {
+                if let Some(end) = rest.find(';') {
+                    out.replace_range(at..at + end + 1, "");
+                }
+                break;
+            }
+            _ => break,
+        }
+    }
+
+    // Trailing: a final `COMMIT;`. A bare `END;` is left alone — it is how a
+    // trigger body closes, and a dump full of triggers ends with one.
+    let trimmed = out.trim_end();
+    if let Some(body) = trimmed.strip_suffix(';') {
+        let tail = body.rsplit(';').next().unwrap_or(body).trim();
+        let tail_upper = tail.to_ascii_uppercase();
+        let is_commit = matches!(
+            tail_upper.as_str(),
+            "COMMIT" | "COMMIT TRANSACTION" | "END TRANSACTION"
+        );
+        if is_commit {
+            let cut = trimmed.len() - tail.len() - 1;
+            out.truncate(cut);
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3122,5 +3194,71 @@ mod tests {
             .unwrap();
         assert_eq!(back, nasty, "stored exactly as typed");
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// The outer transaction a dump writes is dropped so the script can run
+    /// inside the edit savepoint — and nothing else that says BEGIN is touched.
+    #[test]
+    fn only_the_scripts_own_outer_transaction_is_stripped() {
+        let dump = "PRAGMA foreign_keys=OFF;\nBEGIN TRANSACTION;\nCREATE TABLE t(a);\nCOMMIT;\n";
+        let stripped = strip_outer_transaction(dump);
+        assert!(stripped.contains("PRAGMA foreign_keys=OFF;"), "{stripped}");
+        assert!(stripped.contains("CREATE TABLE t(a);"), "{stripped}");
+        assert!(!stripped.to_uppercase().contains("BEGIN"), "{stripped}");
+        assert!(!stripped.to_uppercase().contains("COMMIT"), "{stripped}");
+
+        // A trigger body is BEGIN … END and is the script's own content — the
+        // END that closes it is not the end of a transaction.
+        let trigger = "CREATE TRIGGER tr AFTER INSERT ON t BEGIN UPDATE t SET a = 1; END;";
+        assert_eq!(strip_outer_transaction(trigger), trigger);
+        // Including when a dump wraps it, where both are present at once.
+        let wrapped = format!("BEGIN TRANSACTION;\n{trigger}\nCOMMIT;");
+        let stripped = strip_outer_transaction(&wrapped);
+        assert!(stripped.contains(trigger), "the trigger survives whole: {stripped}");
+        assert!(!stripped.contains("BEGIN TRANSACTION"), "{stripped}");
+        assert!(!stripped.contains("COMMIT;"), "{stripped}");
+
+        // A script with no transaction of its own comes back as it went in.
+        let plain = "INSERT INTO t VALUES (1);\nINSERT INTO t VALUES (2);";
+        assert_eq!(strip_outer_transaction(plain), plain);
+
+        // The words inside a value are values, not statements.
+        let literal = "INSERT INTO t VALUES ('begin transaction; commit;');";
+        assert_eq!(strip_outer_transaction(literal), literal);
+
+        // Comments ahead of the BEGIN do not hide it.
+        let commented =
+            "-- made by zdbview\n/* two kinds */\nBEGIN;\nINSERT INTO t VALUES (1);\nCOMMIT;";
+        let stripped = strip_outer_transaction(commented);
+        assert!(stripped.contains("-- made by zdbview"), "{stripped}");
+        assert!(stripped.contains("INSERT INTO t VALUES (1);"), "{stripped}");
+        assert!(!stripped.contains("BEGIN;"), "{stripped}");
+        assert!(!stripped.contains("COMMIT;"), "{stripped}");
+    }
+
+    /// The whole point of stripping it: a dump replays through the same call the
+    /// SQL-file import uses, and a broken statement still takes nothing with it.
+    #[test]
+    fn a_dump_imports_and_a_failed_script_leaves_nothing_behind() {
+        let (path, store) = fixture("import_sql", 3);
+        let dump = store.dump(Some("t")).unwrap();
+        assert!(dump.contains("BEGIN TRANSACTION"), "the dump has one to strip");
+
+        let mut dest = std::env::temp_dir();
+        dest.push(format!("zdbview_sqlite_{}_import_dest.db", std::process::id()));
+        let _ = std::fs::remove_file(&dest);
+        let fresh = SqliteStore::create(&dest).unwrap();
+        assert_eq!(fresh.import_sql(&dump).unwrap(), 3, "three rows replayed");
+        fresh.write_changes().unwrap();
+        assert_eq!(fresh.count("t").unwrap(), 3);
+
+        // A script that fails part way is rolled back whole.
+        let err = fresh.import_sql("INSERT INTO t (name, n) VALUES ('x', 1); NOT SQL;");
+        assert!(err.is_err(), "the bad statement is reported");
+        fresh.write_changes().unwrap();
+        assert_eq!(fresh.count("t").unwrap(), 3, "and the good one did not stick");
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&dest);
     }
 }

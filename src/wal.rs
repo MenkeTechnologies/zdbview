@@ -463,4 +463,123 @@ mod tests {
             "the stale region is reported, not hidden"
         );
     }
+
+    /// The monitor polls: it asks only for what arrived since its mark, and it
+    /// has to notice a checkpoint, which resets the log and renumbers frames.
+    #[test]
+    fn only_new_frames_come_back_and_a_reset_is_reported() {
+        let (path, conn) = wal_db("incremental", 3);
+        let first = read_frames_after(&path, 0, None).expect("a log exists");
+        assert!(!first.frames.is_empty());
+        assert_eq!(first.total_frames, first.frames.len() as u32);
+        assert!(!first.restarted, "nothing to have restarted from yet");
+
+        // Nothing written since the mark: nothing to report, and the salts hold.
+        let mark = first.total_frames;
+        let idle = read_frames_after(&path, mark, Some((first.salt1, first.salt2))).unwrap();
+        assert!(idle.frames.is_empty(), "polling is cheap when nothing wrote");
+        assert!(!idle.restarted);
+
+        conn.execute("INSERT INTO t (v) VALUES ('after the mark')", [])
+            .unwrap();
+        let more = read_frames_after(&path, mark, Some((first.salt1, first.salt2))).unwrap();
+        assert!(!more.frames.is_empty(), "the new write shows up");
+        assert_eq!(
+            more.frames[0].index,
+            mark + 1,
+            "frames are numbered from the file, not from the batch"
+        );
+        assert!(more.frames.iter().all(|f| f.live), "and belong to this log");
+        assert!(more.frames.last().unwrap().commit, "the write committed");
+
+        // A checkpoint restarts the log: the salts change, so the caller's mark
+        // means nothing and everything is offered again.
+        conn.execute_batch("PRAGMA wal_checkpoint(RESTART)").unwrap();
+        conn.execute("INSERT INTO t (v) VALUES ('after the checkpoint')", [])
+            .unwrap();
+        let after = read_frames_after(&path, 99, Some((first.salt1, first.salt2))).unwrap();
+        assert!(after.restarted, "the reset is reported, not silently skipped");
+        assert!(
+            !after.frames.is_empty(),
+            "and the walk starts over rather than from a stale mark"
+        );
+        drop(conn);
+    }
+
+    /// The log holds the newest image of a page, which is what the database file
+    /// does not yet have. Only the newest is kept, however many times a page was
+    /// written.
+    #[test]
+    fn the_newest_image_of_each_page_is_what_comes_back() {
+        let (path, conn) = wal_db("images", 2);
+        // Rewrite the same row repeatedly: the same page, many frames.
+        for i in 0..20 {
+            conn.execute("UPDATE t SET v = ?1 WHERE id = 1", [format!("v{i}")])
+                .unwrap();
+        }
+        let tail = read_tail(&path, 512).expect("a log");
+        let (page_size, pages, db_size) = latest_pages(&path).expect("images");
+        assert_eq!(page_size, tail.page_size);
+        assert!(db_size > 0, "the last commit recorded a size");
+        assert!(
+            pages.len() < tail.frames.len(),
+            "one image per page, not one per frame: {} pages from {} frames",
+            pages.len(),
+            tail.frames.len()
+        );
+        for image in pages.values() {
+            assert_eq!(image.len(), page_size as usize, "whole pages, always");
+        }
+
+        // The newest image of the page holding the row carries the newest value;
+        // the database file still has the old one.
+        let newest_holds_it = pages
+            .values()
+            .any(|img| String::from_utf8_lossy(img).contains("v19"));
+        assert!(newest_holds_it, "the log holds the write the file has not");
+        drop(conn);
+    }
+
+    /// One frame by index, which is how the frame browser pages through history
+    /// without reading the whole log.
+    #[test]
+    fn a_frame_can_be_read_on_its_own() {
+        let (path, conn) = wal_db("byindex", 4);
+        let tail = read_tail(&path, 64).expect("a log");
+        let wanted = tail.frames.last().expect("frames");
+
+        let (page, image) = frame_page(&path, wanted.index).expect("the frame");
+        assert_eq!(page, wanted.page, "the header agrees with the walk");
+        assert_eq!(image.len(), tail.page_size as usize);
+
+        // Past the end is None, not a panic or a short read.
+        assert!(frame_page(&path, tail.frames.len() as u32 + 1_000).is_none());
+        assert!(frame_page(&path, 0).is_none(), "frames are numbered from one");
+        drop(conn);
+    }
+
+    /// A log caught mid-write ends in a partial frame. Reading it must stop at
+    /// the last whole frame rather than reporting a torn one.
+    #[test]
+    fn a_half_written_frame_at_the_end_is_not_offered() {
+        let (path, conn) = wal_db("torn", 4);
+        let whole = read_tail(&path, 64).expect("a log").frames.len();
+
+        // The connection stays open: closing it checkpoints and removes the log.
+        // Append half a frame, as a writer interrupted mid-write leaves behind.
+        let log = wal_path(&path);
+        let mut bytes = std::fs::read(&log).unwrap();
+        let half = bytes.len() / 2;
+        bytes.extend(std::iter::repeat_n(0u8, half.min(1024)));
+        std::fs::write(&log, &bytes).unwrap();
+
+        let tail = read_tail(&path, 64).expect("still readable");
+        assert_eq!(
+            tail.frames.len(),
+            whole,
+            "the torn tail is ignored, the whole frames are kept"
+        );
+        assert!(read_frames_after(&path, 0, None).is_some());
+        drop(conn);
+    }
 }

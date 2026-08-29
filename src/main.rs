@@ -1024,6 +1024,57 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
+    /// `--export sql` is advertised as a replayable dump, so it has to replay:
+    /// into an empty database, through the same `--import-sql` path a user would
+    /// use, reproducing the schema and every value including the blob, the real
+    /// and the embedded quote.
+    #[test]
+    fn a_sql_dump_replays_into_an_empty_database() {
+        let src = fixture("dump_src.db");
+        let kind = store::detect(&src, false, false).unwrap();
+        let (st, _) = store::Store::open(&src, kind).unwrap();
+        let dump = export_store(&st, "sql", None).unwrap();
+        drop(st);
+
+        let script = std::env::temp_dir().join(format!(
+            "zdbview_cli_replay_{}.sql",
+            std::process::id()
+        ));
+        std::fs::write(&script, &dump).unwrap();
+        // An empty database, made the way `--new` makes one.
+        let dest = std::env::temp_dir().join(format!(
+            "zdbview_cli_replay_{}.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&dest);
+        crate::sqlite::SqliteStore::create(&dest).unwrap();
+
+        run_import_sql(
+            &cli(&[
+                dest.to_str().unwrap(),
+                "--import-sql",
+                script.to_str().unwrap(),
+            ]),
+            &script,
+        )
+        .unwrap();
+
+        let conn = rusqlite::Connection::open(&dest).unwrap();
+        let (a, raw, n): (String, Vec<u8>, f64) = conn
+            .query_row("SELECT a, raw, n FROM t", [], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
+            .unwrap();
+        assert_eq!(a, "it's here", "the quote survived the round trip");
+        assert_eq!(raw, vec![0x00, 0xff], "and the blob is bytes, not a description");
+        assert_eq!(n, 1.5);
+        drop(conn);
+
+        for p in [src, dest, script] {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+
     /// The four non-interactive entry points refuse what they cannot do, with a
     /// message that says which requirement was missed.
     #[test]
