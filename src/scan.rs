@@ -895,7 +895,10 @@ mod tests {
             Some(crate::magics::TEST_TAG_NAME),
             "named by the registry, not by a decoder"
         );
-        assert_eq!(hits[0].rank, 0, "ranked as a recognized shard, not as noise");
+        assert_eq!(
+            hits[0].rank, 0,
+            "ranked as a recognized shard, not as noise"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
