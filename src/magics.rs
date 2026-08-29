@@ -173,9 +173,8 @@ mod tests {
 
     #[test]
     fn bad_lines_do_not_cost_the_good_ones() {
-        let got = parse(
-            "# a comment\n\nLUAR = luars cache (LUAR)\ngarbage\nNOPE =\n0x1234 = raw tag\n",
-        );
+        let got =
+            parse("# a comment\n\nLUAR = luars cache (LUAR)\ngarbage\nNOPE =\n0x1234 = raw tag\n");
         assert_eq!(
             got,
             vec![

@@ -90,7 +90,10 @@ fn a_user_tag_survives_the_scan_cache_round_trip() {
     // The saved scan stores the display name and restores the format from it;
     // a user tag has to come back through that lookup like any built-in.
     let name = formats::magic_in(&stamped(LUAR)).expect("detected");
-    assert_eq!(formats::magic_label(name), Some("luars bytecode cache (LUAR)"));
+    assert_eq!(
+        formats::magic_label(name),
+        Some("luars bytecode cache (LUAR)")
+    );
     assert_eq!(formats::magic_label("a format nobody registered"), None);
 }
 
