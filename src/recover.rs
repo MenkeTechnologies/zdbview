@@ -978,4 +978,94 @@ mod tests {
         );
         assert!(create_columns("CREATE VIEW v AS SELECT 1").is_empty());
     }
+
+    /// A database SQLite refuses to read is exactly what recovery is for: the
+    /// pass reads rows out of the pages that are still there, without opening it.
+    #[test]
+    fn rows_come_back_from_a_file_sqlite_will_not_read() {
+        let mut path = std::env::temp_dir();
+        path.push(format!("zdbview_recover_{}_broken.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute("CREATE TABLE people (name TEXT, age INTEGER)", [])
+                .unwrap();
+            let tx = conn.unchecked_transaction().unwrap();
+            for i in 0..2000 {
+                tx.execute(
+                    "INSERT INTO people VALUES (?1, ?2)",
+                    rusqlite::params![format!("person{i}"), i],
+                )
+                .unwrap();
+            }
+            tx.commit().unwrap();
+        }
+        // Cut the file short of the pages its header accounts for — the shape a
+        // half-copied or half-written database has.
+        let bytes = std::fs::read(&path).unwrap();
+        assert!(bytes.len() > 40_960, "the table has to span pages: {}", bytes.len());
+        std::fs::write(&path, &bytes[..bytes.len() / 2]).unwrap();
+        let refused = rusqlite::Connection::open(&path)
+            .and_then(|c| c.query_row("SELECT count(*) FROM people", [], |r| r.get::<_, i64>(0)));
+        assert!(
+            refused.is_err(),
+            "sqlite must refuse it, or this proves nothing: {refused:?}"
+        );
+
+        let recovered = super::recover(&path).expect("recovery reads the pages regardless");
+        let names: Vec<String> = recovered
+            .rows_for("people")
+            .filter_map(|r| match r.values.first() {
+                Some(Value::Text(t)) => Some(t.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            names.len() > 100,
+            "the surviving pages give up their rows: {} recovered",
+            names.len()
+        );
+        assert!(names.contains(&"person0".to_string()), "including the first");
+        assert!(
+            recovered
+                .tables
+                .iter()
+                .any(|t| t.name == "people" && t.columns == vec!["name", "age"]),
+            "the schema is recovered too: {:?}",
+            recovered.tables
+        );
+
+        // The script replays: the CREATE, then rowid-preserving inserts that a
+        // second run cannot trip over.
+        let sql = super::to_sql(&recovered);
+        assert!(sql.contains("CREATE TABLE people"), "{}", &sql[..400]);
+        assert!(
+            sql.contains(r#"INSERT OR IGNORE INTO "people"(_rowid_, "name", "age") VALUES (1, 'person0', 0);"#),
+            "the first row, with its rowid"
+        );
+        assert!(sql.trim_end().ends_with("COMMIT;"));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A truncated record is what a damaged page holds; decoding one must stop
+    /// rather than read past the payload or panic.
+    #[test]
+    fn a_truncated_record_decodes_to_what_survived() {
+        // Header: length 4, then serial types 1 (i8), 13+2*3 = 19 (3-char text).
+        let full = [0x03u8, 0x01, 0x13, 0x07, b'a', b'b', b'c'];
+        assert_eq!(
+            super::decode_record(&full),
+            vec![Value::Int(7), Value::Text("abc".into())]
+        );
+        // The same record with its body cut short: the int survives, the text
+        // that is no longer there comes back NULL rather than as stray bytes.
+        assert_eq!(
+            super::decode_record(&full[..5]),
+            vec![Value::Int(7), Value::Null]
+        );
+        // Nothing at all is no values, not a panic.
+        assert!(super::decode_record(&[]).is_empty());
+        assert!(super::decode_record(&[0x80]).is_empty());
+    }
 }

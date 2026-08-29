@@ -283,7 +283,15 @@ impl Engine {
                         return Some(done);
                     }
                 }
-                Err(_) => return None,
+                // The worker is gone — a database it could not open — so nothing
+                // is outstanding any more and the grid must stop saying one is.
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    self.pages.inflight = false;
+                    return None;
+                }
+                // Still working: the page missed its grace and is left to
+                // `poll_page`, which is what the grace period is for.
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => return None,
             }
         }
     }
@@ -388,5 +396,175 @@ where
         out: out_rx,
         live,
         inflight: false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{search, CountReq, Engine, PageReq, SearchReq};
+    use crate::sqlite::SqliteStore;
+    use std::path::PathBuf;
+    use std::time::{Duration, Instant};
+
+    /// A database of `n` rows, `a` counting up and `b` constant.
+    fn db(name: &str, n: i64) -> PathBuf {
+        let mut path = std::env::temp_dir();
+        path.push(format!("zdbview_query_{}_{}.db", std::process::id(), name));
+        let _ = std::fs::remove_file(&path);
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute("CREATE TABLE t (a TEXT, b TEXT)", []).unwrap();
+        for i in 0..n {
+            conn.execute("INSERT INTO t VALUES (?1, 'same')", [i.to_string()])
+                .unwrap();
+        }
+        path
+    }
+
+    fn page(offset: i64) -> PageReq {
+        PageReq {
+            table: "t".into(),
+            limit: 10,
+            offset,
+            sort: None,
+            filter: String::new(),
+            hint: None,
+            known_total: None,
+            formats: std::collections::HashMap::new(),
+        }
+    }
+
+    /// A burst of keystrokes asks for several pages; only the newest is ever
+    /// handed back, and it is the one the grid draws.
+    #[test]
+    fn only_the_newest_page_reaches_the_caller() {
+        let path = db("burst", 200);
+        let mut engine = Engine::new(&path);
+
+        let mut last = 0;
+        for offset in [0, 10, 20, 30, 40] {
+            last = engine.request(page(offset), None);
+        }
+        let done = engine
+            .wait_page(Duration::from_secs(5))
+            .expect("the newest page arrives");
+        assert_eq!(done.generation, last, "the newest generation, not an older one");
+        assert_eq!(engine.page_generation, last);
+        let view = done.result.expect("rows");
+        assert_eq!(view.rows[0][0], "40", "the page that was asked for last");
+
+        // Nothing stale is queued behind it.
+        assert!(engine.poll_page().is_none());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Generations are handed out in order and identify the request, which is
+    /// what lets a late result be dropped.
+    #[test]
+    fn every_request_gets_the_next_generation() {
+        let path = db("gens", 5);
+        let mut engine = Engine::new(&path);
+        let first = engine.request(page(0), None);
+        let second = engine.request(page(0), None);
+        assert_eq!(second, first + 1);
+        engine.request_count(CountReq {
+            table: "t".into(),
+            filter: String::new(),
+        });
+        let third = engine.request(page(0), None);
+        assert_eq!(third, second + 2, "the count consumed one too");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A count comes back saying what it counted, so a total that no longer
+    /// describes the screen can be thrown away instead of shown.
+    #[test]
+    fn a_count_says_what_it_counted() {
+        let path = db("counts", 60);
+        let mut engine = Engine::new(&path);
+        engine.request_count(CountReq {
+            table: "t".into(),
+            filter: "4".into(),
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let done = loop {
+            if let Some(d) = engine.poll_count() {
+                break d;
+            }
+            assert!(Instant::now() < deadline, "the count never arrived");
+        };
+        assert_eq!(done.table, "t");
+        assert_eq!(done.filter, "4");
+        // 4, 14, 24, 34, 40..49, 54.
+        assert_eq!(done.result.unwrap(), 15);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// `wait_page` is a grace period, not a block: with nothing outstanding it
+    /// gives up and lets the frame draw.
+    #[test]
+    fn waiting_for_a_page_nobody_asked_for_gives_up() {
+        let path = db("idle", 1);
+        let mut engine = Engine::new(&path);
+        let start = Instant::now();
+        assert!(engine.wait_page(Duration::from_millis(80)).is_none());
+        let waited = start.elapsed();
+        assert!(waited >= Duration::from_millis(70), "it waited: {waited:?}");
+        assert!(waited < Duration::from_secs(2), "but not forever: {waited:?}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A database the workers cannot open must not hang the UI: the threads exit
+    /// and the grid is told there is no page rather than waiting on one.
+    #[test]
+    fn a_database_that_cannot_be_opened_does_not_hang_the_grid() {
+        let path = std::env::temp_dir().join(format!(
+            "zdbview_query_{}_absent.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let mut engine = Engine::new(&path);
+        engine.request(page(0), None);
+        let start = Instant::now();
+        assert!(engine.wait_page(Duration::from_secs(2)).is_none());
+        assert!(start.elapsed() < Duration::from_secs(2), "it did not sit out the grace");
+        assert!(!engine.page_inflight(), "and it stopped saying it was working");
+    }
+
+    /// `n` wraps at the end of the table rather than reporting no match, and
+    /// reports the match's position in display order so the caller knows which
+    /// page to load.
+    #[test]
+    fn a_search_wraps_and_reports_the_position() {
+        let path = db("search", 30);
+        let store = SqliteStore::open_readonly(&path).unwrap();
+        let req = |from: Option<i64>, forward: bool| SearchReq {
+            table: "t".into(),
+            columns: vec!["a".into(), "b".into()],
+            term: "29".into(),
+            sort: None,
+            filter: String::new(),
+            from,
+            forward,
+        };
+
+        // Row 30 holds "29" — the last row, found from the start.
+        let (rowid, ordinal) = search(&store, &req(Some(1), true)).unwrap().unwrap();
+        assert_eq!(ordinal, 30, "1-based position in display order");
+
+        // Searching forward from the only match wraps back to it.
+        let (again, _) = search(&store, &req(Some(rowid), true)).unwrap().unwrap();
+        assert_eq!(again, rowid, "the search wrapped instead of giving up");
+
+        // A term nothing holds is no match, not an error.
+        let none = search(
+            &store,
+            &SearchReq {
+                term: "no such value".into(),
+                ..req(None, true)
+            },
+        )
+        .unwrap();
+        assert!(none.is_none());
+        let _ = std::fs::remove_file(&path);
     }
 }
