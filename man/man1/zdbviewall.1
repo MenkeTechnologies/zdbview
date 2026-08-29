@@ -252,6 +252,29 @@ the hash-keyed
 script cache \(em no magic header, keyed by a u64 content hash rendered as hex.
 .RE
 .PP
+.SS Registering a magic
+The tag space belongs to producers, not to this viewer: the header those tags
+stamp is specified on its own terms in
+.I spec/rkyv\-shard\-header.md
+and a tag is claimed by publishing it, with no authority to apply to. So the
+built-in list above is not the closed set.
+.I src/magics.rs
+merges
+.I $XDG_CONFIG_HOME/zdbview/magics
+over it \(em one
+.RI "\(oq" "tag = display name" "\(cq"
+per line, the tag being four printable ASCII characters or an explicit
+.B 0x
+hex u32 \(em so a producer zdbview has never heard of is detected by the startup
+scan and named in the UI without a patch or a release. A registered tag with no
+copied archive type is still worth having: the file is offered under its real
+name and opens in the structural view instead of as an anonymous
+.RB \(oq "rkyv archive" \(cq .
+An entry for a tag zdbview ships renames it; the decoder keyed on that tag is
+unaffected.
+.B \-\-formats
+prints the resolved registry, marking what came from the file.
+.PP
 The two header-less formats have nothing to pre-filter on, so they are attempted
 last and admitted on rkyv validation alone. An unrelated archive that happens to
 survive the earlier magic scans still fails their validation and falls through to

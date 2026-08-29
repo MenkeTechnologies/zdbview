@@ -290,6 +290,20 @@ LUAR = luars bytecode cache (LUAR)
 0x5045_524C = perlrs script cache (PERL)
 ```
 
+`zdbview --formats` prints the resolved registry — every tag this build ships
+plus everything the file added, each marked — so "does zdbview know my producer"
+is answerable without opening a file:
+
+```console
+$ zdbview --formats
+  rkyv magics  (tag, u32, name)
+  ZRSC  0x5a525343  zshrs script cache (ZRSC)
+  ...
+  LUAR  0x4c554152  luars bytecode cache (LUAR)  (registered)
+
+  register more in ~/.config/zdbview/magics
+```
+
 A four-character tag is the little-endian u32 a producer stamping
 `u32::from_be_bytes(*b"LUAR")` writes, so the bytes read in file order; the
 `0x…` form (underscores allowed) sets the u32 directly for anything else. A

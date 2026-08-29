@@ -23,6 +23,7 @@ _zdbview() {
         '--recover[Salvage rows page by page to stdout as SQL, and exit]'
         '--theme[Color scheme for this run]:scheme:_zdbview_themes'
         '(- *)--list-themes[Preview all color schemes and exit]'
+        '(- *)--formats[List every rkyv magic this build knows and exit]'
         '(--no-scan)*--scan[Scan DIR instead of the default roots]:directory:_files -/'
         '(--scan --rescan)--no-scan[Skip the scan; list only recent files]'
         '(--no-scan)--rescan[Walk again now, ignoring the saved scan]'

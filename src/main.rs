@@ -111,11 +111,13 @@ const AFTER_HELP: &str = concat!(
     "\x1b[32m  //\x1b[0m zdbview d.db --import r.csv --table t  \x1b[90mload a CSV\x1b[0m\n",
     "\x1b[32m  //\x1b[0m zdbview --rescan               \x1b[90mwalk again now\x1b[0m\n",
     "\x1b[32m  //\x1b[0m zdbview --list-themes          \x1b[90mpreview the schemes\x1b[0m\n",
+    "\x1b[32m  //\x1b[0m zdbview --formats              \x1b[90mrkyv magics it knows\x1b[0m\n",
     "\n",
     "\x1b[36m  ── FILES ──────────────────────────────────────────────\x1b[0m\n",
     "\x1b[32m  //\x1b[0m $XDG_CACHE_HOME/zdbview/recent  \x1b[90mrecent-files list\x1b[0m\n",
     "\x1b[32m  //\x1b[0m $XDG_CACHE_HOME/zdbview/scan    \x1b[90msaved scan results\x1b[0m\n",
     "\x1b[32m  //\x1b[0m $XDG_CONFIG_HOME/zdbview/prefs  \x1b[90mscheme + palette\x1b[0m\n",
+    "\x1b[32m  //\x1b[0m $XDG_CONFIG_HOME/zdbview/magics \x1b[90mextra rkyv tags\x1b[0m\n",
     "\n",
     "\x1b[36m  ── SYSTEM ─────────────────────────────────────────────\x1b[0m\n",
     "\x1b[35m  v",
@@ -255,6 +257,12 @@ struct Cli {
     list_themes: bool,
     #[arg(
         long,
+        help_heading = H_GENERAL,
+        help = "\x1b[32m//\x1b[0m List every rkyv magic this build knows and exit"
+    )]
+    formats: bool,
+    #[arg(
+        long,
         value_name = "DIR",
         help_heading = H_DISCOVERY,
         help = "\x1b[32m//\x1b[0m Scan DIR instead of the default roots (repeatable)"
@@ -297,6 +305,11 @@ fn main() -> Result<()> {
 
     if cli.list_themes {
         list_themes();
+        return Ok(());
+    }
+
+    if cli.formats {
+        list_formats();
         return Ok(());
     }
 
@@ -393,6 +406,41 @@ fn list_themes() {
     }
     println!("\n  {B_YELLOW}Use:{RST}    zdbview FILE {B_GREEN}--theme neon_sprawl{RST}");
     println!("  {B_YELLOW}In TUI:{RST} press {B_GREEN}t{RST} for the chooser, {B_GREEN}e{RST} for the palette editor\n");
+}
+
+/// `--formats`: every rkyv magic the registry resolves — the tags this build
+/// ships and whatever the user registered on top of them — so "does zdbview know
+/// my producer" is answerable without opening a file. A tag is printed as its
+/// four characters when they are printable, since that is how a producer writes
+/// it, plus the u32 the bytes actually carry.
+fn list_formats() {
+    const RST: &str = "\x1b[0m";
+    const DIM: &str = "\x1b[90m";
+    const B_GREEN: &str = "\x1b[1;32m";
+    const B_YELLOW: &str = "\x1b[1;33m";
+
+    println!("  {B_YELLOW}rkyv magics{RST}  {DIM}(tag, u32, name){RST}");
+    for (magic, name) in magics::all() {
+        let bytes = magic.to_be_bytes();
+        let tag = if bytes.iter().all(|b| b.is_ascii_graphic()) {
+            String::from_utf8_lossy(&bytes).to_string()
+        } else {
+            "    ".to_string()
+        };
+        let shipped = formats::BUILTIN_MAGICS.iter().any(|(m, _)| m == magic);
+        println!(
+            "  {B_GREEN}{tag}{RST}  {DIM}{magic:#010x}{RST}  {name}{}",
+            if shipped {
+                String::new()
+            } else {
+                format!("  {DIM}(registered){RST}")
+            }
+        );
+    }
+    match magics::registry_path() {
+        Some(p) => println!("\n  {DIM}register more in{RST} {}", p.display()),
+        None => println!("\n  {DIM}no config directory: set XDG_CONFIG_HOME or HOME{RST}"),
+    }
 }
 
 /// Resolve `--theme` to a scheme, erroring with the valid tokens on a typo.

@@ -131,3 +131,74 @@ fn the_registry_file_is_the_documented_path() {
     }
     assert_eq!(got, Some(home.join("zdbview").join("magics")));
 }
+
+/// The proof that owes nothing to a test seam: the shipped binary, a config file
+/// a user wrote, no code change. Everything above installs the registry through
+/// `magics::install`, which only a test can call — this runs `zdbview --formats`
+/// as a user would, with `XDG_CONFIG_HOME` pointed at a directory holding one
+/// hand-written line, and reads what the binary prints.
+#[test]
+fn the_shipped_binary_honours_a_hand_written_registry_file() {
+    let dir = std::env::temp_dir().join(format!("zdbview_cfg_{}", std::process::id()));
+    let zdb = dir.join("zdbview");
+    std::fs::create_dir_all(&zdb).expect("config dir");
+    std::fs::write(zdb.join("magics"), USER_FILE).expect("registry file");
+
+    let run = |config: &std::path::Path| -> String {
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_zdbview"))
+            .arg("--formats")
+            .env("XDG_CONFIG_HOME", config)
+            .output()
+            .expect("run zdbview --formats");
+        assert!(out.status.success(), "--formats exits 0");
+        // The listing is coloured for a terminal; the escapes are not the point.
+        let text = String::from_utf8_lossy(&out.stdout).to_string();
+        strip_ansi(&text)
+    };
+
+    let listed = run(&dir);
+    assert!(
+        listed.contains("LUAR  0x4c554152  luars bytecode cache (LUAR)  (registered)"),
+        "a tag the binary does not ship, listed from the user's file:\n{listed}"
+    );
+    assert!(
+        listed.contains("PERL  0x5045524c  perlrs script cache (PERL)  (registered)"),
+        "a tag written as hex, listed by its characters:\n{listed}"
+    );
+    assert!(
+        listed.contains("VIML  0x56494d4c  vimlrs script cache, renamed by its user"),
+        "a shipped tag the user renamed:\n{listed}"
+    );
+
+    // Control: the same binary, a config directory with no registry file. What
+    // the file added is exactly what disappears.
+    let empty = dir.join("empty");
+    std::fs::create_dir_all(&empty).expect("empty config dir");
+    let bare = run(&empty);
+    assert!(!bare.contains("LUAR"), "nothing registers itself:\n{bare}");
+    assert!(!bare.contains("(registered)"), "no strays:\n{bare}");
+    assert!(
+        bare.contains("VIML  0x56494d4c  vimlrs script cache (VIML)"),
+        "the built-in name, unrenamed:\n{bare}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Colour codes out, so an assertion reads the text and not the styling.
+fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            for c in chars.by_ref() {
+                if c.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}

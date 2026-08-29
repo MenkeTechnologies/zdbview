@@ -210,6 +210,14 @@ Skip the startup scan; list only recently opened files.
 .B \-\-rescan
 Walk the filesystem now, ignoring the saved scan.
 .TP
+.B \-\-formats
+List every rkyv magic the registry resolves \(em the tags this build ships plus
+the ones registered in
+.I $XDG_CONFIG_HOME/zdbview/magics
+(each marked
+.BR "(registered)" )
+\(em with the path to register more, then exit.
+.TP
 .B \-h ", " \-\-help
 Print usage and exit.
 .TP
