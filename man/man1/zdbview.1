@@ -127,7 +127,10 @@ and its shadow tables are emitted with
 because
 .B CREATE VIRTUAL TABLE
 would build them a second time and the script would not replay. For a recognized
-rkyv archive, records are emitted as JSON with the value blob as a hex string.
+rkyv archive, records are emitted as JSON with the value blob as a hex string,
+whatever
+.I FORMAT
+is; an unrecognized archive is an error.
 .TP
 .BI \-\-table " TABLE"
 Restrict
@@ -342,7 +345,7 @@ lists what is implemented:
 .BR .tables ", " .schema ", " .indexes ", " .dump ", " .databases ", " .attach ", "
 .BR .detach ", " .mode ", " .headers ", " .output ", " .once ", " .timer ", " .eqp ", "
 .BR .import ", " .read ", " .backup ", " .expert ", " .vacuum ", " .analyze ", "
-.BR .reindex " and " .quit .
+.BR .reindex ", " .load ", " .project ", " .recover " and " .quit .
 .B .mode
 takes
 .BR list ", " csv ", " tsv ", " markdown ", " line ", " insert " or " json ;
@@ -388,8 +391,8 @@ cannot recover the schema of an arbitrary archive without the originating Rust
 type. zdbview supplies that type for the formats it recognizes, decoding through
 .BR rkyv::check_archived_root ,
 so a copied type that has drifted from its producer fails validation instead of
-misreading the bytes. Eight formats are recognized \(em the script and heap
-caches the fusevm-hosted languages write:
+misreading the bytes. These formats are recognized \(em the script and heap
+caches the fusevm-hosted languages write, and the zshrs state images:
 .RS 2
 .IP \(bu 2
 .B ZRSC
@@ -407,8 +410,15 @@ caches the fusevm-hosted languages write:
 .B VIML
 \(em vimlrs script cache, keyed by script path.
 .IP \(bu 2
+.B TEXR
+\(em texrs bytecode cache, keyed by script path.
+.IP \(bu 2
 .B ELSP
 \(em elisprs heap-image cache, keyed by script path.
+.IP \(bu 2
+.B ZSHS
+\(em zshrs canonical-state shard (the per-source layout and the flat
+system-image layout), one record per section entry.
 .IP \(bu 2
 the header-less
 .B pythonrs
@@ -433,8 +443,7 @@ is selected automatically when a format is recognized, and supports full CRUD:
 .B a
 creates a record,
 .B e
-updates its value (text or
-.BR 0x <hex>),
+edits its value in the hex editor,
 .B r
 renames its key (map-keyed formats), and
 .B d
@@ -834,8 +843,9 @@ and the readline chords
 .BR q ", " Esc
 Leave the current screen.
 .B q
-quits. On the detail, schema, hex-editor or help screen, both return to the main
-view; on the main view itself
+quits. On the detail and schema screens
+.B Esc
+returns to the main view; on the main view itself
 .B Esc
 goes back to the file picker (as
 .B o

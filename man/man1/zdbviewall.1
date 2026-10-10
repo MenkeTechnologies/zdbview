@@ -75,13 +75,76 @@ clap rejects the combination.
 .BI \-\-export " FORMAT"
 Dump the file to standard output and exit, without initializing the terminal.
 .I FORMAT
-is
-.B json
-or
-.BR csv ,
+is one of
+.BR json ", " csv ", " tsv ", " markdown ", " insert ", " line " or " sql ,
 and a
 .I FILE
 is required. See section 11.
+.TP
+.BI \-\-table " TABLE"
+Restrict
+.B \-\-export
+to one table.
+.TP
+.BI \-\-backup " FILE"
+Copy the database to
+.I FILE
+with
+.B VACUUM INTO
+and exit. An existing
+.I FILE
+is an error.
+.TP
+.BI \-\-import " FILE"
+Load a CSV or TSV file into the table named by
+.B \-\-table
+and exit.
+.TP
+.BI \-\-import\-sql " FILE"
+Run a file of SQL into the database and exit.
+.TP
+.B \-\-recover
+Salvage rows page by page and print them as SQL on standard output, then exit.
+.TP
+.BI \-\-new " FILE"
+Create an empty database and open it.
+.TP
+.B \-\-memory
+Open a database that lives only in memory.
+.TP
+.B \-\-readonly
+Open the database read-only: every edit is refused.
+.TP
+.BI \-\-load\-extension " FILE"
+Load a SQLite extension before opening. Repeatable.
+.TP
+.BI \-\-project " FILE"
+Open the database a project file names, with its settings applied.
+.TP
+.BI \-\-theme " NAME"
+Use color scheme
+.I NAME
+for this run.
+.TP
+.B \-\-list\-themes
+Print every color scheme and exit.
+.TP
+.BI \-\-scan " DIR"
+Scan
+.I DIR
+instead of the default roots. Repeatable.
+.TP
+.B \-\-no\-scan
+Skip the startup scan.
+.TP
+.B \-\-rescan
+Walk the filesystem now, ignoring the saved scan.
+.TP
+.B \-\-formats
+List every rkyv magic the registry resolves and exit.
+.PP
+These are described in full in
+.BR zdbview (1).
 .TP
 .B \-h ", " \-\-help
 Print usage and exit.
@@ -137,7 +200,8 @@ advance one page,
 /
 .B PageUp
 go back, and the pane title shows
-.RI "\(oq" "rows <from>..<to> of <total>" "\(cq" .
+.RI "\(oq" "rows <from>..<to> of <total>" "\(cq" ;
+the total reads as a lower bound until the exact count arrives.
 .B G
 walks to the last page and selects its last row;
 .B gg
@@ -145,23 +209,26 @@ returns to the first row of the first page.
 .SS Row addressing
 Every edit and delete targets a row by its
 .BR rowid ,
-selected alongside the real columns as
-.BR "SELECT rowid, * FROM <table>" .
-That is what makes the CRUD generic: no schema knowledge, no primary-key
-guessing, no per-database configuration. A
+selected alongside the real columns.
+That is what makes the CRUD generic: no schema knowledge and no per-database
+configuration. A
 .B WITHOUT ROWID
-table exposes no such handle, so its rows are listed but edit and delete are
-refused with a status-line message.
+table has no rowid, so its rows are addressed by the primary key instead, every
+key column having to match. A table with neither a rowid nor a primary key, and a
+row whose key column holds a blob, are read-only; edit and delete are refused
+with a status-line message.
 .SS Editing a cell
 .B e
 opens a modal seeded with the current display value. Enter runs
 .PP
 .RS 4
-.B UPDATE "<table>" SET "<column>" = ?1 WHERE rowid = ?2
+.B UPDATE "<table>" SET "<column>" = ? WHERE <row address>
 .RE
 .PP
 with the typed text bound as a parameter (so quoting never breaks it), then
-reloads the page. Esc cancels. Identifiers are double-quoted and internal
+reloads the page. Esc cancels. A blob cell opens in the hex editor instead, and
+.B E
+edits any cell as bytes. Identifiers are double-quoted and internal
 quotes doubled, so table and column names containing spaces or keywords work.
 .SS Inserting a row
 .B a
@@ -178,13 +245,16 @@ to insert explicit values instead.
 asks for confirmation;
 .B y
 runs
-.B "DELETE FROM <table> WHERE rowid = ?1"
-and any other key cancels. This is the only destructive operation that
-confirms; a cell edit is committed directly.
+.B "DELETE FROM <table> WHERE <row address>"
+and any other key cancels. Dropping a schema object also confirms; a cell edit
+does not. Every edit is buffered in the write savepoint until
+.B W
+(see section 5).
 .SS Raw SQL
 .B :
-opens a command line for one arbitrary statement. The affected-row count is
-reported and the current page reloaded, so
+opens the SQL editor, a multi-line input with a transcript, history and Tab
+completion. A statement's rows or its affected-row count are reported and the
+current page reloaded, so
 .BR ALTER ,
 .BR CREATE ,
 .BR DROP ,
@@ -245,6 +315,10 @@ by document path.
 .B ELSP
 \(em the elisprs heap-image cache, keyed by script path.
 .IP \(bu 2
+.B ZSHS
+\(em the zshrs canonical-state shard, in both its per-source and its flat
+system-image layout.
+.IP \(bu 2
 the
 .B pythonrs
 bytecode cache \(em no magic header, keyed by source path.
@@ -294,9 +368,12 @@ The key/value table for a recognized archive: keys on the left, the selected
 value's decoded scalar fields plus a hex dump of its blob on the right. Selected
 automatically whenever a format is recognized;
 .B /
-searches the keys. The view is read-only \(em writing an archive back means
-reproducing the producer's exact layout, and a wrong write corrupts a cache the
-producer then mmaps.
+searches the keys.
+.BR a ", " e ", " r " and " d
+create, update, rename and delete a record: the shard is deserialized, mutated,
+re-serialized in the producer's layout and written back atomically.
+.B e
+opens the record's value in the hex editor.
 .SS Info (key 1)
 Path, byte size, and the number of extracted string runs; for a recognized
 archive, also the detected format name and its decoded header fields
@@ -529,8 +606,10 @@ Previous table (left pane) or previous row (right pane).
 .BR j ", " Down
 Next table or next row.
 .TP
-.BR h ", " l ", " Left ", " Right
+.BR Left ", " Right
 Previous / next column (row grid only).
+.B h
+opens the key help instead of moving.
 .TP
 .BR Ctrl\-f ", " Ctrl\-b ", " PageDown ", " PageUp
 Page forward / back.
@@ -556,11 +635,15 @@ is available only when the archive format was recognized.
 .B Enter
 In the Records view, open the detail screen for the selected record.
 .TP
+.BR a ", " e ", " r ", " d
+In the Records view, create a record, edit its value in the hex editor, rename
+its key (map-keyed formats) and delete it.
+.TP
 .BR j ", " k
 Scroll the record list, the string list or the hex dump.
 .TP
 .BR PageDown ", " PageUp
-Scroll the hex dump by 16 lines.
+Scroll a screenful.
 .SS Recent-files picker
 .TP
 .BR j ", " k ", " gg ", " G
@@ -577,8 +660,14 @@ Quit without opening anything.
 .SS Detail screen
 .TP
 .B v
-Cycle how the value renders: auto (text when it looks textual, else hex), hex, or
-text.
+Cycle how the value renders: auto (text when it looks textual, else hex), hex,
+text or disasm.
+.TP
+.B e
+Edit the field the arrows select.
+.TP
+.BR Left ", " Right
+Select the field the value pane shows.
 .TP
 .BR j ", " k ", " g ", " G
 Scroll the value pane.
@@ -586,8 +675,11 @@ Scroll the value pane.
 .B y
 Copy the value.
 .TP
-.BR q ", " Esc ", " Enter
+.BR Esc ", " Enter
 Return to the main view.
+.TP
+.B q
+Quit.
 .SS Modal input (edit, SQL, search)
 .TP
 .B Enter
@@ -689,11 +781,88 @@ The recent-files store: load, record, dedupe, cap, atomic write, relative-age
 formatting.
 .TP
 .B src/export.rs
-Dependency-free CSV and JSON writers shared by the interactive
+Dependency-free writers for CSV, TSV, Markdown, line, INSERT and JSON output,
+shared by the interactive
 .B x
-key and the non-interactive
+key, the SQL editor's
+.B .mode
+and the non-interactive
 .B \-\-export
 path.
+.TP
+.B src/import.rs
+CSV and TSV reading for
+.BR \-\-import .
+.TP
+.B src/recover.rs
+Page-level row salvage for
+.BR \-\-recover ,
+which never opens a connection to the file.
+.TP
+.B src/scan.rs
+The background filesystem scan behind the picker, and the saved scan index.
+.TP
+.B src/magics.rs
+The magic registry: shipped tags merged with the user's
+.I magics
+file.
+.TP
+.B src/query.rs
+Grid queries run off the drawing thread.
+.TP
+.B src/sqledit.rs
+The SQL editor: multi-line input, transcript, history and Tab completion.
+.TP
+.B src/browse.rs
+Per-table Browse Data settings: hidden and frozen columns, the rowid column and
+column display formats.
+.TP
+.B src/ddl.rs
+.TQ
+.B src/designer.rs
+The schema designers: the DDL model and the table and index editing forms.
+.TP
+.B src/pragmas.rs
+The editable pragmas screen.
+.TP
+.B src/project.rs
+Project files read by
+.B \-\-project
+and written by
+.BR ".project save" .
+.TP
+.B src/hexedit.rs
+The hex editor and the shared hex-dump row formatter.
+.TP
+.B src/watch.rs
+.TQ
+.B src/monitor.rs
+.TQ
+.B src/wal.rs
+.TQ
+.B src/frames.rs
+The write monitor: sampling, the screen, the write-ahead-log reader and the
+frame history.
+.TP
+.B src/disasm.rs
+Disassembly of
+.B fusevm::Chunk
+blobs, built with the
+.B disasm
+feature.
+.TP
+.B src/overlay.rs
+.TQ
+.B src/theme.rs
+.TQ
+.B src/prefs.rs
+The help, scheme-chooser, palette-editor and toast overlays, the color schemes,
+and the saved scheme preference.
+.TP
+.B src/input.rs
+.TQ
+.B src/text.rs
+Single-line text editing shared by every prompt, and width-fitting of text.
 .TP
 .B src/clipboard.rs
 OSC 52 clipboard copy, including the hand-rolled base64 the escape carries.
@@ -703,11 +872,10 @@ The interactive layer: application state, focus and modal handling, key
 dispatch, search, and all ratatui rendering.
 .TP
 .B tests/backend.rs
-Integration tests over the backends without a terminal: a full SQLite CRUD
-round-trip, rkyv string extraction and hex formatting, MRU dedupe and ordering,
-and detection of a non-SQLite file carrying a
-.B .db
-name.
+Integration tests over the backends without a terminal.
+.TP
+.B tests/magics.rs
+Integration tests of the magic registry.
 .SH 9. EXAMPLES
 Browse and edit a SQLite database:
 .PP
@@ -736,10 +904,9 @@ Reopen something from earlier:
 .RE
 .SH 10. LIMITATIONS
 .TP
-.B rkyv archives are read-only
-Recognized formats decode to key/value, but nothing is written back:
-re-serializing a shard means reproducing the producer's exact layout, and a
-wrong write corrupts a cache the producer then mmaps. Unrecognized archives stay
+.B Only recognized rkyv archives are editable
+Recognized formats decode to key/value and are edited through
+re-serialization in the producer's layout. Unrecognized archives stay
 structural, since guessing field boundaries from an untyped image would produce
 plausible, wrong output.
 .TP
@@ -752,23 +919,23 @@ clause through
 .B :
 remains the right tool for a complex predicate.
 .TP
-.B WITHOUT ROWID tables are read-only
-No
+.B Some tables are read-only
+A table with neither a
 .B rowid
-means no generic row handle for
+nor a primary key has no row handle for
 .B UPDATE
 and
-.BR DELETE .
+.BR DELETE ,
+and neither does a row whose primary-key column holds a blob.
 .TP
-.B Blobs are readable, not editable
+.B Blobs have no text form
 The grid summarizes a blob as
-.RI "\(oq" "<blob N bytes>" "\(cq"
-and the detail screen shows its bytes as hex or text, but writing binary values
-still goes through
-.BR : .
-.TP
-.B Single connection, no transaction UI
-Each statement commits on its own. There is no explicit begin/rollback surface.
+.RI "\(oq" "<blob N bytes>" "\(cq" .
+Its bytes are edited in the hex editor, which
+.B e
+opens on a blob cell and
+.B E
+opens on any cell.
 .SH 11. EXPORT, DETAIL AND CLIPBOARD
 .SS Export
 .B x
@@ -788,10 +955,17 @@ For SQLite,
 .B json
 emits an object of
 .RI { table :
-[rows]} covering every table, while
-.B csv
-emits the first table alone \(em CSV has no way to express several tables in one
-stream. For a recognized rkyv archive both emit the decoded records, each value
+[rows]} covering every table (or the one named by
+.BR \-\-table ),
+while
+.BR csv ", " tsv ", " markdown " and " line
+emit the first table alone (or the one named by
+.BR \-\-table ),
+.B insert
+emits INSERT statements and
+.B sql
+emits the whole database as replayable SQL. For a recognized rkyv archive every
+format emits the decoded records as JSON, each value
 blob as a lowercase hex string; an unrecognized archive is an error, because
 there is nothing structured to export. The writers are hand-rolled in
 .IR src/export.rs ,
