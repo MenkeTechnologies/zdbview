@@ -136,8 +136,7 @@ and going through it walks everything twice. `/dev`, `/proc`, `/sys`, `/net`,
 `/private/var/folders` and the Spotlight indexes are skipped as never containing
 anything openable. VCS and package-manager caches, the rest of `~/Library`, and
 Chromium profile stores are skipped as noise — that is what keeps the list about
-your data. Measured on this machine, a full walk of `/` finds 553 files in ~96 s
-(debug build) and loads back from the saved index in under a millisecond.
+your data.
 Finding a file is never a reason to stop: the number of hits is not capped, since
 a cap there would cut the walk mid-root and lose every root after it. A 10-minute
 clock and a 20M-entry count are hang backstops, not budgets.
